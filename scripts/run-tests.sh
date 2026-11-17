@@ -61,11 +61,11 @@ else
   record_step "2. Swift Build" "FAIL" "Build failed"
 fi
 
-# 3. DayHelmChecks (30 Unit + Integration + E2E Checks)
+# 3. DayHelmChecks (37 Unit + Integration + E2E Checks)
 echo ""
 echo "[3/4] Running swift run DayHelmChecks..."
 if swift run DayHelmChecks; then
-  record_step "3. DayHelmChecks" "PASS" "30/30 checks passed"
+  record_step "3. DayHelmChecks" "PASS" "37/37 checks passed"
 else
   record_step "3. DayHelmChecks" "FAIL" "DayHelmChecks exited non-zero"
 fi

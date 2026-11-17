@@ -413,13 +413,23 @@ public final class NativeScreenRecorder: @unchecked Sendable {
     public let appFocusDebounceSeconds: TimeInterval = 4.0
     public let visualCheckIntervalSeconds: TimeInterval = 12.0
     public let heartbeatIntervalSeconds: TimeInterval = 120.0
+    public let clickCaptureMinIntervalSeconds: TimeInterval = 10.0
+    public let typingPauseCaptureMinIntervalSeconds: TimeInterval = 15.0
+    public let defaultIdleThresholdSeconds: TimeInterval = 300.0
     public let minHistogramDiffPct: Double = 0.04
     public let jpegQuality: CGFloat = 0.55
+
+    /// Snapshots older than this are re-encoded to a smaller thumbnail before final retention pruning.
+    public let downsampleAfterDays: Int = 1
+    public let downsampleMaxWidth: Int = 480
+    public let downsampleJPEGQuality: CGFloat = 0.4
 
     private let lock = NSLock()
     private var lastSavedHistogram: [Double]?
     private var lastSavedAt: Date?
     private var lastAppFocusCaptureAt: Date?
+    private var lastClickCaptureAt: Date?
+    private var lastTypingPauseCaptureAt: Date?
     private var lastVisualCheckAt: Date?
     private var lastPruneAt: Date?
     private var isCaptureInFlight: Bool = false
@@ -449,12 +459,14 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         sample: ActivitySample,
         deepRecordingEnabled: Bool,
         declaredTaskId: String?,
+        idleThresholdSeconds: TimeInterval = 300.0,
         retentionDays: Int = 7,
         onCompleted: (@Sendable () -> Void)? = nil
     ) {
         guard deepRecordingEnabled,
               !sample.redacted,
               !sample.screenLocked,
+              sample.idleSeconds < idleThresholdSeconds,
               capturer.isScreenCaptureTrusted else {
             return
         }
@@ -495,11 +507,13 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         sample: ActivitySample,
         deepRecordingEnabled: Bool,
         declaredTaskId: String?,
+        idleThresholdSeconds: TimeInterval = 300.0,
         onCompleted: (@Sendable () -> Void)? = nil
     ) {
         guard deepRecordingEnabled,
               !sample.redacted,
               !sample.screenLocked,
+              sample.idleSeconds < idleThresholdSeconds,
               capturer.isScreenCaptureTrusted else {
             return
         }
@@ -521,6 +535,86 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         launchCaptureTask(
             sample: sample,
             trigger: "app_focus",
+            declaredTaskId: declaredTaskId,
+            onCompleted: onCompleted
+        )
+    }
+
+    /// Captures shortly after a click, with its own debounce and histogram de-duplication.
+    public func triggerClickCaptureIfNeeded(
+        sample: ActivitySample,
+        deepRecordingEnabled: Bool,
+        declaredTaskId: String?,
+        idleThresholdSeconds: TimeInterval = 300.0,
+        onCompleted: (@Sendable () -> Void)? = nil
+    ) {
+        triggerSecondaryCaptureIfNeeded(
+            sample: sample,
+            trigger: ActivityEventKind.click.rawValue,
+            minInterval: clickCaptureMinIntervalSeconds,
+            lastCaptureAt: \.lastClickCaptureAt,
+            deepRecordingEnabled: deepRecordingEnabled,
+            declaredTaskId: declaredTaskId,
+            idleThresholdSeconds: idleThresholdSeconds,
+            onCompleted: onCompleted
+        )
+    }
+
+    /// Captures after typing pauses (last keystroke quiet for a short period), de-duplicated.
+    public func triggerTypingPauseCaptureIfNeeded(
+        sample: ActivitySample,
+        deepRecordingEnabled: Bool,
+        declaredTaskId: String?,
+        idleThresholdSeconds: TimeInterval = 300.0,
+        onCompleted: (@Sendable () -> Void)? = nil
+    ) {
+        triggerSecondaryCaptureIfNeeded(
+            sample: sample,
+            trigger: ActivityEventKind.typingPause.rawValue,
+            minInterval: typingPauseCaptureMinIntervalSeconds,
+            lastCaptureAt: \.lastTypingPauseCaptureAt,
+            deepRecordingEnabled: deepRecordingEnabled,
+            declaredTaskId: declaredTaskId,
+            idleThresholdSeconds: idleThresholdSeconds,
+            onCompleted: onCompleted
+        )
+    }
+
+    private func triggerSecondaryCaptureIfNeeded(
+        sample: ActivitySample,
+        trigger: String,
+        minInterval: TimeInterval,
+        lastCaptureAt: ReferenceWritableKeyPath<NativeScreenRecorder, Date?>,
+        deepRecordingEnabled: Bool,
+        declaredTaskId: String?,
+        idleThresholdSeconds: TimeInterval,
+        onCompleted: (@Sendable () -> Void)?
+    ) {
+        guard deepRecordingEnabled,
+              !sample.redacted,
+              !sample.screenLocked,
+              sample.idleSeconds < idleThresholdSeconds,
+              capturer.isScreenCaptureTrusted else {
+            return
+        }
+
+        let now = sample.timestamp
+        lock.lock()
+        guard !isCaptureInFlight else {
+            lock.unlock()
+            return
+        }
+        if let last = self[keyPath: lastCaptureAt], now.timeIntervalSince(last) < minInterval {
+            lock.unlock()
+            return
+        }
+        self[keyPath: lastCaptureAt] = now
+        isCaptureInFlight = true
+        lock.unlock()
+
+        launchCaptureTask(
+            sample: sample,
+            trigger: trigger,
             declaredTaskId: declaredTaskId,
             onCompleted: onCompleted
         )
@@ -559,8 +653,8 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         }
 
         let isHeartbeatDue = prevState.savedAt.map { sample.timestamp.timeIntervalSince($0) >= heartbeatIntervalSeconds } ?? true
-        let isAppFocus = (trigger == "app_focus")
-        let shouldSave = prevState.histogram == nil || isHeartbeatDue || isAppFocus || diffPct >= minHistogramDiffPct
+        // All triggers (including app_focus / click / typing_pause) respect histogram de-duplication.
+        let shouldSave = prevState.histogram == nil || isHeartbeatDue || diffPct >= minHistogramDiffPct
 
         guard shouldSave else {
             return false
@@ -664,6 +758,11 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         }
     }
 
+    /// Public maintenance entry so retention/downsampling still runs even when capture is disabled or idle.
+    public func runRetentionMaintenanceIfNeeded(retentionDays: Int, now: Date = Date()) {
+        pruneIfNeeded(retentionDays: retentionDays, now: now)
+    }
+
     private func pruneIfNeeded(retentionDays: Int, now: Date) {
         let shouldPrune: Bool = {
             lock.lock()
@@ -677,8 +776,106 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         guard shouldPrune else { return }
         let db = database
         let root = snapshotsRootDir
-        Task.detached(priority: .background) {
+        let downsampleAfter = downsampleAfterDays
+        Task.detached(priority: .background) { [weak self] in
+            if let self {
+                _ = await self.downsampleOldSnapshots(
+                    olderThanDays: downsampleAfter,
+                    retentionDays: retentionDays,
+                    now: now
+                )
+            }
             _ = try? db.pruneOldSnapshots(olderThanDays: retentionDays, snapshotsRootDir: root, now: now)
         }
+    }
+
+    /// Two-stage retention: shrink hot snapshots older than `olderThanDays` to thumbnails,
+    /// keeping the original files until `pruneOldSnapshots` removes them at `retentionDays`.
+    @discardableResult
+    public func downsampleOldSnapshots(
+        olderThanDays: Int,
+        retentionDays: Int,
+        maxWidth: Int = 480,
+        quality: CGFloat = 0.4,
+        now: Date
+    ) async -> (downsampled: Int, savedBytes: Int64) {
+        let effectiveRetention = max(1, retentionDays)
+        let effectiveDownsampleAfter = max(1, olderThanDays)
+        guard effectiveRetention > effectiveDownsampleAfter else {
+            return (0, 0)
+        }
+
+        let cutoff = now.addingTimeInterval(-Double(effectiveDownsampleAfter) * 86_400)
+        let cutoffMs = Int64(cutoff.timeIntervalSince1970 * 1000)
+        guard let records = try? database.listSnapshotsForMaintenance(
+            olderThanMs: cutoffMs,
+            storageTier: "hot",
+            limit: 500
+        ) else {
+            return (0, 0)
+        }
+
+        var downsampled = 0
+        var savedBytes: Int64 = 0
+        let fm = FileManager.default
+        for record in records {
+            let fileURL = URL(fileURLWithPath: record.filePath)
+            guard fm.fileExists(atPath: fileURL.path),
+                  let result = SnapshotDownsampler.downsampleJPEG(
+                      at: fileURL,
+                      maxWidth: maxWidth,
+                      quality: quality
+                  ) else {
+                continue
+            }
+            try? database.updateSnapshotStorage(
+                snapshotId: record.id,
+                width: result.width,
+                height: result.height,
+                sizeBytes: result.sizeBytes,
+                storageTier: "downsampled"
+            )
+            downsampled += 1
+            savedBytes += max(0, record.sizeBytes - result.sizeBytes)
+        }
+        return (downsampled, savedBytes)
+    }
+}
+
+// MARK: - Snapshot Downsampling
+
+public enum SnapshotDownsampler {
+    /// Re-encodes a JPEG in place at a bounded pixel size and lower quality.
+    /// Returns the new dimensions and byte size, or `nil` when the file cannot be read.
+    @discardableResult
+    public static func downsampleJPEG(
+        at fileURL: URL,
+        maxWidth: Int = 480,
+        quality: CGFloat = 0.4
+    ) -> (width: Int, height: Int, sizeBytes: Int64)? {
+        guard FileManager.default.fileExists(atPath: fileURL.path),
+              let source = CGImageSourceCreateWithURL(fileURL as CFURL, nil) else {
+            return nil
+        }
+
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(64, maxWidth),
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+
+        guard let sizeBytes = try? ScreenSnapshotCapturer.encodeJPEG(
+            image: thumbnail,
+            to: fileURL,
+            quality: quality
+        ) else {
+            return nil
+        }
+
+        return (thumbnail.width, thumbnail.height, sizeBytes)
     }
 }

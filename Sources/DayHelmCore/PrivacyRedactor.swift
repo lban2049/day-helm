@@ -201,6 +201,50 @@ public enum PrivacyRedactor {
         return components.string ?? urlString
     }
 
+    // MARK: - Credential Redaction (metadata + OCR text)
+
+    /// Ordered from most specific to most generic so tokens are not partially masked twice.
+    private static let secretRedactionRules: [(pattern: String, template: String)] = [
+        (#"\bsk-[A-Za-z0-9_\-]{16,}"#, "sk-***"),
+        (#"\bgh[pousr]_[A-Za-z0-9]{16,}"#, "gh*_***"),
+        (#"\bxox[abprs]-[A-Za-z0-9\-]{8,}"#, "xox*-***"),
+        (#"\bAKIA[0-9A-Z]{16}\b"#, "AKIA***"),
+        (#"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}"#, "jwt.***"),
+        (#"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=\-]{8,}"#, "$1 ***"),
+        (#"(?i)\b(api[_-]?key|access[_-]?key|client[_-]?secret|secret|token|password|passwd|pwd|authorization)\b\s*[:=]\s*[\"'`]?([^\s\"'`;,&?]{3,})[\"'`]?"#, "$1=***")
+    ]
+
+    private static let compiledSecretRules: [(regex: NSRegularExpression, template: String)] = secretRedactionRules.compactMap { rule in
+        guard let regex = try? NSRegularExpression(pattern: rule.pattern, options: []) else { return nil }
+        return (regex, rule.template)
+    }
+
+    /// Masks credentials found in free-form metadata or OCR text while keeping surrounding context.
+    public static func redactSecrets(in text: String) -> String {
+        guard !text.isEmpty, !compiledSecretRules.isEmpty else { return text }
+        var result = text
+        for rule in compiledSecretRules {
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = rule.regex.stringByReplacingMatches(
+                in: result,
+                options: [],
+                range: range,
+                withTemplate: rule.template
+            )
+        }
+        return result
+    }
+
+    /// Normalizes a single metadata value (event `data`, snapshot title): strips URL
+    /// credential query params when it looks like a URL, then masks embedded secrets.
+    public static func sanitizeMetadataValue(_ value: String) -> String {
+        if value.contains("://") || value.lowercased().hasPrefix("http") {
+            let cleaned = sanitizeURL(value) ?? value
+            return redactSecrets(in: cleaned)
+        }
+        return redactSecrets(in: value)
+    }
+
     private static func matchesPayKeyword(_ text: String) -> Bool {
         guard !text.isEmpty else { return false }
         let pattern = #"(?:^|[^a-z0-9])pay(?:ment|s)?(?:$|[^a-z0-9])"#

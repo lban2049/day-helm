@@ -234,7 +234,7 @@ struct MenuBarPopoverView: View {
                 Circle()
                     .fill(coordinator.apiServerPort != nil ? DayHelmColors.successEmerald : Color.secondary.opacity(0.35))
                     .frame(width: 5, height: 5)
-                Text("API :\(coordinator.apiServerPort.map(String.init) ?? "23002")")
+                Text("API :\(coordinator.apiServerPort.map(String.init) ?? String(LocalActivityHTTPServer.defaultPrimaryPort))")
                     .font(.system(size: 9.5, weight: .medium, design: .monospaced))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)

@@ -15,7 +15,7 @@
 四条由此推出的硬约束，任何设计不得违反：
 
 1. **轻量监督与校准，不做强制锁死。** 不做单次 Cmd+Tab 全屏读秒拦截，不做应用白名单强行隐藏/最小化，不做"扛强杀会话锁"。提醒一律使用右上角**不抢键盘焦点**的轻量卡片（`.nonactivatingPanel`）。
-2. **独立原生采集 + 开放数据中心，兼顾兼容。** 内置原生事件监听、AX 窗口标题与 URL 补齐、可选且可开关的去重屏幕快照与设备端 Apple Vision OCR（`activity.sqlite`），并暴露 Agent CLI 与兼容 `/api/activity-recorder/...` 的本地 HTTP 服务（`:23002` 及空闲兼听 `:23001`），无需启动 Alma 即可独立运行；当 Alma 运行时仍可平滑兼容。
+2. **独立原生采集 + 开放数据中心，兼顾兼容。** 内置原生事件监听、AX 窗口标题与 URL 补齐、可选且可开关的去重屏幕快照与设备端 Apple Vision OCR（`activity.sqlite`），并暴露 Agent CLI 与兼容 `/api/activity-recorder/...` 的本地 HTTP 服务（`127.0.0.1:24001`，`24001...24009` 空闲选端，绝不抢占 Alma 的 `23001` 端口），无需启动 Alma 即可独立运行；当 Alma 运行时仍可平滑兼容。
 3. **支持双向配额（保底 Target + 封顶 Cap）。** 既要监督核心任务是否达到每日保底时长，也要在容易超时的任务（如日常运营）达到设定上限时提醒换挡，避免在一件事上耗尽全天。
 4. **UI 保持高密度精密仪表风（Precision Telemetry）。** 统一采用等宽数字（`.monospacedDigit()`）、四色语义系统（推进蓝/达标绿/封顶琥珀/乱切斜纹红）、330pt 免滚动菜单栏面板与今日时间光谱条。
 
@@ -62,7 +62,7 @@ Sources/DayHelmChecks/      # 确定性自检断言，失败 exit 1
 
 | 结论 | 含义 |
 |---|---|
-| Alma `http://localhost:23001/api/activity-recorder/sessions` 实时可用（可选） | Alma 未启动时由 DayHelm 自身原生采集并兼听 `23001`；Alma 运行时仅监听 `23002` 并兼容回补 |
+| Alma `http://localhost:23001/api/activity-recorder/sessions` 为 Alma 专用端口 | DayHelm 自身服务绑定 `127.0.0.1:24001`（`24001...24009` 空闲选端），绝不绑定 `23001` 以免导致 Alma 异常；Alma 运行时可从 `23001` 只读回补 |
 | AX `kAXTitleAttribute` 读窗口标题、**AX `AXDocument` 读浏览器当前 URL** | 需要 Accessibility。实测都拿到了，补齐 `windowTitle` |
 | `ScreenCaptureKit` + `Vision.VNRecognizeTextRequest` | `Screen Recording` 为可选权限：开启并授权时捕获 32-bin 直方图去重 JPEG + 本机离线 OCR；拒绝或关闭时不纠缠 |
 | `NSWorkspace.frontmostApplication`、`CGEventSource.secondsSinceLastEventType` | 均**无需权限** |
@@ -84,9 +84,9 @@ Sources/DayHelmChecks/      # 确定性自检断言，失败 exit 1
 
 | 系统 | 位置 | 关系 |
 |---|---|---|
-| `Alma activity-recorder` | `http://localhost:23001` | 可选兼容。DayHelm 已内置独立原生采集器与 `activity.sqlite`；Alma 关闭时 DayHelm 自动兼听 `23001` 替代之 |
-| `alma-time-audit` | `~/.config/alma/scripts/`、`~/dev/code/alma-time-audit/` | 产出日/周报，做事后审计与评分。**DayHelm 负责当天实时掌舵并在 23001/23002 开放完整数据，与它互补** |
-| 本机 AI Agents (Claude Code / Codex / Hermes) | CLI & `127.0.0.1:23002` | 通过 `dayhelm query/search/sessions` 或 `/api/dayhelm/context` 获取当日实时上下文 |
+| `Alma activity-recorder` | `http://localhost:23001` | 可选只读兼容。DayHelm 已内置独立原生采集器与 `activity.sqlite`，并使用 `24001`（`2400x`）端口，不抢占 `23001` |
+| `alma-time-audit` | `~/.config/alma/scripts/`、`~/dev/code/alma-time-audit/` | 产出日/周报，做事后审计与评分。**DayHelm 负责当天实时掌舵并在 24001 开放完整数据，与它互补** |
+| 本机 AI Agents (Claude Code / Codex / Hermes) | CLI & `127.0.0.1:24001` | 通过 `dayhelm query/search/sessions` 或 `/api/dayhelm/context` 获取当日实时上下文 |
 
 ## 未得到用户明确要求时
 

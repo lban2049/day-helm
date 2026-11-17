@@ -33,5 +33,6 @@ A / B / C，各自的代价，不要只写优点。
 | [001](001-lightweight-quota-and-supervision.md) | 定位转向：从"切换瞬间强制摩擦/白名单锁"转为"轻量配额监督与趋势提醒"（定名 DayHelm） | 已采纳 |
 | [002](002-swiftpm-architecture-and-testing.md) | 工程架构与测试规范：SwiftPM 四模块分层与可注入时钟自检 | 已采纳 |
 | [003](003-standalone-native-recorder-and-open-agent-hub.md) | 独立原生采集、屏幕 OCR 与开放 Agent 数据中心 | 已采纳 |
+| [006](006-activity-classification-and-retention.md) | 活动分类与标题抖动抑制、idle 会话/截图、截图触发去重、凭据脱敏、结构化标签与旧快照降采样 | 已采纳 |
 | 004 | 项目映射机制（如何区分"切去其它项目"与"多应用正常协同"） | 待阶段 2 开始前拍板 |
 | 005 | 跑偏与高频乱切的滑动窗口判定阈值及提醒交互 | 待阶段 2 开始前拍板 |

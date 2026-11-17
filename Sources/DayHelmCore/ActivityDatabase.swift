@@ -219,6 +219,34 @@ public struct RecordedOCRFrame: Sendable, Equatable, Codable, Identifiable {
     }
 }
 
+public struct SnapshotMaintenanceRecord: Sendable, Equatable {
+    public let id: String
+    public let filePath: String
+    public let timestamp: Int64
+    public let width: Int
+    public let height: Int
+    public let sizeBytes: Int64
+    public let storageTier: String
+
+    public init(
+        id: String,
+        filePath: String,
+        timestamp: Int64,
+        width: Int,
+        height: Int,
+        sizeBytes: Int64,
+        storageTier: String
+    ) {
+        self.id = id
+        self.filePath = filePath
+        self.timestamp = timestamp
+        self.width = width
+        self.height = height
+        self.sizeBytes = sizeBytes
+        self.storageTier = storageTier
+    }
+}
+
 public struct RecordedSessionDetail: Sendable, Equatable, Codable {
     public let session: RecordedSessionSummary
     public let events: [RecordedActivityEvent]
@@ -488,6 +516,19 @@ public final class ActivityDatabase: @unchecked Sendable {
         }
     }
 
+    /// Closes the current open session at its last observed activity timestamp.
+    /// Used when the user goes idle so idle time is never counted into `duration_ms`.
+    public func closeActiveSessionAtLastActivity() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let openId = try currentOpenSessionIdLocked() else { return }
+        let summary = try fetchSessionSummaryLocked(sessionId: openId)
+        guard let endMs = try latestSessionTimestampLocked(sessionId: openId) ?? summary?.startedAt, endMs > 0 else {
+            return
+        }
+        try closeSessionLocked(sessionId: openId, endedAtMs: endMs)
+    }
+
     @discardableResult
     public func insertEvent(
         id: String? = nil,
@@ -531,9 +572,14 @@ public final class ActivityDatabase: @unchecked Sendable {
 
         let eventId = id ?? "evt_\(timestampMs)_\(UUID().uuidString.prefix(8).lowercased())"
         let cleanApp = nonEmpty(appName)
-        let cleanTitle = nonEmpty(windowTitle)
+        let cleanTitle = nonEmpty(windowTitle).map { PrivacyRedactor.redactSecrets(in: $0) }
         let cleanURL = PrivacyRedactor.sanitizeURL(nonEmpty(url))
-        let dataJSON = encodeJSONString(data) ?? "{}"
+        let sanitizedData: [String: String] = data.reduce(into: [:]) { acc, pair in
+            let value = pair.value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return }
+            acc[pair.key] = PrivacyRedactor.sanitizeMetadataValue(value)
+        }
+        let dataJSON = encodeJSONString(sanitizedData) ?? "{}"
 
         let sql = """
         INSERT INTO activity_events (
@@ -572,7 +618,7 @@ public final class ActivityDatabase: @unchecked Sendable {
             appName: cleanApp,
             windowTitle: cleanTitle,
             url: cleanURL,
-            data: data,
+            data: sanitizedData,
             createdAt: timestampMs
         )
     }
@@ -614,7 +660,7 @@ public final class ActivityDatabase: @unchecked Sendable {
 
         let snapshotId = id ?? "snap_\(timestampMs)_\(UUID().uuidString.prefix(8).lowercased())"
         let cleanApp = nonEmpty(appName)
-        let cleanTitle = nonEmpty(windowTitle)
+        let cleanTitle = nonEmpty(windowTitle).map { PrivacyRedactor.redactSecrets(in: $0) }
         let histJSON = histogram.flatMap { encodeJSONString($0) }
 
         let sql = """
@@ -687,7 +733,7 @@ public final class ActivityDatabase: @unchecked Sendable {
         defer { lock.unlock() }
 
         let frameId = id ?? "ocr_\(createdAtMs)_\(UUID().uuidString.prefix(8).lowercased())"
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = PrivacyRedactor.redactSecrets(in: text.trimmingCharacters(in: .whitespacesAndNewlines))
         let resolvedChars = charCount ?? trimmed.count
         let resolvedTokens = tokenCount ?? Self.estimateTokenCount(trimmed)
 
@@ -1105,6 +1151,67 @@ public final class ActivityDatabase: @unchecked Sendable {
     }
 
     // MARK: - Pruning & Purge
+
+    /// Lists snapshots older than `cutoffMs` that still sit at the given storage tier.
+    /// Used by the recorder to downscale old frames before final retention pruning.
+    public func listSnapshotsForMaintenance(
+        olderThanMs cutoffMs: Int64,
+        storageTier: String = "hot",
+        limit: Int = 500
+    ) throws -> [SnapshotMaintenanceRecord] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var records: [SnapshotMaintenanceRecord] = []
+        let sql = """
+        SELECT id, file_path, timestamp, width, height, size_bytes, storage_tier
+        FROM activity_snapshots
+        WHERE timestamp < ? AND storage_tier = ?
+        ORDER BY timestamp ASC
+        LIMIT ?;
+        """
+        try queryStatementLocked(sql, bind: { stmt in
+            sqlite3_bind_int64(stmt, 1, cutoffMs)
+            bindText(stmt, index: 2, value: storageTier)
+            sqlite3_bind_int(stmt, 3, Int32(max(1, limit)))
+        }, onRow: { stmt in
+            records.append(SnapshotMaintenanceRecord(
+                id: readText(stmt, 0) ?? "",
+                filePath: readText(stmt, 1) ?? "",
+                timestamp: sqlite3_column_int64(stmt, 2),
+                width: Int(sqlite3_column_int(stmt, 3)),
+                height: Int(sqlite3_column_int(stmt, 4)),
+                sizeBytes: sqlite3_column_int64(stmt, 5),
+                storageTier: readText(stmt, 6) ?? "hot"
+            ))
+        })
+        return records
+    }
+
+    /// Updates a snapshot row after its JPEG has been re-encoded at a smaller size.
+    public func updateSnapshotStorage(
+        snapshotId: String,
+        width: Int,
+        height: Int,
+        sizeBytes: Int64,
+        storageTier: String
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let sql = """
+        UPDATE activity_snapshots
+        SET width = ?, height = ?, size_bytes = ?, storage_tier = ?
+        WHERE id = ?;
+        """
+        try runStatementLocked(sql) { stmt in
+            sqlite3_bind_int(stmt, 1, Int32(max(0, width)))
+            sqlite3_bind_int(stmt, 2, Int32(max(0, height)))
+            sqlite3_bind_int64(stmt, 3, max(0, sizeBytes))
+            bindText(stmt, index: 4, value: storageTier)
+            bindText(stmt, index: 5, value: snapshotId)
+        }
+    }
 
     @discardableResult
     public func pruneOldSnapshots(
@@ -1532,8 +1639,11 @@ public final class ActivityDatabase: @unchecked Sendable {
         var countsByKey: [String: Int] = [:]
         var orderedKeys: [String] = []
 
+        var orderedApps: [String] = []
+        var orderedDomains: [String] = []
+
         let evtSQL = """
-        SELECT app_name, window_title FROM activity_events
+        SELECT app_name, window_title, url FROM activity_events
         WHERE session_id = ?
         ORDER BY timestamp ASC;
         """
@@ -1542,6 +1652,15 @@ public final class ActivityDatabase: @unchecked Sendable {
         }, onRow: { stmt in
             let app = nonEmpty(readText(stmt, 0))
             let title = nonEmpty(readText(stmt, 1))
+            if let app, !orderedApps.contains(app) {
+                orderedApps.append(app)
+            }
+            if let rawURL = nonEmpty(readText(stmt, 2)),
+               let host = URLComponents(string: rawURL)?.host?.lowercased(),
+               !host.isEmpty,
+               !orderedDomains.contains(host) {
+                orderedDomains.append(host)
+            }
             if let title {
                 let label = app.map { "\($0): \(title)" } ?? title
                 if countsByKey[label] == nil {
@@ -1606,20 +1725,54 @@ public final class ActivityDatabase: @unchecked Sendable {
         descParts.append("Events: \(session.eventCount), Snapshots: \(session.snapshotCount), OCR: \(ocrCount)")
         let description = descParts.joined(separator: " | ")
 
+        // Structured tags: task + high-frequency apps + web domains + headline windows.
+        var topics: [String] = []
+        func appendTopic(_ value: String?) {
+            guard let value = nonEmpty(value), !topics.contains(value) else { return }
+            topics.append(value)
+        }
+        let taskTag = session.declaredTaskId ?? session.project
+        appendTopic(taskTag)
+        if orderedApps.isEmpty {
+            for app in session.appNames.prefix(3) { appendTopic(app) }
+        } else {
+            for app in orderedApps.prefix(3) { appendTopic(app) }
+        }
+        for domain in orderedDomains.prefix(3) { appendTopic(domain) }
+        topics = Array(topics.prefix(8))
+
+        var entities: [String: [String]] = [:]
+        if let taskTag = nonEmpty(taskTag) { entities["task"] = [taskTag] }
+        let appEntities = Array(orderedApps.prefix(8))
+        if !appEntities.isEmpty { entities["app"] = appEntities }
+        let domainEntities = Array(orderedDomains.prefix(8))
+        if !domainEntities.isEmpty { entities["domain"] = domainEntities }
+        let highlights = Array(topTitles.prefix(3))
+
+        let topicsJSON = encodeJSONString(topics) ?? "[]"
+        let entitiesJSON = encodeJSONString(entities) ?? "{}"
+        let highlightsJSON = encodeJSONString(highlights) ?? "[]"
+
         let updateSQL = """
         UPDATE activity_sessions
         SET analysis_status = 'completed',
             analysis_title = ?,
             analysis_description = ?,
             analysis_model = 'dayhelm-native',
-            analyzed_at = ?
+            analyzed_at = ?,
+            topics = ?,
+            entities = ?,
+            highlights = ?
         WHERE id = ?;
         """
         try runStatementLocked(updateSQL) { stmt in
             bindText(stmt, index: 1, value: headline)
             bindText(stmt, index: 2, value: description)
             sqlite3_bind_int64(stmt, 3, nowMs)
-            bindText(stmt, index: 4, value: sessionId)
+            bindText(stmt, index: 4, value: topicsJSON)
+            bindText(stmt, index: 5, value: entitiesJSON)
+            bindText(stmt, index: 6, value: highlightsJSON)
+            bindText(stmt, index: 7, value: sessionId)
         }
     }
 

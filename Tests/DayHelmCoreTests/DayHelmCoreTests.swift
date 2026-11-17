@@ -78,6 +78,28 @@ final class DayHelmCoreTests: XCTestCase {
         XCTAssertEqual(PrivacyRedactor.sanitizeURL("https://example.com/login?token=abc&sig=def"), "https://example.com/login")
     }
 
+    func testActivityClassifierDistinguishesBrowserVisitsFromFileDocuments() {
+        XCTAssertEqual(ActivityClassifier.eventKind(appName: "Google Chrome", bundleId: "com.google.Chrome", url: "https://example.com", redacted: false), "browser_visit")
+        XCTAssertEqual(ActivityClassifier.eventKind(appName: "Preview", bundleId: "com.apple.Preview", url: "file:///tmp/a.pdf", redacted: false), "app_focus")
+        XCTAssertEqual(ActivityClassifier.eventKind(appName: "Google Chrome", bundleId: "com.google.Chrome", url: "https://example.com", redacted: true), "app_focus")
+        XCTAssertEqual(ActivityClassifier.normalizedURLKey("https://Example.com/a#x"), "https://example.com/a")
+    }
+
+    func testActivityTextNormalizerIgnoresVolatileTitleJitter() {
+        XCTAssertEqual(ActivityTextNormalizer.normalizedTitleKey("Inbox (3) — Gmail"), ActivityTextNormalizer.normalizedTitleKey("Inbox (9) — Gmail"))
+        XCTAssertEqual(ActivityTextNormalizer.normalizedTitleKey("Standup 14:52"), ActivityTextNormalizer.normalizedTitleKey("Standup 09:03"))
+        XCTAssertEqual(ActivityTextNormalizer.normalizedTitleKey("Uploading… 45%"), ActivityTextNormalizer.normalizedTitleKey("Uploading… 87%"))
+        XCTAssertNotEqual(ActivityTextNormalizer.normalizedTitleKey("Alpha Spec"), ActivityTextNormalizer.normalizedTitleKey("Beta Spec"))
+        XCTAssertTrue(ActivityTextNormalizer.isVolatileOnlyChange(previous: "Inbox (3)", current: "Inbox (9)"))
+    }
+
+    func testPrivacyRedactorMasksCredentialsInFreeFormMetadata() {
+        let masked = PrivacyRedactor.redactSecrets(in: "token: abcdef123456 password=hunter2")
+        XCTAssertFalse(masked.contains("abcdef123456"))
+        XCTAssertFalse(masked.contains("hunter2"))
+        XCTAssertEqual(PrivacyRedactor.sanitizeMetadataValue("https://example.com/a?token=abc&page=2"), "https://example.com/a?page=2")
+    }
+
     func testEventMergerMergesWithinPulsetimeAndSplitsBeyondPulsetime() {
         let t0 = baseDate()
         let s1 = ActivitySample(timestamp: t0, appName: "Editor", bundleId: "com.example.editor", windowTitle: "Example Doc", url: nil, idleSeconds: 1, screenLocked: false, inputActive: true)
@@ -581,6 +603,10 @@ final class DayHelmCoreTests: XCTestCase {
             clock: ManualClock(now: t0.addingTimeInterval(120)),
             stateProvider: { LocalActivityHTTPServer.RuntimeState(axTrusted: true, screenCaptureTrusted: true, deepRecordingEnabled: true, daySnapshot: daySnap) }
         )
+        XCTAssertEqual(LocalActivityHTTPServer.defaultPrimaryPort, 24001)
+        XCTAssertFalse(LocalActivityHTTPServer.defaultPortCandidates.contains(23001))
+        XCTAssertTrue(LocalActivityHTTPServer.defaultPortCandidates.allSatisfy { (24001...24009).contains($0) })
+
         let ports = await server.start(primaryPort: 0, fallbackPort: nil)
         defer { server.stop() }
         let port = try XCTUnwrap(ports.first)
@@ -1459,6 +1485,31 @@ struct DayHelmCoreTests {
         let raw = "https://example.com/dashboard?tab=orders&token=secret123&key=abc&session=xyz&sig=999&secret=s&password=p&auth=bearer&page=2"
         #expect(PrivacyRedactor.sanitizeURL(raw) == "https://example.com/dashboard?tab=orders&page=2")
         #expect(PrivacyRedactor.sanitizeURL("https://example.com/login?token=abc&sig=def") == "https://example.com/login")
+    }
+
+    @Test("ActivityClassifier keeps file documents as app_focus and web URLs as browser_visit")
+    func activityClassifierDistinguishesBrowserVisitsFromFileDocuments() {
+        #expect(ActivityClassifier.eventKind(appName: "Google Chrome", bundleId: "com.google.Chrome", url: "https://example.com", redacted: false) == "browser_visit")
+        #expect(ActivityClassifier.eventKind(appName: "Preview", bundleId: "com.apple.Preview", url: "file:///tmp/a.pdf", redacted: false) == "app_focus")
+        #expect(ActivityClassifier.eventKind(appName: "Google Chrome", bundleId: "com.google.Chrome", url: "https://example.com", redacted: true) == "app_focus")
+        #expect(ActivityClassifier.normalizedURLKey("https://Example.com/a#x") == "https://example.com/a")
+    }
+
+    @Test("ActivityTextNormalizer ignores volatile counters, clocks, and percentages")
+    func activityTextNormalizerIgnoresVolatileTitleJitter() {
+        #expect(ActivityTextNormalizer.normalizedTitleKey("Inbox (3) — Gmail") == ActivityTextNormalizer.normalizedTitleKey("Inbox (9) — Gmail"))
+        #expect(ActivityTextNormalizer.normalizedTitleKey("Standup 14:52") == ActivityTextNormalizer.normalizedTitleKey("Standup 09:03"))
+        #expect(ActivityTextNormalizer.normalizedTitleKey("Uploading… 45%") == ActivityTextNormalizer.normalizedTitleKey("Uploading… 87%"))
+        #expect(ActivityTextNormalizer.normalizedTitleKey("Alpha Spec") != ActivityTextNormalizer.normalizedTitleKey("Beta Spec"))
+        #expect(ActivityTextNormalizer.isVolatileOnlyChange(previous: "Inbox (3)", current: "Inbox (9)"))
+    }
+
+    @Test("PrivacyRedactor masks credentials in free-form metadata")
+    func privacyRedactorMasksCredentialsInFreeFormMetadata() {
+        let masked = PrivacyRedactor.redactSecrets(in: "token: abcdef123456 password=hunter2")
+        #expect(!masked.contains("abcdef123456"))
+        #expect(!masked.contains("hunter2"))
+        #expect(PrivacyRedactor.sanitizeMetadataValue("https://example.com/a?token=abc&page=2") == "https://example.com/a?page=2")
     }
 
     @Test("EventMerger merges within pulsetime and splits beyond pulsetime")

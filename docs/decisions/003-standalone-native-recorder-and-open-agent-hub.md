@@ -18,12 +18,12 @@ DayHelm 最初依赖本机常驻的 Alma `activity-recorder`（`localhost:23001`
 - **方案 B：在 DayHelm 内构建独立原生采集引擎 + 开放 SQLite 数据库 + Agent CLI/HTTP 数据中心，同时保持对 Alma API 的兼容**
   - 利用 macOS 原生 `ScreenCaptureKit` + 32-bin 直方图/8×8 感知哈希去重 + 设备端 `Vision` OCR（`zh-Hans` / `zh-Hant` / `en-US` / `ja`）+ `NSWorkspace` / `NSEvent` 轻量活动监听，将全部数据写入开放的 `~/.config/alma/dayhelm/activity.sqlite`。
   - 屏幕录制权限设为**可选且可开关**：未授权或关闭深度录制时，无痛降级为纯 AX 窗口标题 + URL + 事件录制，不反复弹窗。
-  - 通过 `Network` 框架在 `127.0.0.1:23002` 提供本地 HTTP API，并在 `23001` 空闲时自动兼听 `23001`，无缝兼容 `alma-time-audit`；同时提供 `dayhelm query` / `search` / `sessions` CLI 供任意 AI Agent 调用。
+  - 通过 `Network` 框架在 `127.0.0.1:24001`（若被占用则在 `24001...24009` 自动选端，避免占用 Alma 的 `23001` 端口）提供本地兼容 HTTP API；同时提供 `dayhelm query` / `search` / `sessions` CLI 供任意 AI Agent 调用。
   - 代价：工程新增 SQLite 存储层、原生截图去重与 OCR 调度、本地环回 HTTP 服务，需要严格守住隐私脱敏与磁盘留存边界。
 
 ## 选择
 
-选择 **方案 B**：将完整的原生屏幕快照去重、Apple Vision OCR、开放 SQLite 数据库（`activity.sqlite`）、Agent CLI（`query` / `search` / `sessions`）与兼容本地 HTTP API（`:23002` + 空闲兼听 `:23001`）全部内置于 DayHelm。
+选择 **方案 B**：将完整的原生屏幕快照去重、Apple Vision OCR、开放 SQLite 数据库（`activity.sqlite`）、Agent CLI（`query` / `search` / `sessions`）与兼容本地 HTTP API（`:24001` / `2400x`）全部内置于 DayHelm，且不占用 Alma 的 `23001` 端口。
 
 ## 理由
 

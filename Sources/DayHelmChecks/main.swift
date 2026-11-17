@@ -1,5 +1,6 @@
 import CoreGraphics
 import CoreText
+import ImageIO
 import DayHelmCapture
 import DayHelmCore
 import Foundation
@@ -31,7 +32,7 @@ struct DayHelmChecksMain {
     static func main() async {
         do {
             try await runAllChecks()
-            print("ALL DAYHELM CHECKS PASSED (30/30)")
+            print("ALL DAYHELM CHECKS PASSED (37/37)")
             exit(0)
         } catch {
             fputs("DAYHELM CHECK FAILED: \(error)\n", stderr)
@@ -86,11 +87,16 @@ struct DayHelmChecksMain {
     private final class MockScreenCapturer: ScreenCapturing, @unchecked Sendable {
         private let lock = NSLock()
         private var currentImage: CGImage
+        private var captureCount = 0
         let isScreenCaptureTrusted: Bool
 
         init(image: CGImage, isScreenCaptureTrusted: Bool = true) {
             self.currentImage = image
             self.isScreenCaptureTrusted = isScreenCaptureTrusted
+        }
+
+        var captures: Int {
+            lock.withLock { captureCount }
         }
 
         func setImage(_ image: CGImage) {
@@ -99,18 +105,15 @@ struct DayHelmChecksMain {
             }
         }
 
-        private func readCurrentImage() -> CGImage {
-            lock.withLock {
-                currentImage
-            }
-        }
-
         func requestScreenCapturePermission() -> Bool {
             isScreenCaptureTrusted
         }
 
         func captureMainDisplayImage() async throws -> CGImage {
-            readCurrentImage()
+            lock.withLock {
+                captureCount += 1
+                return currentImage
+            }
         }
     }
 
@@ -865,6 +868,10 @@ struct DayHelmChecksMain {
                     )
                 }
             )
+            try checkEqual(LocalActivityHTTPServer.defaultPrimaryPort, 24001, "Default primary port is 24001 (in 2400x range)")
+            try check(!LocalActivityHTTPServer.defaultPortCandidates.contains(23001), "Port candidates never include Alma's 23001 port")
+            try check(LocalActivityHTTPServer.defaultPortCandidates.allSatisfy { (24001...24009).contains($0) }, "Port candidates stay within 24001...24009")
+
             let ports = await server.start(primaryPort: 0, fallbackPort: nil)
             defer { server.stop() }
             guard let port = ports.first else {
@@ -1602,6 +1609,327 @@ struct DayHelmChecksMain {
             try checkEqual(counts.ocrFrames, 25, "All 25 concurrent OCR frames persisted without loss")
             try checkEqual(try db.integrityCheck().lowercased(), "ok", "SQLite PRAGMA integrity_check reports ok")
             try checkEqual((try db.search(keyword: "StressOCR", limit: 50)).count, 25, "All 25 OCR frames remain searchable")
+        }
+
+        try await runCheck("31. ActivityClassifier distinguishes browser_visit from file:// app_focus") {
+            try checkEqual(
+                ActivityClassifier.eventKind(appName: "Google Chrome", bundleId: "com.google.Chrome", url: "https://shop.example.com/orders", redacted: false),
+                "browser_visit",
+                "Chrome + https => browser_visit"
+            )
+            try checkEqual(
+                ActivityClassifier.eventKind(appName: "Preview", bundleId: "com.apple.Preview", url: "file:///Users/me/Earnings%20Call.pdf", redacted: false),
+                "app_focus",
+                "Preview + file:// => app_focus (not browser_visit)"
+            )
+            try checkEqual(
+                ActivityClassifier.eventKind(appName: "Xcode", bundleId: "com.apple.dt.Xcode", url: "file:///Users/me/project.xcodeproj", redacted: false),
+                "app_focus",
+                "Xcode + file:// => app_focus"
+            )
+            try checkEqual(
+                ActivityClassifier.eventKind(appName: "Google Chrome", bundleId: "com.google.Chrome", url: "https://secret.example.com", redacted: true),
+                "app_focus",
+                "Redacted samples never become browser_visit"
+            )
+            try checkEqual(
+                ActivityClassifier.eventKind(appName: "Terminal", bundleId: "com.apple.Terminal", url: nil, redacted: false),
+                "app_focus",
+                "No URL => app_focus"
+            )
+            try checkEqual(
+                ActivityClassifier.normalizedURLKey("https://Shop.Example.com/a?b=1#frag"),
+                "https://shop.example.com/a?b=1",
+                "URL change key drops fragment and lowercases scheme/host"
+            )
+        }
+
+        try await runCheck("32. ActivityTextNormalizer suppresses title jitter but keeps semantic changes") {
+            let inboxA = "Inbox (3) — Gmail"
+            let inboxB = "Inbox (12) — Gmail"
+            try checkEqual(
+                ActivityTextNormalizer.normalizedTitleKey(inboxA),
+                ActivityTextNormalizer.normalizedTitleKey(inboxB),
+                "Unread counters normalize to the same key"
+            )
+            try check(ActivityTextNormalizer.isVolatileOnlyChange(previous: inboxA, current: inboxB), "Unread counter change is volatile-only")
+
+            let progressA = "Uploading… 45%"
+            let progressB = "Uploading… 87%"
+            try checkEqual(
+                ActivityTextNormalizer.normalizedTitleKey(progressA),
+                ActivityTextNormalizer.normalizedTitleKey(progressB),
+                "Progress percentage / ellipsis normalize to the same key"
+            )
+
+            let clockA = "Standup 14:52"
+            let clockB = "Standup 09:03"
+            try checkEqual(
+                ActivityTextNormalizer.normalizedTitleKey(clockA),
+                ActivityTextNormalizer.normalizedTitleKey(clockB),
+                "Clocks normalize to the same key"
+            )
+
+            let alpha = "Product Spec Alpha"
+            let beta = "Product Spec Beta"
+            try check(
+                ActivityTextNormalizer.normalizedTitleKey(alpha) != ActivityTextNormalizer.normalizedTitleKey(beta),
+                "Word changes must produce different keys"
+            )
+            try check(!ActivityTextNormalizer.isVolatileOnlyChange(previous: alpha, current: beta), "Word change is not volatile-only")
+        }
+
+        try await runCheck("33. Credential redaction for metadata, URLs and OCR text") {
+            let rawKeyText = "export API_KEY=sk-abcdefghijklmnop1234567890"
+            let maskedKey = PrivacyRedactor.redactSecrets(in: rawKeyText)
+            try check(!maskedKey.contains("sk-abcdefghijklmnop1234567890"), "sk- token must be masked (got: \(maskedKey))")
+            try check(maskedKey.contains("***"), "Masked key keeps a *** marker")
+
+            let rawJWT = "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+            let maskedJWT = PrivacyRedactor.redactSecrets(in: rawJWT)
+            try check(!maskedJWT.contains("eyJhbGciOiJIUzI1NiJ9"), "JWT payload must be masked")
+
+            let rawPassword = "password=hunter2 token: abcdef123456"
+            let maskedPassword = PrivacyRedactor.redactSecrets(in: rawPassword)
+            try check(!maskedPassword.contains("hunter2"), "password value must be masked")
+            try check(!maskedPassword.contains("abcdef123456"), "token value must be masked")
+
+            try checkEqual(
+                PrivacyRedactor.sanitizeMetadataValue("https://shop.example.com/orders?token=secret123&page=2"),
+                "https://shop.example.com/orders?page=2",
+                "Metadata URL values drop credential query params"
+            )
+
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-secret-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let db = try ActivityDatabase(databaseURL: tmpDir.appendingPathComponent("activity.sqlite"))
+            let t0Ms = Int64(baseDate().timeIntervalSince1970 * 1000)
+            let ev = try db.insertEvent(
+                timestampMs: t0Ms,
+                kind: "app_focus",
+                appName: "Terminal",
+                windowTitle: "session token: abcdef123456",
+                data: ["note": "Authorization: Bearer abcdefghijklmnop", "url": "https://api.example.com/v1?token=secret123"]
+            )
+            try checkEqual(ev.windowTitle?.contains("abcdef123456"), false, "insertEvent redacts windowTitle tokens")
+            try checkEqual(ev.data["url"], "https://api.example.com/v1", "insertEvent sanitizes data URL params")
+            try checkEqual(ev.data["note"]?.contains("abcdefghijklmnop"), false, "insertEvent redacts data credentials")
+
+            let snap = try db.insertSnapshot(
+                sessionId: ev.sessionId,
+                timestampMs: t0Ms + 1_000,
+                filePath: tmpDir.appendingPathComponent("s.jpg").path,
+                width: 10,
+                height: 10,
+                sizeBytes: 1,
+                appName: "Terminal",
+                windowTitle: "token: abcdef123456"
+            )
+            let ocr = try db.insertOCRFrame(
+                snapshotId: snap.id,
+                sessionId: ev.sessionId,
+                text: "password=hunter2 and token: abcdef123456",
+                createdAtMs: t0Ms + 1_000
+            )
+            try check(!ocr.text.contains("hunter2"), "insertOCRFrame masks password value")
+            try check(!ocr.text.contains("abcdef123456"), "insertOCRFrame masks token value")
+        }
+
+        try await runCheck("34. Idle closes sessions at last activity and structured tags are populated") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-idle-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let t0 = baseDate()
+            let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+            let ev = try db.insertEvent(
+                timestampMs: t0Ms,
+                kind: "browser_visit",
+                appName: "Google Chrome",
+                windowTitle: "Shop Orders",
+                url: "https://shop.example.com/orders?page=2",
+                declaredTaskId: "ecommerce",
+                project: "ecommerce"
+            )
+            _ = try db.insertEvent(
+                timestampMs: t0Ms + 3_000,
+                kind: "app_focus",
+                appName: "Google Chrome",
+                windowTitle: "Shop Orders",
+                url: "https://shop.example.com/orders?page=2",
+                declaredTaskId: "ecommerce"
+            )
+
+            try check(try db.currentOpenSessionId() != nil, "Session is open while active")
+            try db.closeActiveSessionAtLastActivity()
+            try check(try db.currentOpenSessionId() == nil, "closeActiveSessionAtLastActivity closes the open session")
+
+            guard let detail = try db.getSessionDetail(sessionId: ev.sessionId) else {
+                throw CheckFailure(description: "Missing session detail after idle close")
+            }
+            try checkEqual(detail.session.endedAt, t0Ms + 3_000, "ended_at uses last observed activity, not idle time")
+            try checkEqual(detail.session.durationMs, 3_000, "duration excludes idle tail")
+            try check(detail.session.topics.contains("ecommerce"), "topics include declared task")
+            try check(detail.session.topics.contains("Google Chrome"), "topics include frequent app")
+            try check(detail.session.topics.contains("shop.example.com"), "topics include web domain")
+            try checkEqual(detail.session.entities["domain"], ["shop.example.com"], "entities.domain groups web domains")
+            try checkEqual(detail.session.entities["app"], ["Google Chrome"], "entities.app groups apps")
+            try check(detail.session.entities["task"] == ["ecommerce"], "entities.task carries declared task")
+            try check(!detail.session.highlights.isEmpty, "highlights contain headline windows")
+        }
+
+        try await runCheck("35. AlmaActivityClient consumes local /api/activity-recorder API end-to-end") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-alma-api-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let t0 = baseDate()
+            let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+            let ev = try db.insertEvent(
+                timestampMs: t0Ms,
+                kind: "browser_visit",
+                appName: "Google Chrome",
+                windowTitle: "Q4 Research Note",
+                url: "https://research.example.com/q4",
+                data: ["bundleId": "com.google.Chrome"],
+                declaredTaskId: "hermes"
+            )
+            let server = LocalActivityHTTPServer(database: db, store: store, clock: ManualClock(now: t0))
+            let ports = await server.start(primaryPort: 0, fallbackPort: nil)
+            defer { server.stop() }
+            guard let port = ports.first else {
+                throw CheckFailure(description: "Failed to bind HTTP port for Alma compatibility check")
+            }
+
+            let client = AlmaActivityClient(
+                baseURL: URL(string: "http://127.0.0.1:\(port)")!,
+                transport: URLSessionAlmaTransport(timeoutInterval: 3.0)
+            )
+            let sessions = try await client.fetchSessions(sinceMs: t0Ms - 1_000, untilMs: t0Ms + 60_000)
+            try checkEqual(sessions.count, 1, "Alma client decodes exactly one session from local API")
+            try checkEqual(sessions.first?.id, ev.sessionId, "Alma client session id matches")
+            try checkEqual(sessions.first?.appNames ?? [], ["Google Chrome"], "Alma client decodes appNames")
+
+            let events = try await client.fetchSessionEvents(sessionId: ev.sessionId)
+            try checkEqual(events.count, 1, "Alma client decodes embedded session events")
+            try checkEqual(events.first?.kind, "browser_visit", "Alma client decodes event kind")
+
+            let eventsRoute = server.handleRawHTTPRequestLineAndRoute(
+                target: "/api/activity-recorder/sessions/\(ev.sessionId)/events"
+            )
+            try checkEqual(eventsRoute.statusCode, 200, "GET /sessions/<id>/events returns 200")
+            let eventsJSON = String(data: eventsRoute.body, encoding: .utf8) ?? ""
+            try check(eventsJSON.contains("\"events\"") && eventsJSON.contains("\"total\""), "Events endpoint returns {events,total}")
+        }
+
+        try await runCheck("36. app_focus / click / typing_pause all de-duplicate and idle never captures") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-triggers-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let t0 = baseDate()
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+            let imgA = try makeSyntheticTextImage(text: "Alpha Screen 2026", backgroundWhite: true)
+            let imgB = try makeSyntheticTextImage(text: "Beta Screen 2026", backgroundWhite: false)
+            let capturer = MockScreenCapturer(image: imgA, isScreenCaptureTrusted: true)
+            let recorder = NativeScreenRecorder(
+                database: db,
+                snapshotsRootDir: store.snapshotsDirectory,
+                capturer: capturer,
+                clock: ManualClock(now: t0)
+            )
+
+            func sample(_ offset: TimeInterval, idle: TimeInterval = 0) -> ActivitySample {
+                ActivitySample(
+                    timestamp: t0.addingTimeInterval(offset),
+                    appName: "Editor",
+                    bundleId: "com.example.editor",
+                    windowTitle: "Doc",
+                    url: nil,
+                    idleSeconds: idle,
+                    screenLocked: false,
+                    inputActive: idle < 300
+                )
+            }
+
+            let first = try await recorder.processCapturedImage(imgA, sample: sample(0), trigger: "app_focus", declaredTaskId: nil, runOCR: false)
+            try check(first, "First app_focus frame is saved")
+            let dupFocus = try await recorder.processCapturedImage(imgA, sample: sample(5), trigger: "app_focus", declaredTaskId: nil, runOCR: false)
+            try check(!dupFocus, "app_focus with identical pixels is de-duplicated")
+            let dupClick = try await recorder.processCapturedImage(imgA, sample: sample(10), trigger: "click", declaredTaskId: nil, runOCR: false)
+            try check(!dupClick, "click with identical pixels is de-duplicated")
+            let changedClick = try await recorder.processCapturedImage(imgB, sample: sample(20), trigger: "click", declaredTaskId: nil, runOCR: false)
+            try check(changedClick, "click with a visual change is saved")
+            let dupTyping = try await recorder.processCapturedImage(imgB, sample: sample(30), trigger: "typing_pause", declaredTaskId: nil, runOCR: false)
+            try check(!dupTyping, "typing_pause with identical pixels is de-duplicated")
+
+            let before = capturer.captures
+            recorder.triggerAppFocusCaptureIfNeeded(sample: sample(40, idle: 400), deepRecordingEnabled: true, declaredTaskId: nil, idleThresholdSeconds: 300)
+            recorder.triggerClickCaptureIfNeeded(sample: sample(40, idle: 400), deepRecordingEnabled: true, declaredTaskId: nil, idleThresholdSeconds: 300)
+            recorder.triggerTypingPauseCaptureIfNeeded(sample: sample(40, idle: 400), deepRecordingEnabled: true, declaredTaskId: nil, idleThresholdSeconds: 300)
+            recorder.evaluatePeriodicCaptureIfNeeded(sample: sample(40, idle: 400), deepRecordingEnabled: true, declaredTaskId: nil, idleThresholdSeconds: 300, retentionDays: 7)
+            try await Task.sleep(nanoseconds: 80_000_000)
+            try checkEqual(capturer.captures, before, "Idle samples must never capture screenshots")
+        }
+
+        try await runCheck("37. Old snapshots are downsampled before final retention pruning") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-downsample-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let t0 = baseDate()
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+            let img = try makeSyntheticTextImage(text: "Downsample Target 2026", backgroundWhite: true, width: 960, height: 240)
+            let recorder = NativeScreenRecorder(
+                database: db,
+                snapshotsRootDir: store.snapshotsDirectory,
+                clock: ManualClock(now: t0)
+            )
+            let sample = ActivitySample(
+                timestamp: t0,
+                appName: "Editor",
+                bundleId: "com.example.editor",
+                windowTitle: "Doc",
+                url: nil,
+                idleSeconds: 0,
+                screenLocked: false,
+                inputActive: true
+            )
+            let saved = try await recorder.processCapturedImage(img, sample: sample, trigger: "app_focus", declaredTaskId: "ecommerce", runOCR: false)
+            try check(saved, "Initial snapshot is saved before downsampling")
+            guard let sessionId = try db.currentOpenSessionId(),
+                  let beforeDetail = try db.getSessionDetail(sessionId: sessionId),
+                  let snapBefore = beforeDetail.snapshots.first else {
+                throw CheckFailure(description: "Missing snapshot before downsampling")
+            }
+            try checkEqual(snapBefore.width, 960, "Original snapshot keeps full width")
+            try checkEqual(snapBefore.storageTier, "hot", "Fresh snapshot is hot tier")
+
+            let result = await recorder.downsampleOldSnapshots(
+                olderThanDays: 1,
+                retentionDays: 7,
+                maxWidth: 480,
+                quality: 0.4,
+                now: t0.addingTimeInterval(3 * 86_400)
+            )
+            try checkEqual(result.downsampled, 1, "Exactly one old snapshot is downsampled")
+
+            guard let afterDetail = try db.getSessionDetail(sessionId: sessionId),
+                  let snapAfter = afterDetail.snapshots.first else {
+                throw CheckFailure(description: "Missing snapshot after downsampling")
+            }
+            try check(snapAfter.width <= 480, "Downsampled snapshot width <= 480 (got \(snapAfter.width))")
+            try checkEqual(snapAfter.storageTier, "downsampled", "Downsampled snapshot tier is recorded")
+            try check(snapAfter.sizeBytes < snapBefore.sizeBytes, "Downsampling reduces stored bytes")
+            try check(FileManager.default.fileExists(atPath: snapAfter.filePath), "Downsampled JPEG still exists on disk")
+
+            guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: snapAfter.filePath) as CFURL, nil),
+                  let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                  let width = props[kCGImagePropertyPixelWidth] as? Int else {
+                throw CheckFailure(description: "Unable to read downsampled JPEG properties")
+            }
+            try check(width <= 480, "JPEG on disk is actually <= 480px wide (got \(width))")
         }
     }
 

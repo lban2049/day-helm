@@ -10,7 +10,7 @@
 
 1. **独立原生全量记录与分析（Record & Analyze）**：彻底脱离 Alma 独立运行——内置原生应用焦点/键鼠活跃监听、AX 窗口标题与 URL 采集、可选的 32-bin 直方图去重屏幕快照与本机 Apple Vision OCR，并将全部会话/事件/快照/OCR 写入开放的 `~/.config/alma/dayhelm/activity.sqlite`。
 2. **双向时间预算管理（Target & Cap）**：核心推进事项设**保底（Target）**，看清还差多少；容易失控的事务（如日常运营）设**封顶（Cap）**，到点提醒换挡，避免在一件事上耗尽全天。
-3. **温和趋势监督与开放 Agent 数据中心（Nudge & Open Hub）**：声明专注事项后容许跨多应用正常协作；通过右上角非抢占式卡片温和提醒，并开放 `dayhelm query/search/sessions` CLI 与本地兼容 HTTP API（`:23002` + 空闲兼听 `:23001`）供任意 AI Agent 与 `alma-time-audit` 读取。
+3. **温和趋势监督与开放 Agent 数据中心（Nudge & Open Hub）**：声明专注事项后容许跨多应用正常协作；通过右上角非抢占式卡片温和提醒，并开放 `dayhelm query/search/sessions` CLI 与本地兼容 HTTP API（`127.0.0.1:24001` / `2400x`）供任意 AI Agent 与 `alma-time-audit` 读取。
 
 ## 为什么需要它
 
@@ -25,14 +25,14 @@
 更关键的是现实工作流的特征：
 1. **单任务天然跨多应用**：处理电商事务时，需要在浏览器、图片工具、表格、终端等多个应用间正常切换，**靠“锁死单一应用/白名单”完全行不通**，只会产生海量误报。
 2. **切换发生在多个正当工作之间**：在 `alma` / `ecommerce` / `hermes` / `infra-billing` 之间横跳，或者在某一项运营事务上不知不觉耗掉半天。
-3. **彻底摆脱外部黑盒采集与事后滞后**：DayHelm 自行完成窗口标题、URL、去重截图与设备端 Vision OCR 录制并写入开放 SQLite，既能在当天实时监督，也能在 Alma 关闭时直接接管 `localhost:23001/23002` 服务 `alma-time-audit` 与本机 AI Agent。
+3. **彻底摆脱外部黑盒采集与事后滞后**：DayHelm 自行完成窗口标题、URL、去重截图与设备端 Vision OCR 录制并写入开放 SQLite，既能在当天实时监督，也能通过独立的 `localhost:24001`（`2400x` 段，不抢占 Alma 的 `23001`）服务 `alma-time-audit` 与本机 AI Agent。
 
 ## 核心设计原则
 
 - **监督与校准，而不是强制锁死。** 不拦截 Cmd+Tab，不隐藏窗口，不搞全屏读秒锁。用右上角**不抢键盘焦点**的轻量 HUD 卡片提醒，把无意识切换变成有意识决定。
 - **高密度精密仪表风（Precision Telemetry）。** 菜单栏胶囊常驻显示当前事项与配额进度（如 `● 电商做深 · 52/90m`），下拉面板一屏呈现专注切换器、采集与 OCR 引擎状态、双向预算条、今日时间光谱条（Day Spectrum Ribbon）与连续度微指标。
 - **独立原生采集 + 可选 Vision OCR + 隐私优先。** `Screen Recording` 为可选权限，开启后自动执行 32-bin 直方图去重与设备端多语言 Vision OCR（`zh-Hans`/`zh-Hant`/`en-US`/`ja`）；权限拒绝或关闭时静默运行纯 AX 录制。命中敏感应用过滤（`redacted == true`）或锁屏时绝不截屏、不跑 OCR。
-- **开放 Agent CLI & 兼容 HTTP API。** 提供 `query` / `search` / `sessions` CLI 与 `127.0.0.1:23002`（空闲兼听 `23001`）环回接口，完整兼容 `/api/activity-recorder/...`。
+- **开放 Agent CLI & 兼容 HTTP API。** 提供 `query` / `search` / `sessions` CLI 与 `127.0.0.1:24001`（若被占用则在 `24001...24009` 自动选端）环回接口，完整兼容 `/api/activity-recorder/...`，且绝不冲突占用 Alma 的 `23001` 端口。
 
 ## 快速开始（Build & Run）
 
@@ -68,7 +68,7 @@ swift run DayHelmChecks
 
 ## 当前阶段
 
-**独立原生采集与开放数据中心已就绪**：无需启动 Alma，DayHelm 即可完成活动事件 + AX 标题/URL + 可选去重截图与 Apple Vision OCR 录制，并通过 `activity.sqlite`、Agent CLI 与本地兼容 HTTP API（`23002`/`23001`）对外开放。
+**独立原生采集与开放数据中心已就绪**：无需启动 Alma，DayHelm 即可完成活动事件 + AX 标题/URL + 可选去重截图与 Apple Vision OCR 录制，并通过 `activity.sqlite`、Agent CLI 与本地兼容 HTTP API（`24001` / `2400x`）对外开放。
 
 ## 文档
 
@@ -91,13 +91,13 @@ swift run DayHelmChecks
                                                             ├─▶ ~/.config/alma/dayhelm/activity.sqlite & snapshots/
                                                             ├─▶ ~/.config/alma/dayhelm/{today,days/*.json}
                                                             ├─▶ CLI: dayhelm query / search / sessions
-                                                            └─▶ HTTP 127.0.0.1:23002 (+ 空闲兼听 :23001)
+                                                            └─▶ HTTP 127.0.0.1:24001 (2400x 空闲自动选端)
                                                                   ├─▶ alma-time-audit（次日审计，含完整 windowTitle）
                                                                   └─▶ AI Agents（Claude Code / Codex / Hermes）
 ```
 
 - **实时掌舵 vs 事后审计**：`DayHelm` 负责当天实时采集、配额监督与即时 Agent 上下文检索，`alma-time-audit` 负责次日深度复盘与评分。
-- **零依赖接管 Alma 接口**：当 Alma 未运行时，DayHelm 自动兼听 `127.0.0.1:23001` 提供兼容 `/api/activity-recorder/...` 数据，且包含完整 `windowTitle`、`declared_task_id` 与 OCR 帧。
+- **端口隔离兼容 Alma 接口**：DayHelm 监听独立的 `127.0.0.1:24001`（`2400x` 段）提供兼容 `/api/activity-recorder/...` 数据（包含完整 `windowTitle`、`declared_task_id` 与 OCR 帧），绝不占用 Alma 自身的 `23001` 端口。
 
 ## 硬性边界与开源许可
 

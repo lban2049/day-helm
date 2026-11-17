@@ -52,9 +52,17 @@ public final class HybridActivityCoordinator: ObservableObject {
     private var lastNativeInputAt: Date?
     private var lastRecordedSampleKey: String?
     private var lastRecordedHeartbeatAt: Date?
+    private var lastRecordedAt: Date?
+    private var lastRecordedAppName: String?
+    private var lastRecordedURLKey: String?
+    private var pendingTypingPauseAt: Date?
+    private var idleSessionClosed: Bool = false
     private var lastPersistedAt: Date?
     private var tickCount: Int = 0
     private var isStarted: Bool = false
+
+    private let minTitleChangeInterval: TimeInterval = 5.0
+    private let typingPauseQuietSeconds: TimeInterval = 2.0
 
     public init(
         engine: DayHelmEngine,
@@ -263,16 +271,13 @@ public final class HybridActivityCoordinator: ObservableObject {
                 Task { [weak self] in
                     let ports = await server.start(
                         primaryPort: LocalActivityHTTPServer.defaultPrimaryPort,
-                        fallbackPort: LocalActivityHTTPServer.almaCompatiblePort
+                        fallbackPort: nil
                     )
                     await MainActor.run {
                         self?.apiServerPorts = ports
                         self?.apiServerPort = ports.first
                     }
-                    // Only sync from Alma if Alma actually owns 23001 (i.e. DayHelm didn't bind 23001)
-                    if !ports.contains(LocalActivityHTTPServer.almaCompatiblePort) {
-                        await self?.syncFromAlma(isInitialBackfill: true)
-                    }
+                    await self?.syncFromAlma(isInitialBackfill: true)
                 }
             } else {
                 Task { [weak self] in
@@ -304,9 +309,6 @@ public final class HybridActivityCoordinator: ObservableObject {
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 10_000_000_000)
                     guard !Task.isCancelled else { break }
-                    guard self?.httpServer?.isServingPort(LocalActivityHTTPServer.almaCompatiblePort) != true else {
-                        continue
-                    }
                     await self?.syncFromAlma(isInitialBackfill: false)
                 }
             }
@@ -610,17 +612,50 @@ public final class HybridActivityCoordinator: ObservableObject {
             activeAlert = newest
         }
 
-        recordSampleToDatabaseIfNeeded(sample)
-        screenRecorder?.evaluatePeriodicCaptureIfNeeded(
-            sample: sample,
-            deepRecordingEnabled: deepRecordingEnabled,
-            declaredTaskId: currentDeclaredTaskId(),
-            retentionDays: settings.snapshotRetentionDays
-        ) { [weak self] in
-            Task { @MainActor [weak self] in
-                self?.refreshRecorderCounts()
+        // Idle / locked: close the open session at its last activity and stop screenshots.
+        let isAbsent = sample.screenLocked || sample.idleSeconds >= engine.config.idleThresholdSeconds
+        if isAbsent {
+            pendingTypingPauseAt = nil
+            if !idleSessionClosed, !isSyntheticDemo, let database {
+                try? database.closeActiveSessionAtLastActivity()
+                idleSessionClosed = true
+            }
+        } else {
+            idleSessionClosed = false
+            if let pending = pendingTypingPauseAt,
+               sample.timestamp.timeIntervalSince(pending) >= typingPauseQuietSeconds {
+                pendingTypingPauseAt = nil
+                screenRecorder?.triggerTypingPauseCaptureIfNeeded(
+                    sample: sample,
+                    deepRecordingEnabled: deepRecordingEnabled,
+                    declaredTaskId: currentDeclaredTaskId(),
+                    idleThresholdSeconds: engine.config.idleThresholdSeconds
+                ) { [weak self] in
+                    Task { @MainActor [weak self] in
+                        self?.refreshRecorderCounts()
+                    }
+                }
             }
         }
+
+        recordSampleToDatabaseIfNeeded(sample)
+        if !isAbsent {
+            screenRecorder?.evaluatePeriodicCaptureIfNeeded(
+                sample: sample,
+                deepRecordingEnabled: deepRecordingEnabled,
+                declaredTaskId: currentDeclaredTaskId(),
+                idleThresholdSeconds: engine.config.idleThresholdSeconds,
+                retentionDays: settings.snapshotRetentionDays
+            ) { [weak self] in
+                Task { @MainActor [weak self] in
+                    self?.refreshRecorderCounts()
+                }
+            }
+        }
+        screenRecorder?.runRetentionMaintenanceIfNeeded(
+            retentionDays: settings.snapshotRetentionDays,
+            now: now
+        )
 
         refreshPublishedState()
         if lastPersistedAt == nil || now.timeIntervalSince(lastPersistedAt!) >= 10.0 {
@@ -657,30 +692,12 @@ public final class HybridActivityCoordinator: ObservableObject {
                 activeAlert = newest
             }
             if !sample.screenLocked {
-                var eventData: [String: String] = [:]
-                if let bundleId = sample.bundleId { eventData["bundleId"] = bundleId }
-                if let app = nonEmpty(sample.appName) { eventData["appName"] = app }
-                if !sample.redacted {
-                    if let title = sample.windowTitle { eventData["windowTitle"] = title }
-                    if let url = sample.url { eventData["url"] = url }
-                }
-                _ = try? database?.insertEvent(
-                    timestampMs: tsMs,
-                    kind: sample.url != nil ? "browser_visit" : "app_focus",
-                    appName: sample.appName,
-                    windowTitle: sample.redacted ? nil : sample.windowTitle,
-                    url: sample.redacted ? nil : sample.url,
-                    data: eventData,
-                    declaredTaskId: taskId,
-                    project: taskId
-                )
-                lastRecordedSampleKey = sampleKey(for: sample)
-                lastRecordedHeartbeatAt = sample.timestamp
-
+                recordSampleToDatabaseIfNeeded(sample)
                 screenRecorder?.triggerAppFocusCaptureIfNeeded(
                     sample: sample,
                     deepRecordingEnabled: deepRecordingEnabled,
-                    declaredTaskId: taskId
+                    declaredTaskId: taskId,
+                    idleThresholdSeconds: engine.config.idleThresholdSeconds
                 ) { [weak self] in
                     Task { @MainActor [weak self] in
                         self?.refreshRecorderCounts()
@@ -712,6 +729,9 @@ public final class HybridActivityCoordinator: ObservableObject {
 
         case "click", "keypress":
             lastNativeInputAt = event.timestamp
+            if event.kind == "keypress" {
+                pendingTypingPauseAt = event.timestamp
+            }
             if latestSample?.screenLocked != true {
                 _ = try? database?.insertEvent(
                     timestampMs: tsMs,
@@ -723,6 +743,29 @@ public final class HybridActivityCoordinator: ObservableObject {
                     declaredTaskId: taskId,
                     project: taskId
                 )
+            }
+            if event.kind == "click", let sample = latestSample, !sample.screenLocked {
+                let clickSample = ActivitySample(
+                    timestamp: event.timestamp,
+                    appName: sample.appName,
+                    bundleId: sample.bundleId,
+                    windowTitle: sample.windowTitle,
+                    url: sample.url,
+                    idleSeconds: sample.idleSeconds,
+                    screenLocked: sample.screenLocked,
+                    inputActive: true,
+                    redacted: sample.redacted
+                )
+                screenRecorder?.triggerClickCaptureIfNeeded(
+                    sample: clickSample,
+                    deepRecordingEnabled: deepRecordingEnabled,
+                    declaredTaskId: taskId,
+                    idleThresholdSeconds: engine.config.idleThresholdSeconds
+                ) { [weak self] in
+                    Task { @MainActor [weak self] in
+                        self?.refreshRecorderCounts()
+                    }
+                }
             }
 
         default:
@@ -736,17 +779,28 @@ public final class HybridActivityCoordinator: ObservableObject {
             return
         }
 
-        let key = sampleKey(for: sample)
-        let changed = (key != lastRecordedSampleKey)
+        let key = ActivityTextNormalizer.normalizedChangeKey(
+            appName: sample.appName,
+            bundleId: sample.bundleId,
+            title: sample.windowTitle,
+            url: sample.url
+        )
+        let appChanged = (sample.appName != lastRecordedAppName)
+        let keyChanged = (key != lastRecordedSampleKey)
         let heartbeatDue = lastRecordedHeartbeatAt.map { sample.timestamp.timeIntervalSince($0) >= 30.0 } ?? true
+        // Title-only jitter is throttled; app switches are always recorded immediately.
+        let withinTitleThrottle: Bool = {
+            guard !appChanged, let last = lastRecordedAt else { return false }
+            return sample.timestamp.timeIntervalSince(last) < minTitleChangeInterval
+        }()
 
-        guard changed || heartbeatDue else { return }
-
-        lastRecordedSampleKey = key
-        lastRecordedHeartbeatAt = sample.timestamp
+        guard heartbeatDue || (keyChanged && !withinTitleThrottle) else { return }
 
         let tsMs = Int64(sample.timestamp.timeIntervalSince1970 * 1000)
         let taskId = currentDeclaredTaskId()
+        let urlKey = ActivityClassifier.normalizedURLKey(sample.url)
+        let urlChanged = (urlKey != nil && urlKey != lastRecordedURLKey)
+
         var eventData: [String: String] = [:]
         if let bundleId = sample.bundleId { eventData["bundleId"] = bundleId }
         eventData["appName"] = sample.appName
@@ -757,7 +811,18 @@ public final class HybridActivityCoordinator: ObservableObject {
             eventData["redacted"] = "true"
         }
 
-        let kind = (!sample.redacted && sample.url != nil && changed) ? "browser_visit" : "app_focus"
+        // Browser visits require a real web URL in a browser AND an actual URL change;
+        // title-only changes stay as app_focus to avoid jitter masquerading as new pages.
+        let classified = ActivityClassifier.eventKind(
+            appName: sample.appName,
+            bundleId: sample.bundleId,
+            url: sample.url,
+            redacted: sample.redacted
+        )
+        let kind = (classified == ActivityEventKind.browserVisit.rawValue && !urlChanged)
+            ? ActivityEventKind.appFocus.rawValue
+            : classified
+
         _ = try? database.insertEvent(
             timestampMs: tsMs,
             kind: kind,
@@ -768,11 +833,19 @@ public final class HybridActivityCoordinator: ObservableObject {
             declaredTaskId: taskId,
             project: taskId
         )
+
+        lastRecordedSampleKey = key
+        lastRecordedAppName = sample.appName
+        lastRecordedAt = sample.timestamp
+        lastRecordedHeartbeatAt = sample.timestamp
+        if kind == ActivityEventKind.browserVisit.rawValue {
+            lastRecordedURLKey = urlKey
+        }
     }
 
     private func syncFromAlma(isInitialBackfill: Bool) async {
         guard let almaClient else { return }
-        guard httpServer?.isServingPort(LocalActivityHTTPServer.almaCompatiblePort) != true else {
+        guard httpServer?.isServingPort(LocalActivityHTTPServer.almaReservedPort) != true else {
             almaConnected = false
             return
         }
@@ -930,17 +1003,6 @@ public final class HybridActivityCoordinator: ObservableObject {
             return taskId
         }
         return nil
-    }
-
-    private func sampleKey(for sample: ActivitySample) -> String {
-        "\(sample.appName)|\(sample.bundleId ?? "")|\(sample.windowTitle ?? "")|\(sample.url ?? "")|\(sample.redacted)"
-    }
-
-    private func nonEmpty(_ value: String?) -> String? {
-        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
-            return nil
-        }
-        return trimmed
     }
 
     private func startOfDay(for date: Date) -> Date {

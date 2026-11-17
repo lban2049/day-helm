@@ -84,13 +84,19 @@ private struct SessionsListAPIResponse: Codable {
     let total: Int
 }
 
+private struct SessionEventsAPIResponse: Codable {
+    let events: [RecordedActivityEvent]
+    let total: Int
+}
+
 private struct APIErrorResponse: Codable {
     let error: String
 }
 
 public final class LocalActivityHTTPServer: @unchecked Sendable {
-    public static let defaultPrimaryPort: UInt16 = 23002
-    public static let almaCompatiblePort: UInt16 = 23001
+    public static let defaultPrimaryPort: UInt16 = 24001
+    public static let defaultPortCandidates: [UInt16] = Array(24001...24009)
+    public static let almaReservedPort: UInt16 = 23001
 
     public struct RuntimeState: Sendable {
         public var axTrusted: Bool
@@ -153,19 +159,30 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
     @discardableResult
     public func start(
         primaryPort: UInt16 = LocalActivityHTTPServer.defaultPrimaryPort,
-        fallbackPort: UInt16? = LocalActivityHTTPServer.almaCompatiblePort
+        fallbackPort: UInt16? = nil
     ) async -> [UInt16] {
         stop()
 
-        var requestedPorts: [UInt16] = [primaryPort]
-        if let fallbackPort, fallbackPort != primaryPort {
-            requestedPorts.append(fallbackPort)
+        let candidates: [UInt16]
+        if primaryPort == LocalActivityHTTPServer.defaultPrimaryPort && fallbackPort == nil {
+            candidates = LocalActivityHTTPServer.defaultPortCandidates
+        } else {
+            var requested: [UInt16] = [primaryPort]
+            if let fallbackPort, fallbackPort != primaryPort, fallbackPort != LocalActivityHTTPServer.almaReservedPort {
+                requested.append(fallbackPort)
+            }
+            candidates = requested
         }
 
         var boundPorts: [UInt16] = []
-        for port in requestedPorts {
+        for port in candidates {
+            guard port != LocalActivityHTTPServer.almaReservedPort else { continue }
             if let bound = await startSingleListener(port: port) {
                 boundPorts.append(bound)
+                // When searching 24001...24009 for an unused port, stop once one port succeeds
+                if primaryPort == LocalActivityHTTPServer.defaultPrimaryPort && fallbackPort == nil {
+                    break
+                }
             }
         }
         return boundPorts
@@ -321,10 +338,18 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
         }
 
         if path.hasPrefix("/api/activity-recorder/sessions/") {
-            let rawId = String(path.dropFirst("/api/activity-recorder/sessions/".count))
+            var rawId = String(path.dropFirst("/api/activity-recorder/sessions/".count))
+            var wantsEventsOnly = false
+            if rawId.hasSuffix("/events") {
+                wantsEventsOnly = true
+                rawId = String(rawId.dropLast("/events".count))
+            }
             let sessionId = rawId.removingPercentEncoding ?? rawId
             guard !sessionId.isEmpty else {
                 return (400, encodeJSON(APIErrorResponse(error: "Missing session id")))
+            }
+            if wantsEventsOnly {
+                return handleSessionEvents(sessionId: sessionId)
             }
             return handleSessionDetail(sessionId: sessionId)
         }
@@ -410,6 +435,17 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
                 return (404, encodeJSON(APIErrorResponse(error: "Session not found")))
             }
             return (200, encodeJSON(detail))
+        } catch {
+            return (500, encodeJSON(APIErrorResponse(error: "\(error)")))
+        }
+    }
+
+    private func handleSessionEvents(sessionId: String) -> (Int, Data) {
+        do {
+            guard let detail = try database.getSessionDetail(sessionId: sessionId) else {
+                return (404, encodeJSON(APIErrorResponse(error: "Session not found")))
+            }
+            return (200, encodeJSON(SessionEventsAPIResponse(events: detail.events, total: detail.events.count)))
         } catch {
             return (500, encodeJSON(APIErrorResponse(error: "\(error)")))
         }

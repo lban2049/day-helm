@@ -6,11 +6,11 @@
 
 | 数据 | 粒度 | 开关 / 权限 | 用途 |
 |---|---|---|---|
-| 本机活动事件（`app_focus`, `browser_visit`, `click`, `keypress`, `lock`, `unlock`） | 毫秒级事件 + 2s 轮询（仅计数与时间戳，不录具体按键字符） | 基础监听（全局键鼠仅计次） | 构建完整会话边界、切换时间点与活跃度 |
+| 本机活动事件（`app_focus`, `browser_visit`, `click`, `keypress`, `typing_pause`, `lock`, `unlock`） | 毫秒级事件 + 2s 轮询（仅计数与时间戳，不录具体按键字符） | 基础监听（全局键鼠仅计次） | 构建完整会话边界、切换时间点与活跃度 |
 | 前台应用名 + `bundleId` | 事件驱动 + 2s 轮询 | 无需权限 | 记录应用切换频次与活动归属 |
 | 窗口标题 `windowTitle` | 2s 轮询 (AX `kAXTitleAttribute`) | Accessibility | 识别具体工作内容、补齐会话标题并辅助跑偏检测 |
 | 浏览器当前 `url` | 2s 轮询 (AX `AXDocument`) | Accessibility | 区分不同项目页面与泛刷行为（写入前剥离敏感 query 参数） |
-| 屏幕快照（可选深度录制） | 32-bin 直方图去重（`diffPct >= 4%` / 4s app_focus 防抖 / 120s 心跳），JPEG 0.55 压缩 | **可选** `Screen Recording` + `deepRecordingEnabled` 开关 | 保留视觉工作上下文并驱动设备端 OCR；默认 7 天自动清理原图 |
+| 屏幕快照（可选深度录制） | 32-bin 直方图去重（`diffPct >= 4%`；`app_focus` 4s / `click` 10s / `typing_pause` 静默 2s 后 / 120s 心跳），JPEG 0.55 压缩 | **可选** `Screen Recording` + `deepRecordingEnabled` 开关 | 保留视觉工作上下文并驱动设备端 OCR；超过 1 天降采样为 480px/0.4，默认 7 天自动清理 |
 | 设备端 OCR 文本（可选深度录制） | 随去重快照在后台 `.utility` 队列运行 Apple Vision OCR（`zh-Hans` / `zh-Hant` / `en-US` / `ja`） | 同上（**完全本机离线识别**） | 为 AI Agent 与 `alma-time-audit` 提供可检索的屏幕语义摘要 |
 | 空闲时长（秒数，不含内容） | 2s 轮询 (`CGEventSource` / `IOHIDSystem`) | 无需权限 | 判断人是否在场，避免空转计入专注时长 |
 | 屏幕锁定状态 | `DistributedNotificationCenter` 事件 | 无需权限 | 排除锁屏时段并立即终止截屏与 OCR |
@@ -34,7 +34,7 @@
 ```
 ~/.config/alma/dayhelm/
   activity.sqlite        # 开放 SQLite 数据库（WAL 模式）：sessions / events / snapshots / ocr_frames
-  snapshots/YYYY-MM-DD/  # 去重后的 JPEG 快照（默认保留 7 天自动清理，OCR 文本与元数据保留）
+  snapshots/YYYY-MM-DD/  # 去重后的 JPEG 快照（超过 1 天降采样为 480px/0.4，默认 7 天自动清理，OCR 文本与元数据保留）
   today.json             # 今日实时配额与上下文热数据（原子写）
   days/YYYY-MM-DD.json   # 日终定稿归档
   config.json            # 事项配额、关键词与 deepRecordingEnabled / snapshotRetentionDays 配置
@@ -42,7 +42,7 @@
 
 - 无遥测、无崩溃上报、无云同步、无网络分析
 - 进程**不发任何出站公网网络请求**
-- 内置本地 HTTP API 服务**严格只绑定环回地址 `127.0.0.1`**（主端口 `23002`，当 `23001` 空闲时自动兼听 `23001` 兼容 `alma-time-audit`），绝不绑定外部网卡（`0.0.0.0`）
+- 内置本地 HTTP API 服务**严格只绑定环回地址 `127.0.0.1`**（主端口 `24001`，若被占用则在 `24001...24009` 自动选端，不占用 Alma 的 `23001`），绝不绑定外部网卡（`0.0.0.0`）
 - 不修改 `~/.config/alma/time-audit/` 下的任何文件（仅在初次初始化时只读读取 `focus.json` 与 `config.json`）
 
 ## 敏感应用过滤（含截图与 OCR 阻断）
@@ -65,6 +65,16 @@
 ```
 
 **不记录任何标题片段、不做哈希、不做长度。** 只留 app 名。
+
+## 凭据脱敏（写入前强制）
+
+即使未被 `PrivacyRedactor` 整条拦截，写入 SQLite 前仍会对以下字段做凭据擦除：
+
+- 事件 `data` 的每个值、快照 `window_title`、OCR 文本；
+- `Bearer/Basic <token>`、`api_key|token|secret|password|pwd|authorization ... = <value>`、`sk-...`、`ghp_...`、`xoxb-...`、`AKIA...`、JWT 三段式 → 敏感片段替换为 `***`；
+- 任何形似 URL 的值额外走 `sanitizeURL`，删除 `token/session/sig/secret/password/auth/key` 查询参数。
+
+该脱敏位于 `ActivityDatabase` 写入口，CLI、HTTP 回填与测试均无法绕过。
 
 ## 权限（分级与无痛降级）
 
