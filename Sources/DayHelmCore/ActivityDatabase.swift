@@ -47,6 +47,12 @@ public struct RecordedSessionSummary: Sendable, Equatable, Codable, Identifiable
     public let declaredTaskId: String?
     public let createdAt: Int64
     public let updatedAt: Int64
+    /// Count of recorded `click` events in this session. Counts only, never key contents.
+    public let clickCount: Int
+    /// Count of recorded `keypress` events in this session. Counts only, never key contents.
+    public let keypressCount: Int
+    /// Derived input density: `(clickCount + keypressCount) / session minutes`.
+    public let inputEventsPerMinute: Double
 
     public init(
         id: String,
@@ -74,7 +80,9 @@ public struct RecordedSessionSummary: Sendable, Equatable, Codable, Identifiable
         highlights: [String] = [],
         declaredTaskId: String? = nil,
         createdAt: Int64,
-        updatedAt: Int64
+        updatedAt: Int64,
+        clickCount: Int = 0,
+        keypressCount: Int = 0
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -102,6 +110,14 @@ public struct RecordedSessionSummary: Sendable, Equatable, Codable, Identifiable
         self.declaredTaskId = declaredTaskId
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.clickCount = clickCount
+        self.keypressCount = keypressCount
+        let effectiveDurationMs = durationMs ?? endedAt.map { max(0, $0 - startedAt) } ?? 0
+        self.inputEventsPerMinute = DayInputTotals.density(
+            clickCount: clickCount,
+            keypressCount: keypressCount,
+            durationMs: effectiveDurationMs
+        )
     }
 }
 
@@ -297,6 +313,22 @@ public struct ActivitySearchHit: Sendable, Equatable, Codable, Identifiable {
         self.url = url
         self.snippet = snippet
         self.declaredTaskId = declaredTaskId
+    }
+}
+
+public struct OCRActivitySearchResult: Sendable, Equatable, Codable, Identifiable {
+    public let id: String
+    public let sessionId: String
+    public let snapshotId: String
+    public let text: String
+    public let createdAt: Int64
+
+    public init(id: String, sessionId: String, snapshotId: String, text: String, createdAt: Int64) {
+        self.id = id
+        self.sessionId = sessionId
+        self.snapshotId = snapshotId
+        self.text = text
+        self.createdAt = createdAt
     }
 }
 
@@ -774,57 +806,7 @@ public final class ActivityDatabase: @unchecked Sendable {
     ) throws -> [RecordedSessionSummary] {
         lock.lock()
         defer { lock.unlock() }
-
-        var clauses: [String] = []
-        if sinceMs != nil {
-            clauses.append("(COALESCE(ended_at, updated_at, started_at) >= ?)")
-        }
-        if untilMs != nil {
-            clauses.append("(started_at <= ?)")
-        }
-
-        let whereClause = clauses.isEmpty ? "" : "WHERE " + clauses.joined(separator: " AND ")
-        let sql = """
-        SELECT id, started_at, ended_at, duration_ms, trigger_kind, app_names,
-               event_count, snapshot_count, total_bytes, analysis_status,
-               analysis_title, analysis_description, analysis_model, analysis_error,
-               analyzed_at, worth_memory, worth_knowledge, is_meeting, storage_tier,
-               entities, topics, project, highlights, declared_task_id, created_at, updated_at
-        FROM activity_sessions
-        \(whereClause)
-        ORDER BY started_at DESC
-        LIMIT ?;
-        """
-
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
-            throw ActivityDatabaseError.prepareFailed(sql: sql, message: lastErrorMessageLocked())
-        }
-        defer { sqlite3_finalize(stmt) }
-
-        var bindIdx: Int32 = 1
-        if let sinceMs {
-            sqlite3_bind_int64(stmt, bindIdx, sinceMs)
-            bindIdx += 1
-        }
-        if let untilMs {
-            sqlite3_bind_int64(stmt, bindIdx, untilMs)
-            bindIdx += 1
-        }
-        sqlite3_bind_int(stmt, bindIdx, Int32(max(1, limit)))
-
-        var results: [RecordedSessionSummary] = []
-        while true {
-            let step = sqlite3_step(stmt)
-            if step == SQLITE_ROW {
-                results.append(readSessionRow(stmt))
-            } else if step == SQLITE_DONE {
-                break
-            } else {
-                throw ActivityDatabaseError.stepFailed(sql: sql, message: lastErrorMessageLocked())
-            }
-        }
-        return results
+        return try listSessionsLocked(sinceMs: sinceMs, untilMs: untilMs, limit: limit)
     }
 
     public func getSessionDetail(sessionId: String) throws -> RecordedSessionDetail? {
@@ -1096,6 +1078,100 @@ public final class ActivityDatabase: @unchecked Sendable {
             recentWindows: recentWindows,
             ocrHighlights: ocrHighlights
         )
+    }
+
+    /// Alma-compatible OCR-only keyword search (`GET /api/activity-recorder/search/keyword`).
+    public func searchOCR(keyword: String, limit: Int = 50) throws -> [OCRActivitySearchResult] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let pattern = "%\(escapeLike(trimmed.lowercased()))%"
+        let maxResults = max(1, limit)
+
+        var results: [OCRActivitySearchResult] = []
+        let sql = """
+        SELECT id, session_id, snapshot_id, text, created_at
+        FROM activity_ocr_frames
+        WHERE LOWER(text) LIKE ? ESCAPE '\\'
+        ORDER BY created_at DESC
+        LIMIT ?;
+        """
+        try queryStatementLocked(sql, bind: { stmt in
+            bindText(stmt, index: 1, value: pattern)
+            sqlite3_bind_int(stmt, 2, Int32(maxResults))
+        }, onRow: { stmt in
+            results.append(OCRActivitySearchResult(
+                id: readText(stmt, 0) ?? "",
+                sessionId: readText(stmt, 1) ?? "",
+                snapshotId: readText(stmt, 2) ?? "",
+                text: readText(stmt, 3) ?? "",
+                createdAt: sqlite3_column_int64(stmt, 4)
+            ))
+        })
+        return results
+    }
+
+    /// Looks up a single snapshot record; used by `GET /api/activity-recorder/snapshot-file?id=`.
+    public func snapshot(id: String) throws -> RecordedSnapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var found: RecordedSnapshot?
+        let sql = """
+        SELECT id, session_id, timestamp, file_path, width, height, size_bytes,
+               trigger, app_name, window_title, hash_hex, histogram, diff_pct,
+               storage_tier, created_at
+        FROM activity_snapshots
+        WHERE id = ?
+        LIMIT 1;
+        """
+        try queryStatementLocked(sql, bind: { stmt in
+            bindText(stmt, index: 1, value: id)
+        }, onRow: { stmt in
+            let hist = decodeJSON([Double].self, from: readText(stmt, 11))
+            let diffPct: Double? = sqlite3_column_type(stmt, 12) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 12)
+            found = RecordedSnapshot(
+                id: readText(stmt, 0) ?? "",
+                sessionId: readText(stmt, 1) ?? "",
+                timestamp: sqlite3_column_int64(stmt, 2),
+                filePath: readText(stmt, 3) ?? "",
+                width: Int(sqlite3_column_int(stmt, 4)),
+                height: Int(sqlite3_column_int(stmt, 5)),
+                sizeBytes: sqlite3_column_int64(stmt, 6),
+                trigger: readText(stmt, 7) ?? "heartbeat",
+                appName: readText(stmt, 8),
+                windowTitle: readText(stmt, 9),
+                hashHex: readText(stmt, 10),
+                histogram: hist,
+                diffPct: diffPct,
+                storageTier: readText(stmt, 13) ?? "hot",
+                createdAt: sqlite3_column_int64(stmt, 14)
+            )
+        })
+        return found
+    }
+
+    /// Day-level click/keypress counters plus session duration, for input density (`click`/`keypress` counts only).
+    public func dayInputTotals(dayStartMs: Int64, dayEndMs: Int64) throws -> DayInputTotals {
+        lock.lock()
+        defer { lock.unlock() }
+        return try dayInputTotalsLocked(dayStartMs: dayStartMs, dayEndMs: dayEndMs)
+    }
+
+    /// Derives Alma-compatible daily summary stats from the local tables (no LLM, no stored summary row).
+    public func dailySummaryStats(dateKey: String) throws -> ActivityDailySummaryStats {
+        lock.lock()
+        defer { lock.unlock() }
+        return try dailySummaryStatsLocked(dateKey: dateKey)
+    }
+
+    /// Derives Alma-compatible weekly summary stats over the ISO week that contains `weekKey`.
+    public func weeklySummaryStats(weekKey: String) throws -> ActivityWeeklySummaryStats {
+        lock.lock()
+        defer { lock.unlock() }
+        return try weeklySummaryStatsLocked(weekKey: weekKey)
     }
 
     public func todayCounts(dayStartMs: Int64, dayEndMs: Int64) throws -> (sessions: Int, events: Int, snapshots: Int, ocrFrames: Int) {
@@ -1378,6 +1454,8 @@ public final class ActivityDatabase: @unchecked Sendable {
                 trigger_kind TEXT NOT NULL DEFAULT 'idle',
                 app_names TEXT NOT NULL DEFAULT '[]',
                 event_count INTEGER NOT NULL DEFAULT 0,
+                click_count INTEGER NOT NULL DEFAULT 0,
+                keypress_count INTEGER NOT NULL DEFAULT 0,
                 snapshot_count INTEGER NOT NULL DEFAULT 0,
                 total_bytes INTEGER NOT NULL DEFAULT 0,
                 analysis_status TEXT NOT NULL DEFAULT 'pending',
@@ -1456,6 +1534,8 @@ public final class ActivityDatabase: @unchecked Sendable {
 
         // Forward compatibility if upgrading an older database file
         try ensureColumnExistsLocked(table: "activity_sessions", column: "declared_task_id", definition: "TEXT")
+        try ensureColumnExistsLocked(table: "activity_sessions", column: "click_count", definition: "INTEGER NOT NULL DEFAULT 0")
+        try ensureColumnExistsLocked(table: "activity_sessions", column: "keypress_count", definition: "INTEGER NOT NULL DEFAULT 0")
         try ensureColumnExistsLocked(table: "activity_events", column: "window_title", definition: "TEXT")
     }
 
@@ -1565,10 +1645,19 @@ public final class ActivityDatabase: @unchecked Sendable {
         }
 
         var eventCount = 0
-        try queryStatementLocked("SELECT COUNT(*) FROM activity_events WHERE session_id = ?;", bind: { stmt in
+        var clickCount = 0
+        var keypressCount = 0
+        try queryStatementLocked("""
+        SELECT COUNT(*),
+               COALESCE(SUM(CASE WHEN kind = 'click' THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN kind = 'keypress' THEN 1 ELSE 0 END), 0)
+        FROM activity_events WHERE session_id = ?;
+        """, bind: { stmt in
             bindText(stmt, index: 1, value: sessionId)
         }, onRow: { stmt in
             eventCount = Int(sqlite3_column_int64(stmt, 0))
+            clickCount = Int(sqlite3_column_int64(stmt, 1))
+            keypressCount = Int(sqlite3_column_int64(stmt, 2))
         })
 
         var snapshotCount = 0
@@ -1590,6 +1679,8 @@ public final class ActivityDatabase: @unchecked Sendable {
         UPDATE activity_sessions
         SET app_names = ?,
             event_count = ?,
+            click_count = ?,
+            keypress_count = ?,
             snapshot_count = ?,
             total_bytes = ?,
             duration_ms = ?,
@@ -1601,13 +1692,15 @@ public final class ActivityDatabase: @unchecked Sendable {
         try runStatementLocked(updateSQL) { stmt in
             bindText(stmt, index: 1, value: appsJSON)
             sqlite3_bind_int(stmt, 2, Int32(eventCount))
-            sqlite3_bind_int(stmt, 3, Int32(snapshotCount))
-            sqlite3_bind_int64(stmt, 4, totalBytes)
-            sqlite3_bind_int64(stmt, 5, durationMs)
-            bindOptionalText(stmt, index: 6, value: resolvedProject)
-            bindOptionalText(stmt, index: 7, value: resolvedTaskId)
-            sqlite3_bind_int64(stmt, 8, max(existing.updatedAt, activityAtMs))
-            bindText(stmt, index: 9, value: sessionId)
+            sqlite3_bind_int(stmt, 3, Int32(clickCount))
+            sqlite3_bind_int(stmt, 4, Int32(keypressCount))
+            sqlite3_bind_int(stmt, 5, Int32(snapshotCount))
+            sqlite3_bind_int64(stmt, 6, totalBytes)
+            sqlite3_bind_int64(stmt, 7, durationMs)
+            bindOptionalText(stmt, index: 8, value: resolvedProject)
+            bindOptionalText(stmt, index: 9, value: resolvedTaskId)
+            sqlite3_bind_int64(stmt, 10, max(existing.updatedAt, activityAtMs))
+            bindText(stmt, index: 11, value: sessionId)
         }
 
         try synthesizeSessionSummaryLocked(sessionId: sessionId, nowMs: activityAtMs)
@@ -1723,6 +1816,14 @@ public final class ActivityDatabase: @unchecked Sendable {
             descParts.append("Task: \(task)")
         }
         descParts.append("Events: \(session.eventCount), Snapshots: \(session.snapshotCount), OCR: \(ocrCount)")
+        if session.clickCount + session.keypressCount > 0 {
+            descParts.append(String(
+                format: "Clicks: %d, Keypresses: %d (%.1f/min)",
+                session.clickCount,
+                session.keypressCount,
+                session.inputEventsPerMinute
+            ))
+        }
         let description = descParts.joined(separator: " | ")
 
         // Structured tags: task + high-frequency apps + web domains + headline windows.
@@ -1783,7 +1884,8 @@ public final class ActivityDatabase: @unchecked Sendable {
                event_count, snapshot_count, total_bytes, analysis_status,
                analysis_title, analysis_description, analysis_model, analysis_error,
                analyzed_at, worth_memory, worth_knowledge, is_meeting, storage_tier,
-               entities, topics, project, highlights, declared_task_id, created_at, updated_at
+               entities, topics, project, highlights, declared_task_id, created_at, updated_at,
+               click_count, keypress_count
         FROM activity_sessions
         WHERE id = ?
         LIMIT 1;
@@ -1796,7 +1898,11 @@ public final class ActivityDatabase: @unchecked Sendable {
         return found
     }
 
-    private func listSessionsLocked(sinceMs: Int64?, untilMs: Int64?, limit: Int) throws -> [RecordedSessionSummary] {
+    private func listSessionsLocked(
+        sinceMs: Int64? = nil,
+        untilMs: Int64? = nil,
+        limit: Int = 100
+    ) throws -> [RecordedSessionSummary] {
         var clauses: [String] = []
         if sinceMs != nil {
             clauses.append("(COALESCE(ended_at, updated_at, started_at) >= ?)")
@@ -1811,7 +1917,8 @@ public final class ActivityDatabase: @unchecked Sendable {
                event_count, snapshot_count, total_bytes, analysis_status,
                analysis_title, analysis_description, analysis_model, analysis_error,
                analyzed_at, worth_memory, worth_knowledge, is_meeting, storage_tier,
-               entities, topics, project, highlights, declared_task_id, created_at, updated_at
+               entities, topics, project, highlights, declared_task_id, created_at, updated_at,
+               click_count, keypress_count
         FROM activity_sessions
         \(whereClause)
         ORDER BY started_at DESC
@@ -1968,8 +2075,263 @@ public final class ActivityDatabase: @unchecked Sendable {
             highlights: highlights,
             declaredTaskId: readText(stmt, 23),
             createdAt: sqlite3_column_int64(stmt, 24),
-            updatedAt: sqlite3_column_int64(stmt, 25)
+            updatedAt: sqlite3_column_int64(stmt, 25),
+            clickCount: Int(sqlite3_column_int64(stmt, 26)),
+            keypressCount: Int(sqlite3_column_int64(stmt, 27))
         )
+    }
+
+    // MARK: - Summary Helpers (lock held by caller)
+
+    private func dayStartMsLocked(dateKey: String) -> Int64? {
+        guard let date = DayHelmDateFormatting.parseDayString(dateKey) else { return nil }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = DayHelmDateFormatting.shanghaiTimeZone
+        return Int64(cal.startOfDay(for: date).timeIntervalSince1970 * 1000)
+    }
+
+    private func dayInputTotalsLocked(dayStartMs: Int64, dayEndMs: Int64) throws -> DayInputTotals {
+        var clickCount = 0
+        var keypressCount = 0
+        try queryStatementLocked("""
+        SELECT COALESCE(SUM(CASE WHEN kind = 'click' THEN 1 ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN kind = 'keypress' THEN 1 ELSE 0 END), 0)
+        FROM activity_events WHERE timestamp >= ? AND timestamp <= ?;
+        """, bind: { stmt in
+            sqlite3_bind_int64(stmt, 1, dayStartMs)
+            sqlite3_bind_int64(stmt, 2, dayEndMs)
+        }, onRow: { stmt in
+            clickCount = Int(sqlite3_column_int64(stmt, 0))
+            keypressCount = Int(sqlite3_column_int64(stmt, 1))
+        })
+
+        var totalSessionMs: Int64 = 0
+        try queryStatementLocked("""
+        SELECT COALESCE(SUM(
+                   COALESCE(duration_ms, CASE WHEN ended_at IS NOT NULL THEN MAX(0, ended_at - started_at) ELSE 0 END)
+               ), 0)
+        FROM activity_sessions WHERE started_at >= ? AND started_at <= ?;
+        """, bind: { stmt in
+            sqlite3_bind_int64(stmt, 1, dayStartMs)
+            sqlite3_bind_int64(stmt, 2, dayEndMs)
+        }, onRow: { stmt in
+            totalSessionMs = sqlite3_column_int64(stmt, 0)
+        })
+
+        return DayInputTotals(
+            clickCount: clickCount,
+            keypressCount: keypressCount,
+            totalSessionDurationMs: totalSessionMs,
+            inputEventsPerMinute: DayInputTotals.density(
+                clickCount: clickCount,
+                keypressCount: keypressCount,
+                durationMs: totalSessionMs
+            )
+        )
+    }
+
+    private func ocrTotalsLocked(dayStartMs: Int64, dayEndMs: Int64) throws -> (frames: Int, chars: Int) {
+        var frames = 0
+        var chars = 0
+        try queryStatementLocked("""
+        SELECT COUNT(*), COALESCE(SUM(char_count), 0)
+        FROM activity_ocr_frames WHERE created_at >= ? AND created_at <= ?;
+        """, bind: { stmt in
+            sqlite3_bind_int64(stmt, 1, dayStartMs)
+            sqlite3_bind_int64(stmt, 2, dayEndMs)
+        }, onRow: { stmt in
+            frames = Int(sqlite3_column_int64(stmt, 0))
+            chars = Int(sqlite3_column_int64(stmt, 1))
+        })
+        return (frames, chars)
+    }
+
+    private func snapshotCountLocked(dayStartMs: Int64, dayEndMs: Int64) throws -> Int {
+        var count = 0
+        try queryStatementLocked(
+            "SELECT COUNT(*) FROM activity_snapshots WHERE timestamp >= ? AND timestamp <= ?;",
+            bind: { stmt in
+                sqlite3_bind_int64(stmt, 1, dayStartMs)
+                sqlite3_bind_int64(stmt, 2, dayEndMs)
+            },
+            onRow: { stmt in
+                count = Int(sqlite3_column_int64(stmt, 0))
+            }
+        )
+        return count
+    }
+
+    /// Per-app time attribution inside one session: each event's app holds until the next event
+    /// (or the session end), mirroring Alma's `perAppDurationsForSession`.
+    private func perAppDurationsLocked(sessionId: String, sessionEndMs: Int64) throws -> [String: Int64] {
+        var rows: [(timestamp: Int64, app: String)] = []
+        try queryStatementLocked("""
+        SELECT timestamp, app_name FROM activity_events
+        WHERE session_id = ? AND app_name IS NOT NULL
+        ORDER BY timestamp ASC;
+        """, bind: { stmt in
+            bindText(stmt, index: 1, value: sessionId)
+        }, onRow: { stmt in
+            guard let app = nonEmpty(readText(stmt, 1)) else { return }
+            rows.append((sqlite3_column_int64(stmt, 0), app))
+        })
+
+        var durations: [String: Int64] = [:]
+        for (index, row) in rows.enumerated() {
+            let nextTimestamp = index + 1 < rows.count ? rows[index + 1].timestamp : sessionEndMs
+            let heldMs = min(nextTimestamp, sessionEndMs) - row.timestamp
+            guard heldMs > 0 else { continue }
+            durations[row.app, default: 0] += heldMs
+        }
+        return durations
+    }
+
+    private func dailySummaryStatsLocked(dateKey: String) throws -> ActivityDailySummaryStats {
+        guard let startMs = dayStartMsLocked(dateKey: dateKey) else {
+            throw ActivitySummaryError.invalidDateKey(dateKey)
+        }
+        let endMs = startMs + 86_400_000 - 1
+        let sessions = try listSessionsLocked(sinceMs: startMs, untilMs: endMs, limit: 1_000)
+
+        var totalActiveMs: Int64 = 0
+        var analyzedCount = 0
+        var notWorthCount = 0
+        var appDurations: [String: Int64] = [:]
+        var hours = [Int](repeating: 0, count: 24)
+        var keyMoments: [ActivityDailySummaryStats.KeyMoment] = []
+
+        for session in sessions {
+            let effectiveMs = session.durationMs
+                ?? session.endedAt.map { max(0, $0 - session.startedAt) }
+                ?? 0
+            totalActiveMs += max(0, effectiveMs)
+            if session.analysisStatus == "analyzed" || session.analysisStatus == "completed" {
+                analyzedCount += 1
+            }
+            if session.analysisStatus == "not_worth" {
+                notWorthCount += 1
+            }
+            let sessionEnd = max(session.endedAt ?? session.updatedAt, session.startedAt)
+            for (app, ms) in try perAppDurationsLocked(sessionId: session.id, sessionEndMs: sessionEnd) {
+                appDurations[app, default: 0] += ms
+            }
+            let hour = hourOfDayMs(session.startedAt)
+            if hour >= 0, hour < 24 {
+                hours[hour] += 1
+            }
+            if let title = session.analysisTitle, !title.isEmpty {
+                keyMoments.append(ActivityDailySummaryStats.KeyMoment(
+                    sessionId: session.id,
+                    title: title,
+                    startedAt: session.startedAt,
+                    durationMs: max(0, effectiveMs)
+                ))
+            }
+        }
+
+        keyMoments.sort { $0.durationMs > $1.durationMs }
+        let inputTotals = try dayInputTotalsLocked(dayStartMs: startMs, dayEndMs: endMs)
+        let ocr = try ocrTotalsLocked(dayStartMs: startMs, dayEndMs: endMs)
+        let eventCount = try countRowsLocked(
+            sql: "SELECT COUNT(*) FROM activity_events WHERE timestamp >= ? AND timestamp <= ?;",
+            sinceMs: startMs,
+            untilMs: endMs
+        )
+        let snapshots = try snapshotCountLocked(dayStartMs: startMs, dayEndMs: endMs)
+
+        let apps = appDurations
+            .map { ActivityDailySummaryStats.AppDuration(app: $0.key, durationMs: $0.value) }
+            .sorted { $0.durationMs > $1.durationMs }
+            .prefix(10)
+            .map { $0 }
+
+        return ActivityDailySummaryStats(
+            dateKey: dateKey,
+            sessionCount: sessions.count,
+            totalActiveMs: totalActiveMs,
+            analyzedCount: analyzedCount,
+            notWorthCount: notWorthCount,
+            eventCount: eventCount,
+            snapshotCount: snapshots,
+            ocrFrameCount: ocr.frames,
+            ocrCharCount: ocr.chars,
+            clickCount: inputTotals.clickCount,
+            keypressCount: inputTotals.keypressCount,
+            inputEventsPerMinute: DayInputTotals.density(
+                clickCount: inputTotals.clickCount,
+                keypressCount: inputTotals.keypressCount,
+                durationMs: totalActiveMs
+            ),
+            apps: apps,
+            hours: hours.enumerated().map { ActivityDailySummaryStats.HourBucket(hour: $0.offset, count: $0.element) },
+            keyMoments: Array(keyMoments.prefix(10))
+        )
+    }
+
+    private func weeklySummaryStatsLocked(weekKey: String) throws -> ActivityWeeklySummaryStats {
+        guard let range = DayHelmISOWeek.dateRange(forWeekKey: weekKey) else {
+            throw ActivitySummaryError.invalidWeekKey(weekKey)
+        }
+
+        var daily: [ActivityWeeklySummaryStats.DailySlice] = []
+        var appDurations: [String: Int64] = [:]
+        var totalActiveMs: Int64 = 0
+        var sessionCount = 0
+        var clickCount = 0
+        var keypressCount = 0
+
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = DayHelmDateFormatting.shanghaiTimeZone
+
+        for offset in 0..<7 {
+            guard let day = cal.date(byAdding: .day, value: offset, to: range.start) else { continue }
+            let dateKey = DayHelmDateFormatting.dayString(from: day)
+            let stats = try dailySummaryStatsLocked(dateKey: dateKey)
+            daily.append(ActivityWeeklySummaryStats.DailySlice(
+                dateKey: dateKey,
+                activeMs: stats.totalActiveMs,
+                sessionCount: stats.sessionCount
+            ))
+            totalActiveMs += stats.totalActiveMs
+            sessionCount += stats.sessionCount
+            clickCount += stats.clickCount
+            keypressCount += stats.keypressCount
+            for entry in stats.apps {
+                appDurations[entry.app, default: 0] += entry.durationMs
+            }
+        }
+
+        let apps = appDurations
+            .map { ActivityDailySummaryStats.AppDuration(app: $0.key, durationMs: $0.value) }
+            .sorted { $0.durationMs > $1.durationMs }
+            .prefix(10)
+            .map { $0 }
+
+        let lastDay = cal.date(byAdding: .day, value: -1, to: range.end) ?? range.start
+
+        return ActivityWeeklySummaryStats(
+            weekKey: DayHelmISOWeek.weekKey(for: range.start),
+            startDate: DayHelmDateFormatting.dayString(from: range.start),
+            endDate: DayHelmDateFormatting.dayString(from: lastDay),
+            totalActiveMs: totalActiveMs,
+            sessionCount: sessionCount,
+            clickCount: clickCount,
+            keypressCount: keypressCount,
+            inputEventsPerMinute: DayInputTotals.density(
+                clickCount: clickCount,
+                keypressCount: keypressCount,
+                durationMs: totalActiveMs
+            ),
+            apps: apps,
+            daily: daily
+        )
+    }
+
+    private func hourOfDayMs(_ timestampMs: Int64) -> Int {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = DayHelmDateFormatting.shanghaiTimeZone
+        let date = Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000.0)
+        return cal.component(.hour, from: date)
     }
 
     // MARK: - Low-Level SQLite Helpers

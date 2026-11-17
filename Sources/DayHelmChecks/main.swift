@@ -32,7 +32,7 @@ struct DayHelmChecksMain {
     static func main() async {
         do {
             try await runAllChecks()
-            print("ALL DAYHELM CHECKS PASSED (37/37)")
+            print("ALL DAYHELM CHECKS PASSED (41/41)")
             exit(0)
         } catch {
             fputs("DAYHELM CHECK FAILED: \(error)\n", stderr)
@@ -1930,6 +1930,220 @@ struct DayHelmChecksMain {
                 throw CheckFailure(description: "Unable to read downsampled JPEG properties")
             }
             try check(width <= 480, "JPEG on disk is actually <= 480px wide (got \(width))")
+        }
+
+        try await runCheck("38. Session and day summaries expose click/keypress input density") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-density-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let t0 = baseDate()
+            let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+            let focus = try db.insertEvent(
+                timestampMs: t0Ms,
+                kind: "app_focus",
+                appName: "Google Chrome",
+                windowTitle: "Orders",
+                declaredTaskId: "ecommerce"
+            )
+            for i in 0..<3 {
+                _ = try db.insertEvent(timestampMs: t0Ms + Int64(i) * 5_000 + 1_000, kind: "click", appName: "Google Chrome")
+            }
+            for i in 0..<2 {
+                _ = try db.insertEvent(timestampMs: t0Ms + 30_000 + Int64(i) * 2_000, kind: "keypress", appName: "Google Chrome")
+            }
+            try db.closeSession(sessionId: focus.sessionId, endedAtMs: t0Ms + 60_000)
+
+            let summary = try db.getSessionDetail(sessionId: focus.sessionId)?.session
+            try checkEqual(summary?.clickCount ?? -1, 3, "Session clickCount aggregates click events")
+            try checkEqual(summary?.keypressCount ?? -1, 2, "Session keypressCount aggregates keypress events")
+            try checkApprox(summary?.inputEventsPerMinute ?? -1, 5.0, tolerance: 0.001, "Session input density = 5 events/min")
+
+            let totals = try db.dayInputTotals(dayStartMs: t0Ms, dayEndMs: t0Ms + 86_400_000 - 1)
+            try checkEqual(totals.clickCount, 3, "Day input totals aggregate clicks")
+            try checkEqual(totals.keypressCount, 2, "Day input totals aggregate keypresses")
+            try checkApprox(totals.inputEventsPerMinute, 5.0, tolerance: 0.001, "Day input density = 5 events/min")
+
+            let daily = try db.dailySummaryStats(dateKey: "2026-11-17")
+            try checkEqual(daily.sessionCount, 1, "Daily summary counts the session")
+            try checkEqual(daily.clickCount, 3, "Daily summary carries click density metadata")
+            try checkEqual(daily.hours.count, 24, "Daily summary exposes 24 hour buckets")
+        }
+
+        try await runCheck("39. HTTP keyword search, ocr alias, and DayHelm rich search") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-searchapi-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let t0 = baseDate()
+            let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+            let event = try db.insertEvent(
+                timestampMs: t0Ms,
+                kind: "browser_visit",
+                appName: "Google Chrome",
+                windowTitle: "Wafer Fab Report",
+                url: "https://research.example.com/wafer",
+                declaredTaskId: "hermes"
+            )
+            let snap = try db.insertSnapshot(
+                sessionId: event.sessionId,
+                timestampMs: t0Ms + 1_000,
+                filePath: store.snapshotsDirectory.appendingPathComponent("2026-11-17/wafer.jpg").path,
+                width: 100,
+                height: 60,
+                sizeBytes: 4_096,
+                trigger: "app_focus",
+                appName: "Google Chrome",
+                windowTitle: "Wafer Fab Report"
+            )
+            _ = try db.insertOCRFrame(
+                snapshotId: snap.id,
+                sessionId: event.sessionId,
+                text: "Wafer fab utilization reached 92% in Q4",
+                createdAtMs: t0Ms + 1_000
+            )
+
+            let server = LocalActivityHTTPServer(database: db, store: store, clock: ManualClock(now: t0))
+
+            let detail = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/sessions/\(event.sessionId)")
+            let detailJSON = try JSONSerialization.jsonObject(with: detail.body) as? [String: Any]
+            let ocrAlias = detailJSON?["ocr"] as? [[String: Any]]
+            let ocrFrames = detailJSON?["ocrFrames"] as? [[String: Any]]
+            try checkEqual(ocrAlias?.count, 1, "Session detail exposes Alma-compatible ocr key")
+            try checkEqual(ocrFrames?.count, 1, "Session detail still exposes ocrFrames")
+
+            let keyword = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/search/keyword?q=wafer&limit=10")
+            try checkEqual(keyword.statusCode, 200, "Keyword search returns 200")
+            let keywordJSON = try JSONSerialization.jsonObject(with: keyword.body) as? [String: Any]
+            let results = keywordJSON?["results"] as? [[String: Any]]
+            try checkEqual(results?.count, 1, "Keyword search returns one OCR hit")
+            try checkEqual(results?.first?["snapshotId"] as? String, snap.id, "Keyword hit carries snapshotId")
+
+            let empty = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/search/keyword?q=")
+            let emptyJSON = try JSONSerialization.jsonObject(with: empty.body) as? [String: Any]
+            try checkEqual((emptyJSON?["results"] as? [[String: Any]])?.count, 0, "Empty keyword returns empty results")
+
+            let rich = server.handleRawHTTPRequestLineAndRoute(target: "/api/dayhelm/search?q=wafer&limit=10")
+            let richJSON = try JSONSerialization.jsonObject(with: rich.body) as? [String: Any]
+            let hits = richJSON?["hits"] as? [[String: Any]] ?? []
+            try check(hits.contains { $0["sourceKind"] as? String == "ocr" }, "Rich search includes OCR hits")
+            try check(hits.contains { $0["sourceKind"] as? String == "event" }, "Rich search includes event hits")
+        }
+
+        try await runCheck("40. HTTP daily and weekly summaries follow the Alma activity_summaries contract") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-summaryapi-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let t0 = baseDate()
+            let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+            let event = try db.insertEvent(timestampMs: t0Ms, kind: "app_focus", appName: "Google Chrome", windowTitle: "Orders", declaredTaskId: "ecommerce")
+            _ = try db.insertEvent(timestampMs: t0Ms + 10_000, kind: "click", appName: "Google Chrome")
+            try db.closeSession(sessionId: event.sessionId, endedAtMs: t0Ms + 120_000)
+
+            let server = LocalActivityHTTPServer(database: db, store: store, clock: ManualClock(now: t0.addingTimeInterval(600)))
+
+            let daily = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/summary/daily/2026-11-17")
+            try checkEqual(daily.statusCode, 200, "Daily summary returns 200")
+            let dailyJSON = try JSONSerialization.jsonObject(with: daily.body) as? [String: Any]
+            try checkEqual(dailyJSON?["kind"] as? String, "daily", "Daily summary kind is daily")
+            try check(dailyJSON?["summary"] is NSNull, "Daily summary row keeps summary null (no LLM)")
+            try check(dailyJSON?["isPartial"] as? Bool == true, "Today's daily summary is partial")
+            let stats = dailyJSON?["stats"] as? [String: Any]
+            try checkEqual(stats?["sessionCount"] as? Int, 1, "Daily stats sessionCount")
+            try checkEqual(stats?["totalActiveMs"] as? Int, 120_000, "Daily stats totalActiveMs")
+            try checkEqual(stats?["clickCount"] as? Int, 1, "Daily stats carry click density")
+            try check((stats?["apps"] as? [[String: Any]])?.isEmpty == false, "Daily stats list per-app durations")
+
+            let weekly = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/summary/weekly/2026-11-17")
+            try checkEqual(weekly.statusCode, 200, "Weekly summary returns 200")
+            let weeklyJSON = try JSONSerialization.jsonObject(with: weekly.body) as? [String: Any]
+            let weeklyStats = weeklyJSON?["stats"] as? [String: Any]
+            try checkEqual(weeklyStats?["weekKey"] as? String, "2026-W47", "Weekly summary resolves ISO week key")
+            try checkEqual(weeklyStats?["startDate"] as? String, "2026-11-16", "Weekly summary start date is Monday")
+            try checkEqual(weeklyStats?["endDate"] as? String, "2026-11-22", "Weekly summary end date is Sunday")
+            try checkEqual((weeklyStats?["daily"] as? [[String: Any]])?.count, 7, "Weekly summary has seven daily slices")
+
+            let invalid = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/summary/weekly/not-a-week")
+            try checkEqual(invalid.statusCode, 400, "Invalid week key returns 400")
+        }
+
+        try await runCheck("41. HTTP snapshot-file containment and CLI status --json density") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-snapfile-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let t0 = baseDate()
+            let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+            let snapshotDir = store.snapshotsDirectory.appendingPathComponent("2026-11-17", isDirectory: true)
+            try FileManager.default.createDirectory(at: snapshotDir, withIntermediateDirectories: true)
+            let jpegBytes = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0xFF, 0xD9])
+            let storedFile = snapshotDir.appendingPathComponent("frame-1.jpg")
+            try jpegBytes.write(to: storedFile)
+            let outsideFile = tmpDir.appendingPathComponent("outside.jpg")
+            try jpegBytes.write(to: outsideFile)
+
+            let event = try db.insertEvent(timestampMs: t0Ms, kind: "app_focus", appName: "Google Chrome")
+            let snap = try db.insertSnapshot(
+                sessionId: event.sessionId,
+                timestampMs: t0Ms + 1_000,
+                filePath: storedFile.path,
+                width: 4,
+                height: 4,
+                sizeBytes: Int64(jpegBytes.count),
+                trigger: "app_focus",
+                appName: "Google Chrome"
+            )
+            _ = try db.insertEvent(sessionId: event.sessionId, timestampMs: t0Ms + 5_000, kind: "click", appName: "Google Chrome")
+            _ = try db.insertEvent(sessionId: event.sessionId, timestampMs: t0Ms + 9_000, kind: "keypress", appName: "Google Chrome")
+
+            let server = LocalActivityHTTPServer(database: db, store: store, clock: ManualClock(now: t0))
+            let ports = await server.start(primaryPort: 0, fallbackPort: nil)
+            defer { server.stop() }
+            guard let port = ports.first else {
+                throw CheckFailure(description: "Failed to bind HTTP port for snapshot-file check")
+            }
+            let urlSession = URLSession(configuration: .ephemeral)
+
+            func fetchSnapshot(_ query: String) async throws -> (Data, HTTPURLResponse) {
+                var components = URLComponents(string: "http://127.0.0.1:\(port)/api/activity-recorder/snapshot-file")!
+                components.query = query.isEmpty ? nil : query
+                let (data, response) = try await urlSession.data(from: components.url!)
+                guard let http = response as? HTTPURLResponse else {
+                    throw CheckFailure(description: "Missing HTTP response for snapshot-file")
+                }
+                return (data, http)
+            }
+
+            let byPath = try await fetchSnapshot("path=\(storedFile.path)")
+            try checkEqual(byPath.1.statusCode, 200, "snapshot-file by path returns 200")
+            try check(byPath.1.value(forHTTPHeaderField: "Content-Type")?.contains("image/jpeg") == true, "snapshot-file sends image/jpeg")
+            try check(byPath.0 == jpegBytes, "snapshot-file returns raw JPEG bytes")
+
+            let byId = try await fetchSnapshot("id=\(snap.id)")
+            try checkEqual(byId.1.statusCode, 200, "snapshot-file by id returns 200")
+
+            let forbidden = try await fetchSnapshot("path=\(outsideFile.path)")
+            try checkEqual(forbidden.1.statusCode, 403, "snapshot-file rejects paths outside snapshots dir")
+
+            let missing = try await fetchSnapshot("path=\(snapshotDir.appendingPathComponent("missing.jpg").path)")
+            try checkEqual(missing.1.statusCode, 404, "snapshot-file reports missing file as 404")
+
+            let statusResult = DayHelmCLI.run(
+                arguments: ["dayhelm", "status", "--format", "json", "--store-dir", tmpDir.path],
+                clock: ManualClock(now: t0)
+            )
+            guard let result = statusResult, result.exitCode == 0 else {
+                throw CheckFailure(description: "dayhelm status --format json must exit 0")
+            }
+            let payload = try JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any]
+            let recorder = payload?["recorder"] as? [String: Any]
+            try checkEqual(recorder?["clickCount"] as? Int, 1, "CLI status json reports clickCount")
+            try checkEqual(recorder?["keypressCount"] as? Int, 1, "CLI status json reports keypressCount")
         }
     }
 

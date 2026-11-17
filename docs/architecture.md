@@ -213,8 +213,10 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 
 启用 `PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;`，包含四张与 Alma 兼容并扩展了 `window_title` 与 `declared_task_id` 的核心表：
 
-- `activity_sessions`：`id`, `started_at`, `ended_at`, `duration_ms`, `trigger_kind`, `app_names`, `event_count`, `snapshot_count`, `total_bytes`, `analysis_status`, `analysis_title`, `analysis_description`, `analysis_model`, `analysis_error`, `analyzed_at`, `worth_memory`, `worth_knowledge`, `is_meeting`, `storage_tier`, `entities`, `topics`, `project`, `highlights`, `declared_task_id`, `created_at`, `updated_at`
+- `activity_sessions`：`id`, `started_at`, `ended_at`, `duration_ms`, `trigger_kind`, `app_names`, `event_count`, `click_count`, `keypress_count`, `snapshot_count`, `total_bytes`, `analysis_status`, `analysis_title`, `analysis_description`, `analysis_model`, `analysis_error`, `analyzed_at`, `worth_memory`, `worth_knowledge`, `is_meeting`, `storage_tier`, `entities`, `topics`, `project`, `highlights`, `declared_task_id`, `created_at`, `updated_at`
   - 空闲超过会话间隔（默认 `120s`，可在 `30s–300s` 间配置）、锁屏或跨日时自动切分新会话，并基于高频应用、窗口标题与专注事项自动合成 `analysis_title` 与 `analysis_description`。
+  - `click_count` / `keypress_count` 是**敲击密度元数据**：每次写事件时由同一条 `GROUP BY kind` 聚合刷新（不读按键内容，只计次）。会话摘要额外派生 `inputEventsPerMinute = (click_count + keypress_count) / 会话分钟数`，供 Agent 判断「人在高强度操作」还是「页面挂着但人走了」。
+- **日/周汇总不另建表**：`/summary/daily|weekly` 由 `activity_sessions` / `activity_events` / `activity_snapshots` / `activity_ocr_frames` 现场聚合（Alma 的 `activity_summaries` 表结构仅作为输出 JSON 契约，不复制其存储，避免同一事实两处真源）。
 - `activity_events`：`id`, `session_id`, `timestamp`, `kind` (`app_focus` / `browser_visit` / `click` / `keypress` / `lock` / `unlock`), `app_name`, `window_title`, `url`, `data`, `created_at`
 - `activity_snapshots`：`id`, `session_id`, `timestamp`, `file_path`, `width`, `height`, `size_bytes`, `trigger` (`app_focus` / `click` / `typing_pause` / `visual_change` / `heartbeat`), `app_name`, `window_title`, `hash_hex`, `histogram` (32-bin JSON), `diff_pct`, `storage_tier` (`hot` / `downsampled` / `pruned`), `created_at`
 - `activity_ocr_frames`：`id`, `snapshot_id`, `session_id`, `text`, `char_count`, `token_count`, `created_at`
@@ -227,9 +229,11 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 dayhelm query [--today | --since <2h|30m|YYYY-MM-DD>] [--format json|md] [--store-dir <path>]
 dayhelm search <keyword> [--limit 20] [--format json|md] [--store-dir <path>]
 dayhelm sessions [--date YYYY-MM-DD] [--id <session_id>] [--format json|md] [--store-dir <path>]
-dayhelm status [--store-dir <path>]
+dayhelm status [--format json|md] [--store-dir <path>]   # --json 等价于 --format json
 dayhelm purge [--before YYYY-MM-DD] [--store-dir <path>]
 ```
+
+`dayhelm status --format json` 输出 `{schemaVersion, date, focusState, activeTaskId, budgets, metrics, recorder}`；`recorder` 含今日 `sessions/events/snapshots/ocrFrames/clickCount/keypressCount/inputEventsPerMinute`，便于 Agent 直接判定采集是否健康、人在不在场。
 
 ### 4. 本地兼容 HTTP API（`127.0.0.1` 环回）
 
@@ -237,9 +241,14 @@ dayhelm purge [--before YYYY-MM-DD] [--store-dir <path>]
 
 - `GET /api/activity-recorder/status`：采集器状态、端口、AX/Screen Recording 权限状态、今日会话/事件/快照/OCR 计数
 - `GET /api/activity-recorder/sessions?limit=...&since=...&until=...`：兼容 Alma 会话列表格式（`{sessions:[...], total}`；`since`/`until` 同时接受毫秒时间戳与 ISO8601）
-- `GET /api/activity-recorder/sessions/<id>`：返回 `{ session, events, snapshots, ocrFrames }`（含完整 `windowTitle` 与 `declaredTaskId`）
+- `GET /api/activity-recorder/sessions/<id>`：返回 `{ session, events, snapshots, ocrFrames, ocr }`（含完整 `windowTitle`、`declaredTaskId` 与会话级 `clickCount`/`keypressCount`/`inputEventsPerMinute`）。`ocr` 与 `ocrFrames` 同源同值，前者是 Alma 存储层字段名（含 `charCount`/`tokenCount`/`hasEmbedding=false`，DayHelm 不跑 embedding），给只认 `ocr` 的下游调用方
 - `GET /api/activity-recorder/sessions/<id>/events`：仅返回 `{ events, total }`，兼容只需要事件流的 Alma/审计调用方；`kind` 保留 `app_focus` / `browser_visit` / `click` / `keypress` / `lock` / `unlock` / `typing_pause`
+- `GET /api/activity-recorder/search/keyword?q=<kw>&limit=50`：Alma 形状的 OCR 关键词检索 `{ results: [{ id, sessionId, snapshotId, text, createdAt }] }`；`q` 为空时返回 `{ results: [] }`
+- `GET /api/activity-recorder/snapshot-file?path=<file>`（或 `?id=<snapshot_id>`）：返回快照原始 JPEG 字节（`Content-Type: image/jpeg`）；`path` 必须落在 `~/.config/alma/dayhelm/snapshots/` 内，越界一律 `403 forbidden path`，文件不存在 `404`
+- `GET /api/activity-recorder/summary/daily/<YYYY-MM-DD>`：Alma `activity_summaries` 形状 `{ id, kind: "daily", dateKey, summary, stats, model, isPartial, createdAt, updatedAt }`，`stats` 含 `sessionCount`/`totalActiveMs`/`apps`/`hours`/`keyMoments` 以及 `clickCount`/`keypressCount`/`inputEventsPerMinute`；当天为 `isPartial: true`
+- `GET /api/activity-recorder/summary/weekly/<YYYY-Www>`（也接受 `YYYY-MM-DD` 末端日期）：Alma 形状周汇总，`stats` 含 `weekKey`/`startDate`/`endDate`/`totalActiveMs`/`apps`/`daily`
 - `GET /api/dayhelm/context?since=...`：面向 AI Agent 的结构化摘要（当前专注状态、今日配额、连续度指标、最近窗口标题/URL 与 OCR 片段）
+- `GET /api/dayhelm/search?q=<kw>&limit=20`：跨窗口标题 / URL / 应用名 / 会话摘要 / OCR 的富检索 `{ keyword, total, hits }`（`hits[].sourceKind` = `ocr` / `event` / `session`）
 
 ### 5. `today.json` 核心结构示例
 

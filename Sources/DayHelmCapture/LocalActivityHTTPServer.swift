@@ -89,6 +89,69 @@ private struct SessionEventsAPIResponse: Codable {
     let total: Int
 }
 
+/// Alma's session detail shape: `{ session, events, snapshots, ocr }`. DayHelm keeps `ocrFrames` as well so
+/// existing callers keep working, and adds `ocr` because Alma's own store uses that key name.
+private struct SessionDetailAPIResponse: Codable {
+    let session: RecordedSessionSummary
+    let events: [RecordedActivityEvent]
+    let snapshots: [RecordedSnapshot]
+    let ocrFrames: [RecordedOCRFrame]
+    let ocr: [OCRFrameCompatItem]
+}
+
+/// Alma OCR frame shape. `hasEmbedding` is always `false` because DayHelm runs no embedding model.
+private struct OCRFrameCompatItem: Codable {
+    let id: String
+    let sessionId: String
+    let snapshotId: String
+    let text: String
+    let charCount: Int
+    let tokenCount: Int
+    let hasEmbedding: Bool
+    let createdAt: Int64
+
+    init(frame: RecordedOCRFrame) {
+        self.id = frame.id
+        self.sessionId = frame.sessionId
+        self.snapshotId = frame.snapshotId
+        self.text = frame.text
+        self.charCount = frame.charCount
+        self.tokenCount = frame.tokenCount
+        self.hasEmbedding = false
+        self.createdAt = frame.createdAt
+    }
+}
+
+private struct OCRKeywordSearchItem: Codable {
+    let id: String
+    let sessionId: String
+    let snapshotId: String
+    let text: String
+    let createdAt: Int64
+}
+
+private struct OCRKeywordSearchAPIResponse: Codable {
+    let results: [OCRKeywordSearchItem]
+}
+
+private struct DayHelmSearchAPIResponse: Codable {
+    let keyword: String
+    let total: Int
+    let hits: [ActivitySearchHit]
+}
+
+private struct RoutedResponse {
+    let statusCode: Int
+    let body: Data
+    let contentType: String
+
+    init(statusCode: Int, body: Data, contentType: String = "application/json; charset=utf-8") {
+        self.statusCode = statusCode
+        self.body = body
+        self.contentType = contentType
+    }
+}
+
 private struct APIErrorResponse: Codable {
     let error: String
 }
@@ -316,25 +379,30 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
     }
 
     public func handleRawHTTPRequestLineAndRoute(target: String, method: String = "GET") -> (statusCode: Int, body: Data) {
+        let routed = route(target: target, method: method)
+        return (routed.statusCode, routed.body)
+    }
+
+    private func route(target: String, method: String = "GET") -> RoutedResponse {
         let upperMethod = method.uppercased()
         guard upperMethod == "GET" else {
-            return (405, encodeJSON(APIErrorResponse(error: "Method not allowed")))
+            return RoutedResponse(statusCode: 405, body: encodeJSON(APIErrorResponse(error: "Method not allowed")))
         }
 
         let normalizedTarget = target.hasPrefix("/") ? target : "/" + target
         guard let components = URLComponents(string: "http://127.0.0.1" + normalizedTarget) else {
-            return (400, encodeJSON(APIErrorResponse(error: "Invalid request URI")))
+            return RoutedResponse(statusCode: 400, body: encodeJSON(APIErrorResponse(error: "Invalid request URI")))
         }
 
         let path = components.path
         let queryItems = components.queryItems ?? []
 
         if path == "/api/activity-recorder/status" {
-            return handleStatus()
+            return json(handleStatus())
         }
 
         if path == "/api/activity-recorder/sessions" {
-            return handleListSessions(queryItems: queryItems)
+            return json(handleListSessions(queryItems: queryItems))
         }
 
         if path.hasPrefix("/api/activity-recorder/sessions/") {
@@ -346,19 +414,45 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
             }
             let sessionId = rawId.removingPercentEncoding ?? rawId
             guard !sessionId.isEmpty else {
-                return (400, encodeJSON(APIErrorResponse(error: "Missing session id")))
+                return json((400, encodeJSON(APIErrorResponse(error: "Missing session id"))))
             }
             if wantsEventsOnly {
-                return handleSessionEvents(sessionId: sessionId)
+                return json(handleSessionEvents(sessionId: sessionId))
             }
-            return handleSessionDetail(sessionId: sessionId)
+            return json(handleSessionDetail(sessionId: sessionId))
+        }
+
+        if path == "/api/activity-recorder/search/keyword" {
+            return json(handleOCRKeywordSearch(queryItems: queryItems))
+        }
+
+        if path == "/api/activity-recorder/snapshot-file" {
+            return handleSnapshotFile(queryItems: queryItems)
+        }
+
+        if path.hasPrefix("/api/activity-recorder/summary/daily/") {
+            let dateKey = String(path.dropFirst("/api/activity-recorder/summary/daily/".count)).removingPercentEncoding ?? ""
+            return json(handleDailySummary(dateKey: dateKey))
+        }
+
+        if path.hasPrefix("/api/activity-recorder/summary/weekly/") {
+            let weekKey = String(path.dropFirst("/api/activity-recorder/summary/weekly/".count)).removingPercentEncoding ?? ""
+            return json(handleWeeklySummary(weekKey: weekKey))
         }
 
         if path == "/api/dayhelm/context" {
-            return handleDayHelmContext(queryItems: queryItems)
+            return json(handleDayHelmContext(queryItems: queryItems))
         }
 
-        return (404, encodeJSON(APIErrorResponse(error: "Not found: \(path)")))
+        if path == "/api/dayhelm/search" {
+            return json(handleDayHelmSearch(queryItems: queryItems))
+        }
+
+        return json((404, encodeJSON(APIErrorResponse(error: "Not found: \(path)"))))
+    }
+
+    private func json(_ result: (Int, Data)) -> RoutedResponse {
+        RoutedResponse(statusCode: result.0, body: result.1)
     }
 
     private func routeHTTPRequest(headerData: Data) -> Data {
@@ -374,16 +468,23 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
 
         let method = String(parts[0])
         let target = String(parts[1])
-        let routed = handleRawHTTPRequestLineAndRoute(target: target, method: method)
+        let routed = route(target: target, method: method)
         let statusText: String
         switch routed.statusCode {
         case 200: statusText = "OK"
         case 400: statusText = "Bad Request"
+        case 403: statusText = "Forbidden"
         case 404: statusText = "Not Found"
         case 405: statusText = "Method Not Allowed"
+        case 503: statusText = "Service Unavailable"
         default: statusText = "Internal Server Error"
         }
-        return makeHTTPResponse(statusCode: routed.statusCode, statusText: statusText, bodyData: routed.body)
+        return makeHTTPResponse(
+            statusCode: routed.statusCode,
+            statusText: statusText,
+            bodyData: routed.body,
+            contentType: routed.contentType
+        )
     }
 
     // MARK: - Route Handlers
@@ -434,7 +535,146 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
             guard let detail = try database.getSessionDetail(sessionId: sessionId) else {
                 return (404, encodeJSON(APIErrorResponse(error: "Session not found")))
             }
-            return (200, encodeJSON(detail))
+            let payload = SessionDetailAPIResponse(
+                session: detail.session,
+                events: detail.events,
+                snapshots: detail.snapshots,
+                ocrFrames: detail.ocrFrames,
+                ocr: detail.ocrFrames.map { OCRFrameCompatItem(frame: $0) }
+            )
+            return (200, encodeJSON(payload))
+        } catch {
+            return (500, encodeJSON(APIErrorResponse(error: "\(error)")))
+        }
+    }
+
+    private func handleOCRKeywordSearch(queryItems: [URLQueryItem]) -> (Int, Data) {
+        let keyword = queryItems.first(where: { $0.name == "q" })?.value ?? ""
+        guard !keyword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return (200, encodeJSON(OCRKeywordSearchAPIResponse(results: [])))
+        }
+        let limit = queryItems.first(where: { $0.name == "limit" })?.value.flatMap(Int.init) ?? 50
+        do {
+            let rows = try database.searchOCR(keyword: keyword, limit: max(1, min(limit, 500)))
+            let results = rows.map {
+                OCRKeywordSearchItem(
+                    id: $0.id,
+                    sessionId: $0.sessionId,
+                    snapshotId: $0.snapshotId,
+                    text: $0.text,
+                    createdAt: $0.createdAt
+                )
+            }
+            return (200, encodeJSON(OCRKeywordSearchAPIResponse(results: results)))
+        } catch {
+            return (500, encodeJSON(APIErrorResponse(error: "\(error)")))
+        }
+    }
+
+    private func handleSnapshotFile(queryItems: [URLQueryItem]) -> RoutedResponse {
+        guard let store else {
+            return RoutedResponse(statusCode: 503, body: encodeJSON(APIErrorResponse(error: "recorder not configured")))
+        }
+
+        let idParam = queryItems.first(where: { $0.name == "id" })?.value
+        let pathParam = queryItems.first(where: { $0.name == "path" })?.value
+
+        let requestedPath: String
+        if let idParam, !idParam.isEmpty {
+            do {
+                guard let snapshot = try database.snapshot(id: idParam) else {
+                    return RoutedResponse(statusCode: 404, body: encodeJSON(APIErrorResponse(error: "not found")))
+                }
+                requestedPath = snapshot.filePath
+            } catch {
+                return RoutedResponse(statusCode: 500, body: encodeJSON(APIErrorResponse(error: "\(error)")))
+            }
+        } else if let pathParam, !pathParam.isEmpty {
+            requestedPath = pathParam
+        } else {
+            return RoutedResponse(statusCode: 400, body: encodeJSON(APIErrorResponse(error: "path required")))
+        }
+
+        let root = store.snapshotsDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        let candidateURL = requestedPath.hasPrefix("/")
+            ? URL(fileURLWithPath: requestedPath)
+            : root.appendingPathComponent(requestedPath)
+        let candidate = candidateURL.standardizedFileURL.resolvingSymlinksInPath()
+
+        let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard candidate.path == root.path || candidate.path.hasPrefix(rootPath) else {
+            return RoutedResponse(statusCode: 403, body: encodeJSON(APIErrorResponse(error: "forbidden path")))
+        }
+
+        guard FileManager.default.fileExists(atPath: candidate.path) else {
+            return RoutedResponse(statusCode: 404, body: encodeJSON(APIErrorResponse(error: "not found")))
+        }
+
+        guard let bytes = try? Data(contentsOf: candidate) else {
+            return RoutedResponse(statusCode: 500, body: encodeJSON(APIErrorResponse(error: "failed to read snapshot file")))
+        }
+
+        let contentType: String
+        switch candidate.pathExtension.lowercased() {
+        case "jpg", "jpeg": contentType = "image/jpeg"
+        case "png": contentType = "image/png"
+        default: contentType = "application/octet-stream"
+        }
+        return RoutedResponse(statusCode: 200, body: bytes, contentType: contentType)
+    }
+
+    private func handleDailySummary(dateKey: String) -> (Int, Data) {
+        let trimmed = dateKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard DayHelmDateFormatting.parseDayString(trimmed) != nil else {
+            return (400, encodeJSON(APIErrorResponse(error: "Invalid date key '\(dateKey)'. Expected YYYY-MM-DD.")))
+        }
+        do {
+            let stats = try database.dailySummaryStats(dateKey: trimmed)
+            let nowMs = Int64(clock.now().timeIntervalSince1970 * 1000)
+            let todayKey = DayHelmDateFormatting.dayString(from: clock.now())
+            let record = DailyActivitySummaryRecord(
+                id: "summary_daily_\(trimmed)",
+                dateKey: trimmed,
+                stats: stats,
+                isPartial: trimmed >= todayKey,
+                createdAt: nowMs,
+                updatedAt: nowMs
+            )
+            return (200, encodeJSON(record))
+        } catch {
+            return (500, encodeJSON(APIErrorResponse(error: "\(error)")))
+        }
+    }
+
+    private func handleWeeklySummary(weekKey: String) -> (Int, Data) {
+        let trimmed = weekKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard DayHelmISOWeek.dateRange(forWeekKey: trimmed) != nil else {
+            return (400, encodeJSON(APIErrorResponse(error: "Invalid week key '\(weekKey)'. Expected YYYY-Www or YYYY-MM-DD.")))
+        }
+        do {
+            let stats = try database.weeklySummaryStats(weekKey: trimmed)
+            let nowMs = Int64(clock.now().timeIntervalSince1970 * 1000)
+            let currentWeek = DayHelmISOWeek.weekKey(for: clock.now())
+            let record = WeeklyActivitySummaryRecord(
+                id: "summary_weekly_\(stats.weekKey)",
+                weekKey: stats.weekKey,
+                stats: stats,
+                isPartial: stats.weekKey >= currentWeek,
+                createdAt: nowMs,
+                updatedAt: nowMs
+            )
+            return (200, encodeJSON(record))
+        } catch {
+            return (500, encodeJSON(APIErrorResponse(error: "\(error)")))
+        }
+    }
+
+    private func handleDayHelmSearch(queryItems: [URLQueryItem]) -> (Int, Data) {
+        let keyword = queryItems.first(where: { $0.name == "q" })?.value ?? ""
+        let limit = queryItems.first(where: { $0.name == "limit" })?.value.flatMap(Int.init) ?? 20
+        do {
+            let hits = try database.search(keyword: keyword, limit: max(1, min(limit, 200)))
+            return (200, encodeJSON(DayHelmSearchAPIResponse(keyword: keyword, total: hits.count, hits: hits)))
         } catch {
             return (500, encodeJSON(APIErrorResponse(error: "\(error)")))
         }
@@ -528,10 +768,10 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
         makeHTTPResponse(statusCode: statusCode, statusText: statusText, bodyData: encodeJSON(jsonBody))
     }
 
-    private func makeHTTPResponse(statusCode: Int, statusText: String, bodyData: Data) -> Data {
+    private func makeHTTPResponse(statusCode: Int, statusText: String, bodyData: Data, contentType: String = "application/json; charset=utf-8") -> Data {
         let headers = [
             "HTTP/1.1 \(statusCode) \(statusText)",
-            "Content-Type: application/json; charset=utf-8",
+            "Content-Type: \(contentType)",
             "Content-Length: \(bodyData.count)",
             "Cache-Control: no-store",
             "Connection: close",

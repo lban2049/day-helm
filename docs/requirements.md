@@ -81,12 +81,13 @@
 验收：产出格式稳定、有 schema 版本、有文档；`time-audit` 侧改动由 `time-audit` 项目负责。
 
 **US-8｜独立原生录制、可选屏幕 OCR 与开放 Agent 数据中心**
-> 即使完全退出 Alma，DayHelm 也能独立完成毫秒级活动事件、AX 窗口标题、URL、去重屏幕快照与设备端 Vision OCR 录制，并通过开放 SQLite（`activity.sqlite`）、CLI（`query`/`search`/`sessions`）与本地兼容 HTTP API（`:23002` + 空闲兼听 `:23001`）向任意 AI Agent 与 `alma-time-audit` 开放。
+> 即使完全退出 Alma，DayHelm 也能独立完成毫秒级活动事件、AX 窗口标题、URL、去重屏幕快照与设备端 Vision OCR 录制，并通过开放 SQLite（`activity.sqlite`）、CLI（`query`/`search`/`sessions`/`status --json`）与本地兼容 HTTP API（`127.0.0.1:24001`，`24001...24009` 空闲选端，绝不占用 Alma 的 `23001`）向任意 AI Agent 与 `alma-time-audit` 开放。
 
 验收：
 - 屏幕录制权限可选可开关；未授权或关闭时无痛降级为 AX 标题 + URL + 事件录制
 - 命中 `PrivacyRedactor` 脱敏规则或锁屏时绝不截屏、绝不运行 OCR
-- 支持 `dayhelm query` / `dayhelm search` / `dayhelm sessions`（`json` 与 `md` 输出）以及 `/api/activity-recorder/*`、`/api/dayhelm/context`
+- 支持 `dayhelm query` / `dayhelm search` / `dayhelm sessions` / `dayhelm status --json`（`json` 与 `md` 输出）以及 Alma 形状的 `/api/activity-recorder/status`、`/sessions`、`/sessions/<id>`、`/sessions/<id>/events`、`/search/keyword`、`/snapshot-file`、`/summary/daily|weekly` 与 DayHelm 自有的 `/api/dayhelm/context`、`/api/dayhelm/search`
+- 会话级暴露敲击密度（`clickCount` / `keypressCount` / `inputEventsPerMinute`），只计次、不读按键内容
 
 ### 不做（明确排除）
 

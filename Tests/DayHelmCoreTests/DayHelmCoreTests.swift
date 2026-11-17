@@ -1,6 +1,7 @@
 import CoreGraphics
 import CoreText
 import Foundation
+import SQLite3
 @testable import DayHelmCapture
 @testable import DayHelmCore
 
@@ -2835,6 +2836,342 @@ struct DayHelmCoreTests {
         ctx.textPosition = CGPoint(x: 40, y: 95)
         CTLineDraw(line, ctx)
         return try #require(ctx.makeImage())
+    }
+}
+
+@Suite("DayHelm Alma compatibility surface (ADR 007)")
+struct DayHelmAlmaCompatTests {
+
+    private func baseDate() -> Date {
+        DayHelmDateFormatting.parseISO8601("2026-11-17T09:00:00+08:00")!
+    }
+
+    private func sampleBudgets() -> [TaskBudget] {
+        [
+            TaskBudget(taskId: "ecommerce", displayName: "电商做深", colorHex: "#3B82F6", targetMinutes: 90, capMinutes: 120, keywords: ["example-shop"]),
+            TaskBudget(taskId: "hermes", displayName: "Hermes 投研", colorHex: "#10B981", targetMinutes: 45, capMinutes: 60, keywords: ["hermes"])
+        ]
+    }
+
+    @Test("Session summaries expose click/keypress counts and derived input density")
+    func sessionSummaryExposesInputDensity() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-density-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let db = try ActivityDatabase(databaseURL: tmpDir.appendingPathComponent("activity.sqlite"))
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+
+        let focus = try db.insertEvent(
+            timestampMs: t0Ms,
+            kind: "app_focus",
+            appName: "Google Chrome",
+            windowTitle: "Orders",
+            declaredTaskId: "ecommerce"
+        )
+        for i in 0..<3 {
+            _ = try db.insertEvent(timestampMs: t0Ms + Int64(i * 5_000) + 1_000, kind: "click", appName: "Google Chrome")
+        }
+        for i in 0..<2 {
+            _ = try db.insertEvent(timestampMs: t0Ms + 30_000 + Int64(i * 2_000), kind: "keypress", appName: "Google Chrome")
+        }
+        try db.closeSession(sessionId: focus.sessionId, endedAtMs: t0Ms + 60_000)
+
+        let summary = try #require(try db.getSessionDetail(sessionId: focus.sessionId)?.session)
+        #expect(summary.clickCount == 3)
+        #expect(summary.keypressCount == 2)
+        #expect(summary.eventCount == 6)
+        #expect(abs(summary.inputEventsPerMinute - 5.0) < 0.0001)
+
+        let listed = try #require(try db.listSessions(sinceMs: t0Ms - 1_000, untilMs: t0Ms + 120_000, limit: 5).first)
+        #expect(listed.clickCount == 3)
+        #expect(listed.keypressCount == 2)
+
+        let dayTotals = try db.dayInputTotals(dayStartMs: t0Ms, dayEndMs: t0Ms + 86_400_000 - 1)
+        #expect(dayTotals.clickCount == 3)
+        #expect(dayTotals.keypressCount == 2)
+        #expect(abs(dayTotals.inputEventsPerMinute - 5.0) < 0.0001)
+    }
+
+    @Test("Opening an older activity.sqlite adds click/keypress columns without losing sessions")
+    func oldDatabaseMigratesInputDensityColumns() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-migrate-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        let databaseURL = tmpDir.appendingPathComponent("activity.sqlite")
+
+        let legacySchema = """
+        CREATE TABLE activity_sessions (
+            id TEXT PRIMARY KEY,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            duration_ms INTEGER,
+            trigger_kind TEXT NOT NULL DEFAULT 'idle',
+            app_names TEXT NOT NULL DEFAULT '[]',
+            event_count INTEGER NOT NULL DEFAULT 0,
+            snapshot_count INTEGER NOT NULL DEFAULT 0,
+            total_bytes INTEGER NOT NULL DEFAULT 0,
+            analysis_status TEXT NOT NULL DEFAULT 'pending',
+            analysis_title TEXT,
+            analysis_description TEXT,
+            analysis_model TEXT,
+            analysis_error TEXT,
+            analyzed_at INTEGER,
+            worth_memory INTEGER NOT NULL DEFAULT 0,
+            worth_knowledge INTEGER NOT NULL DEFAULT 0,
+            is_meeting INTEGER NOT NULL DEFAULT 0,
+            storage_tier TEXT NOT NULL DEFAULT 'hot',
+            entities TEXT NOT NULL DEFAULT '{}',
+            topics TEXT NOT NULL DEFAULT '[]',
+            project TEXT,
+            highlights TEXT NOT NULL DEFAULT '[]',
+            declared_task_id TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT INTO activity_sessions (id, started_at, duration_ms, app_names, event_count, created_at, updated_at)
+        VALUES ('sess_legacy', 1763337600000, 60000, '["Editor"]', 1, 1763337600000, 1763337660000);
+        """
+        try execRawSQL(legacySchema, at: databaseURL)
+
+        let db = try ActivityDatabase(databaseURL: databaseURL)
+        let legacy = try #require(try db.getSessionDetail(sessionId: "sess_legacy")?.session)
+        #expect(legacy.clickCount == 0)
+        #expect(legacy.keypressCount == 0)
+
+        let t0Ms: Int64 = 1_763_337_660_000
+        _ = try db.insertEvent(sessionId: "sess_legacy", timestampMs: t0Ms, kind: "click", appName: "Editor")
+        _ = try db.insertEvent(sessionId: "sess_legacy", timestampMs: t0Ms + 1_000, kind: "keypress", appName: "Editor")
+        let migrated = try #require(try db.getSessionDetail(sessionId: "sess_legacy")?.session)
+        #expect(migrated.clickCount == 1)
+        #expect(migrated.keypressCount == 1)
+        #expect(migrated.eventCount == 2)
+    }
+
+    @Test("HTTP snapshot-file serves only files inside the snapshots directory")
+    func httpSnapshotFileServesOnlyStoredSnapshots() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-snapfile-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+        let snapshotDir = store.snapshotsDirectory.appendingPathComponent("2026-11-17", isDirectory: true)
+        try FileManager.default.createDirectory(at: snapshotDir, withIntermediateDirectories: true)
+        let jpegBytes = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0xFF, 0xD9])
+        let storedFile = snapshotDir.appendingPathComponent("frame-1.jpg")
+        try jpegBytes.write(to: storedFile)
+        let outsideFile = tmpDir.appendingPathComponent("outside.jpg")
+        try jpegBytes.write(to: outsideFile)
+
+        let event = try db.insertEvent(timestampMs: t0Ms, kind: "app_focus", appName: "Google Chrome", windowTitle: "Orders")
+        let snap = try db.insertSnapshot(
+            sessionId: event.sessionId,
+            timestampMs: t0Ms + 1_000,
+            filePath: storedFile.path,
+            width: 4,
+            height: 4,
+            sizeBytes: Int64(jpegBytes.count),
+            trigger: "app_focus",
+            appName: "Google Chrome",
+            windowTitle: "Orders"
+        )
+
+        let server = LocalActivityHTTPServer(database: db, store: store, clock: ManualClock(now: t0))
+        let ports = await server.start(primaryPort: 0, fallbackPort: nil)
+        defer { server.stop() }
+        let port = try #require(ports.first)
+        let urlSession = URLSession(configuration: .ephemeral)
+
+        func get(_ query: String) async throws -> (Data, HTTPURLResponse) {
+            var components = URLComponents(string: "http://127.0.0.1:\(port)/api/activity-recorder/snapshot-file")!
+            components.query = query.isEmpty ? nil : query
+            let (data, response) = try await urlSession.data(from: components.url!)
+            return (data, try #require(response as? HTTPURLResponse))
+        }
+
+        let byPath = try await get("path=\(storedFile.path)")
+        #expect(byPath.1.statusCode == 200)
+        #expect(byPath.1.value(forHTTPHeaderField: "Content-Type")?.contains("image/jpeg") == true)
+        #expect(byPath.0 == jpegBytes)
+
+        let byId = try await get("id=\(snap.id)")
+        #expect(byId.1.statusCode == 200)
+        #expect(byId.0 == jpegBytes)
+
+        let escaped = try await get("path=\(outsideFile.path)")
+        #expect(escaped.1.statusCode == 403)
+
+        let missing = try await get("path=\(snapshotDir.appendingPathComponent("missing.jpg").path)")
+        #expect(missing.1.statusCode == 404)
+
+        let noParam = try await get("")
+        #expect(noParam.1.statusCode == 400)
+    }
+
+    @Test("HTTP OCR keyword search, ocr alias, and daily/weekly summaries match the Alma contract")
+    func httpAlmaSearchOCRAndSummaryContract() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-almasum-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+        let event = try db.insertEvent(
+            timestampMs: t0Ms,
+            kind: "browser_visit",
+            appName: "Google Chrome",
+            windowTitle: "Wafer Fab Report",
+            url: "https://research.example.com/wafer",
+            declaredTaskId: "hermes",
+            project: "hermes"
+        )
+        _ = try db.insertEvent(timestampMs: t0Ms + 20_000, kind: "click", appName: "Google Chrome")
+        _ = try db.insertEvent(timestampMs: t0Ms + 25_000, kind: "keypress", appName: "Google Chrome")
+        let snap = try db.insertSnapshot(
+            sessionId: event.sessionId,
+            timestampMs: t0Ms + 5_000,
+            filePath: store.snapshotsDirectory.appendingPathComponent("2026-11-17/wafer.jpg").path,
+            width: 100,
+            height: 60,
+            sizeBytes: 4_096,
+            trigger: "browser_visit",
+            appName: "Google Chrome",
+            windowTitle: "Wafer Fab Report"
+        )
+        _ = try db.insertOCRFrame(
+            snapshotId: snap.id,
+            sessionId: event.sessionId,
+            text: "Wafer fab utilization reached 92% in Q4",
+            createdAtMs: t0Ms + 5_000
+        )
+        try db.closeSession(sessionId: event.sessionId, endedAtMs: t0Ms + 120_000)
+
+        let server = LocalActivityHTTPServer(
+            database: db,
+            store: store,
+            clock: ManualClock(now: t0.addingTimeInterval(600))
+        )
+
+        let detail = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/sessions/\(event.sessionId)")
+        #expect(detail.statusCode == 200)
+        let detailJSON = try #require(try JSONSerialization.jsonObject(with: detail.body) as? [String: Any])
+        let ocrAlias = try #require(detailJSON["ocr"] as? [[String: Any]])
+        let ocrFrames = try #require(detailJSON["ocrFrames"] as? [[String: Any]])
+        #expect(ocrAlias.count == 1)
+        #expect(ocrFrames.count == 1)
+        #expect(ocrAlias[0]["snapshotId"] as? String == snap.id)
+        #expect(ocrAlias[0]["hasEmbedding"] as? Bool == false)
+        let sessionJSON = try #require(detailJSON["session"] as? [String: Any])
+        #expect(sessionJSON["clickCount"] as? Int == 1)
+        #expect(sessionJSON["keypressCount"] as? Int == 1)
+
+        let search = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/search/keyword?q=wafer&limit=10")
+        #expect(search.statusCode == 200)
+        let searchJSON = try #require(try JSONSerialization.jsonObject(with: search.body) as? [String: Any])
+        let results = try #require(searchJSON["results"] as? [[String: Any]])
+        #expect(results.count == 1)
+        #expect(results[0]["snapshotId"] as? String == snap.id)
+        #expect((results[0]["text"] as? String)?.contains("Wafer fab") == true)
+
+        let emptySearch = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/search/keyword?q=")
+        let emptyJSON = try #require(try JSONSerialization.jsonObject(with: emptySearch.body) as? [String: Any])
+        #expect((emptyJSON["results"] as? [[String: Any]])?.isEmpty == true)
+
+        let richSearch = server.handleRawHTTPRequestLineAndRoute(target: "/api/dayhelm/search?q=wafer&limit=10")
+        #expect(richSearch.statusCode == 200)
+        let richJSON = try #require(try JSONSerialization.jsonObject(with: richSearch.body) as? [String: Any])
+        let hits = try #require(richJSON["hits"] as? [[String: Any]])
+        #expect(hits.contains { $0["sourceKind"] as? String == "ocr" })
+        #expect(hits.contains { $0["sourceKind"] as? String == "event" })
+
+        let daily = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/summary/daily/2026-11-17")
+        #expect(daily.statusCode == 200)
+        let dailyJSON = try #require(try JSONSerialization.jsonObject(with: daily.body) as? [String: Any])
+        #expect(dailyJSON["kind"] as? String == "daily")
+        #expect(dailyJSON["dateKey"] as? String == "2026-11-17")
+        #expect(dailyJSON["summary"] is NSNull)
+        #expect(dailyJSON["isPartial"] as? Bool == true)
+        let dailyStats = try #require(dailyJSON["stats"] as? [String: Any])
+        #expect(dailyStats["sessionCount"] as? Int == 1)
+        #expect(dailyStats["totalActiveMs"] as? Int == 120_000)
+        #expect(dailyStats["clickCount"] as? Int == 1)
+        #expect(dailyStats["keypressCount"] as? Int == 1)
+        let apps = try #require(dailyStats["apps"] as? [[String: Any]])
+        #expect(apps.contains { $0["app"] as? String == "Google Chrome" })
+        #expect((dailyStats["hours"] as? [[String: Any]])?.count == 24)
+        let keyMoments = try #require(dailyStats["keyMoments"] as? [[String: Any]])
+        #expect(keyMoments.first?["sessionId"] as? String == event.sessionId)
+
+        let weekly = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/summary/weekly/2026-11-17")
+        #expect(weekly.statusCode == 200)
+        let weeklyJSON = try #require(try JSONSerialization.jsonObject(with: weekly.body) as? [String: Any])
+        #expect(weeklyJSON["kind"] as? String == "weekly")
+        let weeklyStats = try #require(weeklyJSON["stats"] as? [String: Any])
+        #expect(weeklyStats["weekKey"] as? String == "2026-W47")
+        #expect(weeklyStats["startDate"] as? String == "2026-11-16")
+        #expect(weeklyStats["endDate"] as? String == "2026-11-22")
+        #expect((weeklyStats["daily"] as? [[String: Any]])?.count == 7)
+
+        let invalidWeek = server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/summary/weekly/not-a-week")
+        #expect(invalidWeek.statusCode == 400)
+    }
+
+    @Test("DayHelmCLI status --format json emits recorder density counters")
+    func cliStatusJSONIncludesRecorderDensity() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-statusjson-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+        engine.startFocus(taskId: "ecommerce", at: t0)
+        try store.saveToday(engine.snapshot(at: t0.addingTimeInterval(600)))
+
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+        let event = try db.insertEvent(timestampMs: t0Ms, kind: "app_focus", appName: "Google Chrome", declaredTaskId: "ecommerce")
+        _ = try db.insertEvent(sessionId: event.sessionId, timestampMs: t0Ms + 10_000, kind: "click", appName: "Google Chrome")
+        _ = try db.insertEvent(sessionId: event.sessionId, timestampMs: t0Ms + 20_000, kind: "click", appName: "Google Chrome")
+        _ = try db.insertEvent(sessionId: event.sessionId, timestampMs: t0Ms + 30_000, kind: "keypress", appName: "Google Chrome")
+        try db.closeSession(sessionId: event.sessionId, endedAtMs: t0Ms + 60_000)
+
+        let clock = ManualClock(now: t0.addingTimeInterval(600))
+        let jsonResult = DayHelmCLI.run(arguments: ["dayhelm", "status", "--format", "json", "--store-dir", tmpDir.path], clock: clock)
+        let result = try #require(jsonResult)
+        #expect(result.exitCode == 0)
+        let payload = try #require(try JSONSerialization.jsonObject(with: Data(result.stdout.utf8)) as? [String: Any])
+        #expect(payload["schemaVersion"] as? Int == 1)
+        #expect(payload["date"] as? String == "2026-11-17")
+        #expect(payload["activeTaskId"] as? String == "ecommerce")
+        #expect((payload["budgets"] as? [[String: Any]])?.count == sampleBudgets().count)
+        let recorder = try #require(payload["recorder"] as? [String: Any])
+        #expect(recorder["clickCount"] as? Int == 2)
+        #expect(recorder["keypressCount"] as? Int == 1)
+        #expect(recorder["events"] as? Int == 4)
+
+        let aliasResult = DayHelmCLI.run(arguments: ["dayhelm", "status", "--json", "--store-dir", tmpDir.path], clock: clock)
+        #expect(aliasResult?.exitCode == 0)
+        #expect(aliasResult?.stdout.contains("\"recorder\"") == true)
+
+        let mdResult = DayHelmCLI.run(arguments: ["dayhelm", "status", "--store-dir", tmpDir.path], clock: clock)
+        #expect(mdResult?.exitCode == 0)
+        #expect(mdResult?.stdout.contains("DayHelm Status") == true)
+    }
+
+    private func execRawSQL(_ sql: String, at url: URL) throws {
+        var handle: OpaquePointer?
+        guard sqlite3_open(url.path, &handle) == SQLITE_OK, let handle else {
+            throw NSError(domain: "DayHelmAlmaCompatTests", code: 9, userInfo: [NSLocalizedDescriptionKey: "Failed to open sqlite file"])
+        }
+        defer { sqlite3_close(handle) }
+        var errMsg: UnsafeMutablePointer<CChar>?
+        if sqlite3_exec(handle, sql, nil, nil, &errMsg) != SQLITE_OK {
+            let message = errMsg.map { String(cString: $0) } ?? "unknown sqlite error"
+            if let errMsg { sqlite3_free(errMsg) }
+            throw NSError(domain: "DayHelmAlmaCompatTests", code: 10, userInfo: [NSLocalizedDescriptionKey: message])
+        }
     }
 }
 #endif

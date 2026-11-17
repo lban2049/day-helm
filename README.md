@@ -32,7 +32,7 @@
 - **监督与校准，而不是强制锁死。** 不拦截 Cmd+Tab，不隐藏窗口，不搞全屏读秒锁。用右上角**不抢键盘焦点**的轻量 HUD 卡片提醒，把无意识切换变成有意识决定。
 - **高密度精密仪表风（Precision Telemetry）。** 菜单栏胶囊常驻显示当前事项与配额进度（如 `● 电商做深 · 52/90m`），下拉面板一屏呈现专注切换器、采集与 OCR 引擎状态、双向预算条、今日时间光谱条（Day Spectrum Ribbon）与连续度微指标。
 - **独立原生采集 + 可选 Vision OCR + 隐私优先。** `Screen Recording` 为可选权限，开启后自动执行 32-bin 直方图去重与设备端多语言 Vision OCR（`zh-Hans`/`zh-Hant`/`en-US`/`ja`）；权限拒绝或关闭时静默运行纯 AX 录制。命中敏感应用过滤（`redacted == true`）或锁屏时绝不截屏、不跑 OCR。
-- **开放 Agent CLI & 兼容 HTTP API。** 提供 `query` / `search` / `sessions` CLI 与 `127.0.0.1:24001`（若被占用则在 `24001...24009` 自动选端）环回接口，完整兼容 `/api/activity-recorder/...`，且绝不冲突占用 Alma 的 `23001` 端口。
+- **开放 Agent CLI & 兼容 HTTP API。** 提供 `query` / `search` / `sessions` / `status --format json` CLI 与 `127.0.0.1:24001`（若被占用则在 `24001...24009` 自动选端）环回接口，兼容 Alma 形状的 `/api/activity-recorder/status`、`/sessions`、`/sessions/<id>`（含 `ocr`）、`/sessions/<id>/events`、`/search/keyword`、`/snapshot-file`、`/summary/daily|weekly`，另提供 `/api/dayhelm/context` 与 `/api/dayhelm/search`，且绝不冲突占用 Alma 的 `23001` 端口。
 
 ## 快速开始（Build & Run）
 
@@ -54,6 +54,7 @@ swift run DayHelmChecks
 /Applications/DayHelm.app/Contents/MacOS/DayHelm search "抖店" --limit 10 --format json
 /Applications/DayHelm.app/Contents/MacOS/DayHelm sessions --date 2026-11-17 --format md
 /Applications/DayHelm.app/Contents/MacOS/DayHelm status
+/Applications/DayHelm.app/Contents/MacOS/DayHelm status --format json
 /Applications/DayHelm.app/Contents/MacOS/DayHelm purge --before 2026-11-01
 ```
 

@@ -40,6 +40,26 @@ private struct CLISessionsListPayload: Codable {
     let sessions: [RecordedSessionSummary]
 }
 
+private struct CLIRecorderCounts: Codable {
+    let sessions: Int
+    let events: Int
+    let snapshots: Int
+    let ocrFrames: Int
+    let clickCount: Int
+    let keypressCount: Int
+    let inputEventsPerMinute: Double
+}
+
+private struct CLIStatusPayload: Codable {
+    let schemaVersion: Int
+    let date: String
+    let focusState: FocusSessionState
+    let activeTaskId: String?
+    let budgets: [BudgetSnapshot]
+    let metrics: DayMetrics
+    let recorder: CLIRecorderCounts?
+}
+
 public enum DayHelmCLI {
     /// Parses and runs CLI subcommands (`query`, `search`, `sessions`, `status`, `purge`, `--help`).
     /// Returns `nil` when the process should continue to launch the GUI app.
@@ -91,7 +111,8 @@ public enum DayHelmCLI {
                                                        Search window titles, URLs, sessions & OCR text
           dayhelm sessions [--date YYYY-MM-DD] [--id <session_id>] [--limit 50] [--format json|md] [--store-dir <path>]
                                                        List sessions or inspect full session details
-          dayhelm status [--store-dir <path>]          Print today's budget & telemetry summary
+          dayhelm status [--format json|md] [--store-dir <path>]
+                                                       Print today's budget & telemetry summary (--json alias for --format json)
           dayhelm purge [--before YYYY-MM-DD] [--store-dir <path>]
                                                        Permanently delete stored JSON, SQLite & snapshot data
           dayhelm --help                               Show this help message
@@ -521,6 +542,7 @@ public enum DayHelmCLI {
 
     private static func runStatus(args: [String], clock: any DayHelmClock) -> DayHelmCLIResult {
         var storeDirPath: String?
+        var format: DayHelmCLIFormat = .md
         var i = 0
         while i < args.count {
             let arg = args[i]
@@ -530,6 +552,15 @@ public enum DayHelmCLI {
                     return DayHelmCLIResult(exitCode: 1, stderr: "Error: --store-dir requires a directory path.\n")
                 }
                 storeDirPath = args[i + 1]
+                i += 2
+            case "--json":
+                format = .json
+                i += 1
+            case "--format":
+                guard i + 1 < args.count, let parsed = DayHelmCLIFormat(rawValue: args[i + 1]) else {
+                    return DayHelmCLIResult(exitCode: 1, stderr: "Error: --format requires 'json' or 'md'.\n")
+                }
+                format = parsed
                 i += 2
             case "--help", "-h":
                 return DayHelmCLIResult(exitCode: 0, stdout: helpText)
@@ -544,6 +575,20 @@ public enum DayHelmCLI {
         let summary = loadFocusAndBudgets(store: store, storeDirPath: storeDirPath, todayString: todayString)
         if let loadErr = summary.errorMessage {
             return DayHelmCLIResult(exitCode: 1, stderr: loadErr)
+        }
+
+        let recorder = loadRecorderCounts(store: store, now: clock.now())
+
+        if format == .json {
+            return encodeJSONResult(CLIStatusPayload(
+                schemaVersion: 1,
+                date: summary.activeDate,
+                focusState: summary.focusState,
+                activeTaskId: summary.activeTaskId,
+                budgets: summary.budgets,
+                metrics: summary.metrics,
+                recorder: recorder
+            ))
         }
 
         var lines: [String] = []
@@ -563,19 +608,43 @@ public enum DayHelmCLI {
         lines.append("  - Solid blocks (>=12m): \(summary.metrics.solidBlocksCount)")
         lines.append(String(format: "  - Recent switches/hr: %.1f/h", summary.metrics.recentSwitchesPerHour))
 
-        if FileManager.default.fileExists(atPath: store.databaseURL.path),
-           let db = try? ActivityDatabase(databaseURL: store.databaseURL) {
-            let dayStart = startOfDay(for: clock.now())
-            let dayStartMs = Int64(dayStart.timeIntervalSince1970 * 1000)
-            let dayEndMs = dayStartMs + 86_400_000 - 1
-            if let counts = try? db.todayCounts(dayStartMs: dayStartMs, dayEndMs: dayEndMs) {
-                lines.append("")
-                lines.append("Native Recorder (activity.sqlite):")
-                lines.append("  - Today sessions: \(counts.sessions), events: \(counts.events), snapshots: \(counts.snapshots), OCR frames: \(counts.ocrFrames)")
-            }
+        if let recorder {
+            lines.append("")
+            lines.append("Native Recorder (activity.sqlite):")
+            lines.append("  - Today sessions: \(recorder.sessions), events: \(recorder.events), snapshots: \(recorder.snapshots), OCR frames: \(recorder.ocrFrames)")
+            lines.append(String(
+                format: "  - Input density: clicks %d, keypresses %d, %.1f/min",
+                recorder.clickCount,
+                recorder.keypressCount,
+                recorder.inputEventsPerMinute
+            ))
         }
 
         return DayHelmCLIResult(exitCode: 0, stdout: lines.joined(separator: "\n") + "\n")
+    }
+
+    private static func loadRecorderCounts(store: DayHelmStore, now: Date) -> CLIRecorderCounts? {
+        guard FileManager.default.fileExists(atPath: store.databaseURL.path),
+              let db = try? ActivityDatabase(databaseURL: store.databaseURL) else {
+            return nil
+        }
+        let dayStart = startOfDay(for: now)
+        let dayStartMs = Int64(dayStart.timeIntervalSince1970 * 1000)
+        let dayEndMs = dayStartMs + 86_400_000 - 1
+        guard let counts = try? db.todayCounts(dayStartMs: dayStartMs, dayEndMs: dayEndMs) else {
+            return nil
+        }
+        let density = (try? db.dayInputTotals(dayStartMs: dayStartMs, dayEndMs: dayEndMs))
+            ?? DayInputTotals(clickCount: 0, keypressCount: 0, totalSessionDurationMs: 0, inputEventsPerMinute: 0)
+        return CLIRecorderCounts(
+            sessions: counts.sessions,
+            events: counts.events,
+            snapshots: counts.snapshots,
+            ocrFrames: counts.ocrFrames,
+            clickCount: density.clickCount,
+            keypressCount: density.keypressCount,
+            inputEventsPerMinute: density.inputEventsPerMinute
+        )
     }
 
     // MARK: - Helpers
@@ -589,6 +658,7 @@ public enum DayHelmCLI {
         let budgets: [BudgetSnapshot]
         let focusDescription: String
         let activeTaskId: String?
+        let focusState: FocusSessionState
         let metrics: DayMetrics
         let errorMessage: String?
     }
@@ -607,6 +677,7 @@ public enum DayHelmCLI {
                 budgets: [],
                 focusDescription: "Error",
                 activeTaskId: nil,
+                focusState: .unassigned,
                 metrics: DayMetrics(activeMinutes: 0, longestBlockMinutes: 0, solidBlocksCount: 0, recentSwitchesPerHour: 0),
                 errorMessage: "Error: Failed to read \(store.todayURL.path): \(error.localizedDescription)\n"
             )
@@ -637,6 +708,7 @@ public enum DayHelmCLI {
                 budgets: snapshot.budgets,
                 focusDescription: focusDescription,
                 activeTaskId: activeTaskId,
+                focusState: snapshot.focusState ?? .unassigned,
                 metrics: snapshot.metrics,
                 errorMessage: nil
             )
@@ -663,6 +735,7 @@ public enum DayHelmCLI {
             budgets: budgetsToShow,
             focusDescription: "Standby (no activity recorded for \(todayString))",
             activeTaskId: nil,
+            focusState: .unassigned,
             metrics: DayMetrics(activeMinutes: 0, longestBlockMinutes: 0, solidBlocksCount: 0, recentSwitchesPerHour: 0),
             errorMessage: nil
         )
