@@ -15,7 +15,7 @@
 四条由此推出的硬约束，任何设计不得违反：
 
 1. **轻量监督与校准，不做强制锁死。** 不做单次 Cmd+Tab 全屏读秒拦截，不做应用白名单强行隐藏/最小化，不做"扛强杀会话锁"。提醒一律使用右上角**不抢键盘焦点**的轻量卡片（`.nonactivatingPanel`）。
-2. **双通道混合采集，不重复造底层钩子。** 复用 Alma `localhost:23001` 的实时 session/event 数据，并用本机轻量 AX 采样补齐缺失的 `windowTitle` 与 `AXDocument` URL；当 Alma 未运行时可无缝降级为纯本机采样。
+2. **独立原生采集 + 开放数据中心，兼顾兼容。** 内置原生事件监听、AX 窗口标题与 URL 补齐、可选且可开关的去重屏幕快照与设备端 Apple Vision OCR（`activity.sqlite`），并暴露 Agent CLI 与兼容 `/api/activity-recorder/...` 的本地 HTTP 服务（`:23002` 及空闲兼听 `:23001`），无需启动 Alma 即可独立运行；当 Alma 运行时仍可平滑兼容。
 3. **支持双向配额（保底 Target + 封顶 Cap）。** 既要监督核心任务是否达到每日保底时长，也要在容易超时的任务（如日常运营）达到设定上限时提醒换挡，避免在一件事上耗尽全天。
 4. **UI 保持高密度精密仪表风（Precision Telemetry）。** 统一采用等宽数字（`.monospacedDigit()`）、四色语义系统（推进蓝/达标绿/封顶琥珀/乱切斜纹红）、330pt 免滚动菜单栏面板与今日时间光谱条。
 
@@ -41,7 +41,7 @@
 
 - 顺序：写测试 → 跑，确认它**因为正确的原因失败** → 写最小实现 → 跑通 → 再重构。
 - 测试必须能在**无 GUI、无网络、无真实用户数据**的条件下跑通。CI 友好。
-- 时间相关逻辑一律**注入时钟**，不直接调 `Date()`。事件合并、配额累计、光谱条切分、滑动窗口检测全部可确定性测试。
+- 时间相关逻辑一律**注入时钟**，不直接调 `Date()`。事件合并、配额累计、光谱条切分、滑动窗口检测、SQLite/CLI/HTTP 接口全部可确定性测试。
 - 每个测试只断言一件事。断言失败信息要能直接指出哪条不变量破了。
 
 ### 测试组织
@@ -50,8 +50,8 @@
 
 ```
 Package.swift
-Sources/DayHelmCore/        # 纯逻辑，严禁 import AppKit
-Sources/DayHelmCapture/     # Alma HTTP + AX 采集实现，用协议隔离
+Sources/DayHelmCore/        # 纯逻辑、SQLite3 存储、Agent CLI，严禁 import AppKit
+Sources/DayHelmCapture/     # 原生 AX / 屏幕快照与 Vision OCR / 本地 HTTP 服务 / Alma 客户端
 Sources/DayHelmApp/         # MenuBarExtra + NSPanel UI
 Sources/DayHelmChecks/      # 确定性自检断言，失败 exit 1
 ```
@@ -62,29 +62,31 @@ Sources/DayHelmChecks/      # 确定性自检断言，失败 exit 1
 
 | 结论 | 含义 |
 |---|---|
-| Alma `http://localhost:23001/api/activity-recorder/sessions` 实时可用 | 能直接拿到今日 `sessions` 和毫秒级 `app_focus`、`browser_visit`、`keypress`、`click`、`unlock` 事件，但 `snapshots.windowTitle` 为 `null` |
-| AX `kAXTitleAttribute` 读窗口标题、**AX `AXDocument` 读浏览器当前 URL** | 需要 Accessibility。实测都拿到了，正好补齐 Alma 缺失的窗口标题 |
+| Alma `http://localhost:23001/api/activity-recorder/sessions` 实时可用（可选） | Alma 未启动时由 DayHelm 自身原生采集并兼听 `23001`；Alma 运行时仅监听 `23002` 并兼容回补 |
+| AX `kAXTitleAttribute` 读窗口标题、**AX `AXDocument` 读浏览器当前 URL** | 需要 Accessibility。实测都拿到了，补齐 `windowTitle` |
+| `ScreenCaptureKit` + `Vision.VNRecognizeTextRequest` | `Screen Recording` 为可选权限：开启并授权时捕获 32-bin 直方图去重 JPEG + 本机离线 OCR；拒绝或关闭时不纠缠 |
 | `NSWorkspace.frontmostApplication`、`CGEventSource.secondsSinceLastEventType` | 均**无需权限** |
-| 空闲检测**不能用 `.keyDown`** | 只用鼠标时会误判离开。用 `CGEventType(rawValue: 0xFFFFFFFF)` 或结合 Alma 实时 `click/keypress` 事件 |
+| 空闲检测**不能用 `.keyDown`** | 只用鼠标时会误判离开。用 `CGEventType(rawValue: 0xFFFFFFFF)` 结合 `NSEvent` 计次活跃 |
 | `NSPanel` + `.nonactivatingPanel` + `.floating` | 可以在右上角弹出带按钮的提醒卡片，且**不抢夺用户当前正在打字的窗口焦点** |
 | `MenuBarExtra` 的图标被用户拖掉后 **app 会自动终止** | 需要 launchd 兜底 |
 | `~/.config/alma/time-audit/daily/*.json` 是**次日 08:00** 才生成 | "今日已投入"必须由 DayHelm 实时计算，**不能读日报** |
 
 ## 数据与隐私边界
 
-- 采集范围：**Alma 实时活动事件 + 前台应用名、窗口标题、浏览器当前 URL、屏幕锁定状态、空闲时长**。
-- **不采**：音频、键盘输入具体文本内容、剪贴板、屏幕截图（DayHelm 自身不截图）。
-- 所有数据留在本机 `~/.config/alma/dayhelm/`。不加遥测、崩溃上报、云同步。
-- 标题和 URL 按高敏感数据处理。写入前过滤密码管理器、银行、私人聊天类应用（名单在 `docs/privacy.md`）。
-- 真实窗口标题、URL、数据库**不得提交到 Git**。测试一律用合成数据。
-- 提供一条命令彻底删除所有采集数据，并在文档里写明。
+- 采集范围：**本机活动事件（含计次级键鼠活跃，不读按键内容）+ 前台应用名、窗口标题、浏览器当前 URL、屏幕锁定状态、空闲时长 + 可选的去重屏幕快照与本机 Apple Vision OCR 文本**。
+- **不采**：音频、摄像头、键盘输入**具体文本内容**、剪贴板、脱敏应用或锁屏时的屏幕截图与 OCR。
+- 命中 `PrivacyRedactor` 脱敏规则（`redacted == true`）或锁屏时：**绝不保存标题/URL，且绝不截屏、绝不运行 OCR**。
+- 所有数据留在本机 `~/.config/alma/dayhelm/`（`activity.sqlite`、`snapshots/`、`today.json`、`days/`、`config.json`）。不加遥测、崩溃上报、云同步；内置 HTTP API 仅绑定 `127.0.0.1` 环回地址。
+- 真实窗口标题、URL、快照、数据库**不得提交到 Git**。测试一律用合成数据（含合成渲染图像）。
+- 提供 `dayhelm purge` 命令彻底删除所有采集数据（含 JSON、SQLite、快照），并在文档里写明。
 
 ## 与既有系统的关系（重要）
 
 | 系统 | 位置 | 关系 |
 |---|---|---|
-| `Alma activity-recorder` | `http://localhost:23001` | 底层实时事件源之一。DayHelm 读取其实时事件，并补齐其缺失的 `windowTitle` |
-| `alma-time-audit` | `~/.config/alma/scripts/`、`~/dev/code/alma-time-audit/` | 产出日/周报，做事后审计与评分。**DayHelm 负责当天实时掌舵，与它互补** |
+| `Alma activity-recorder` | `http://localhost:23001` | 可选兼容。DayHelm 已内置独立原生采集器与 `activity.sqlite`；Alma 关闭时 DayHelm 自动兼听 `23001` 替代之 |
+| `alma-time-audit` | `~/.config/alma/scripts/`、`~/dev/code/alma-time-audit/` | 产出日/周报，做事后审计与评分。**DayHelm 负责当天实时掌舵并在 23001/23002 开放完整数据，与它互补** |
+| 本机 AI Agents (Claude Code / Codex / Hermes) | CLI & `127.0.0.1:23002` | 通过 `dayhelm query/search/sessions` 或 `/api/dayhelm/context` 获取当日实时上下文 |
 
 ## 未得到用户明确要求时
 

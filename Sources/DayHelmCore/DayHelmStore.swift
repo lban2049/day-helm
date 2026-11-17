@@ -89,6 +89,21 @@ public struct DayHelmDaySnapshot: Sendable, Equatable, Codable {
     }
 }
 
+public struct DayHelmSettings: Sendable, Equatable, Codable {
+    public var deepRecordingEnabled: Bool
+    public var snapshotRetentionDays: Int
+
+    public static let `default` = DayHelmSettings()
+
+    public init(
+        deepRecordingEnabled: Bool = true,
+        snapshotRetentionDays: Int = 7
+    ) {
+        self.deepRecordingEnabled = deepRecordingEnabled
+        self.snapshotRetentionDays = max(1, snapshotRetentionDays)
+    }
+}
+
 public final class DayHelmStore: @unchecked Sendable {
     public let directory: URL
     private let fileManager: FileManager
@@ -106,6 +121,14 @@ public final class DayHelmStore: @unchecked Sendable {
 
     public var daysDirectory: URL {
         directory.appendingPathComponent("days", isDirectory: true)
+    }
+
+    public var snapshotsDirectory: URL {
+        directory.appendingPathComponent("snapshots", isDirectory: true)
+    }
+
+    public var databaseURL: URL {
+        directory.appendingPathComponent("activity.sqlite")
     }
 
     public var configURL: URL {
@@ -150,13 +173,42 @@ public final class DayHelmStore: @unchecked Sendable {
         return try decoder.decode(DayHelmDaySnapshot.self, from: data)
     }
 
-    private struct DayHelmConfigSaveDTO: Codable {
-        let budgets: [TaskBudget]
+    private struct DayHelmConfigFileDTO: Codable {
+        var budgets: [TaskBudget]?
+        var deepRecordingEnabled: Bool?
+        var snapshotRetentionDays: Int?
+    }
+
+    private func loadConfigDTO() -> DayHelmConfigFileDTO {
+        guard fileManager.fileExists(atPath: configURL.path),
+              let data = try? Data(contentsOf: configURL),
+              let decoded = try? decoder.decode(DayHelmConfigFileDTO.self, from: data) else {
+            return DayHelmConfigFileDTO(budgets: nil, deepRecordingEnabled: nil, snapshotRetentionDays: nil)
+        }
+        return decoded
     }
 
     public func saveBudgets(_ budgets: [TaskBudget]) throws {
         try ensureDirectory(directory)
-        let payload = DayHelmConfigSaveDTO(budgets: budgets)
+        var payload = loadConfigDTO()
+        payload.budgets = budgets
+        let data = try encoder.encode(payload)
+        try writeAtomically(data: data, to: configURL, tempURL: directory.appendingPathComponent("config.json.tmp"))
+    }
+
+    public func loadSettings() -> DayHelmSettings {
+        let dto = loadConfigDTO()
+        return DayHelmSettings(
+            deepRecordingEnabled: dto.deepRecordingEnabled ?? true,
+            snapshotRetentionDays: dto.snapshotRetentionDays ?? 7
+        )
+    }
+
+    public func saveSettings(_ settings: DayHelmSettings) throws {
+        try ensureDirectory(directory)
+        var payload = loadConfigDTO()
+        payload.deepRecordingEnabled = settings.deepRecordingEnabled
+        payload.snapshotRetentionDays = max(1, settings.snapshotRetentionDays)
         let data = try encoder.encode(payload)
         try writeAtomically(data: data, to: configURL, tempURL: directory.appendingPathComponent("config.json.tmp"))
     }
@@ -205,6 +257,24 @@ public final class DayHelmStore: @unchecked Sendable {
                 deletedBytes += size
             }
 
+            if fileManager.fileExists(atPath: databaseURL.path) {
+                let db = try ActivityDatabase(databaseURL: databaseURL)
+                let dbPurge = try db.purgeRecords(before: cutoffDate, snapshotsRootDir: snapshotsDirectory)
+                deletedFiles += dbPurge.deletedFiles
+                deletedBytes += dbPurge.deletedBytes
+            } else if fileManager.fileExists(atPath: snapshotsDirectory.path) {
+                let dayDirs = (try? fileManager.contentsOfDirectory(at: snapshotsDirectory, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+                for dayDir in dayDirs where dayDir.lastPathComponent < cutoffDay {
+                    let files = (try? fileManager.contentsOfDirectory(at: dayDir, includingPropertiesForKeys: [.fileSizeKey], options: [.skipsHiddenFiles])) ?? []
+                    for file in files {
+                        deletedBytes += fileSize(at: file)
+                        try fileManager.removeItem(at: file)
+                        deletedFiles += 1
+                    }
+                    try? fileManager.removeItem(at: dayDir)
+                }
+            }
+
             return (deletedFiles, deletedBytes)
         }
 
@@ -228,11 +298,8 @@ public final class DayHelmStore: @unchecked Sendable {
             }
         }
 
-        if fileManager.fileExists(atPath: daysDirectory.path) {
-            let remaining = (try? fileManager.contentsOfDirectory(atPath: daysDirectory.path)) ?? []
-            if remaining.isEmpty {
-                try? fileManager.removeItem(at: daysDirectory)
-            }
+        for subDir in [daysDirectory, snapshotsDirectory] where fileManager.fileExists(atPath: subDir.path) {
+            try? fileManager.removeItem(at: subDir)
         }
 
         return (deletedFiles, deletedBytes)

@@ -80,6 +80,14 @@
 
 验收：产出格式稳定、有 schema 版本、有文档；`time-audit` 侧改动由 `time-audit` 项目负责。
 
+**US-8｜独立原生录制、可选屏幕 OCR 与开放 Agent 数据中心**
+> 即使完全退出 Alma，DayHelm 也能独立完成毫秒级活动事件、AX 窗口标题、URL、去重屏幕快照与设备端 Vision OCR 录制，并通过开放 SQLite（`activity.sqlite`）、CLI（`query`/`search`/`sessions`）与本地兼容 HTTP API（`:23002` + 空闲兼听 `:23001`）向任意 AI Agent 与 `alma-time-audit` 开放。
+
+验收：
+- 屏幕录制权限可选可开关；未授权或关闭时无痛降级为 AX 标题 + URL + 事件录制
+- 命中 `PrivacyRedactor` 脱敏规则或锁屏时绝不截屏、绝不运行 OCR
+- 支持 `dayhelm query` / `dayhelm search` / `dayhelm sessions`（`json` 与 `md` 输出）以及 `/api/activity-recorder/*`、`/api/dayhelm/context`
+
 ### 不做（明确排除）
 
 | 不做 | 理由 |
@@ -93,7 +101,6 @@
 | 日历集成 / 内置复杂待办管理 | 只管"今天这几个专注事项的配额与监督" |
 | 游戏化（种树/宠物/房间） | 对多任务管理无效 |
 | 生产力评分 | 与 time-audit 重复且口径会冲突 |
-| 屏幕截图 / OCR | 已由 local-screen-time-journal 与 Alma recorder 承担 |
 
 ## 成功标准
 

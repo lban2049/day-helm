@@ -10,7 +10,10 @@ today.json
 days/
 blocks/
 captures/
+snapshots/
 exports/
+*.jpg
+*.jpeg
 
 # 数据库
 *.sqlite

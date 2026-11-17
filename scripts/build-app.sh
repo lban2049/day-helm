@@ -76,6 +76,8 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
     </dict>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>DayHelm 使用本地屏幕快照与 Apple Vision OCR 自动提取工作上下文（所有数据仅保留在本地，隐私应用/窗口自动跳过）。</string>
 </dict>
 </plist>
 PLIST
@@ -93,4 +95,7 @@ echo "[DayHelm] Packaged successfully: ${APP_BUNDLE}"
 echo "  Run live:           open \"${APP_BUNDLE}\""
 echo "  Run synthetic demo: \"${MACOS_DIR}/${APP_NAME}\" --synthetic-demo"
 echo "  CLI status:         \"${MACOS_DIR}/${APP_NAME}\" status"
+echo "  CLI query:          \"${MACOS_DIR}/${APP_NAME}\" query --today --format md"
+echo "  CLI search:         \"${MACOS_DIR}/${APP_NAME}\" search <keyword> --format json"
+echo "  CLI sessions:       \"${MACOS_DIR}/${APP_NAME}\" sessions --format md"
 echo "  CLI purge:          \"${MACOS_DIR}/${APP_NAME}\" purge --before YYYY-MM-DD"

@@ -8,20 +8,26 @@
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ 界面层 (DayHelmApp)                                                     │
 │   ├─ MenuBar 实时胶囊 (MenuBarExtra) + 330pt 高密度下拉仪表盘           │
+│   ├─ 采集与 OCR 引擎状态条（AX 标题 / 屏幕 OCR 开关与帧数 / Agent API） │
 │   └─ 右上角非抢占式监督浮窗 (NSPanel: .nonactivatingPanel)              │
 ├─────────────────────────────────────────────────────────────────────────┤
-│ 判定与分析层 (DayHelmCore · 纯 Swift，严禁 import AppKit)               │
-│   ├─ EventMerger: 融合 Alma 实时事件与 AX 窗口标题为连续 ActivitySpan   │
-│   ├─ QuotaTracker: 计算各事项今日累计时长、保底缺口(Target)与封顶(Cap)  │
-│   ├─ SpectrumBuilder: 生成今日时间光谱条数据与连续块/切换频次指标       │
-│   └─ SlidingSupervisor: 滑动窗口检测配额到点、持续跑偏与高频碎片化乱切  │
+│ 判定与数据中心层 (DayHelmCore · 纯 Swift，严禁 import AppKit)           │
+│   ├─ EventMerger / QuotaTracker / SpectrumBuilder / SlidingSupervisor   │
+│   ├─ ActivityDatabase: 开放 SQLite (SQLite3 WAL)，兼容 Alma 四表模型    │
+│   └─ DayHelmCLI: query / search / sessions / status / purge             │
 ├─────────────────────────────────────────────────────────────────────────┤
-│ 混合采集层 (DayHelmCapture)                                             │
-│   ├─ AlmaActivityClient: 增量拉取 localhost:23001 实时 sessions/events  │
-│   └─ AXWindowInspector: 2s 轮询 NSWorkspace + AX 补齐窗口标题与 URL     │
+│ 独立原生采集与接口层 (DayHelmCapture)                                   │
+│   ├─ AXWindowInspector: 2s 轮询 NSWorkspace + AX 窗口标题与 URL         │
+│   ├─ NativeScreenRecorder: 32-bin 直方图去重 + JPEG 0.55 + Vision OCR   │
+│   ├─ NativeEventMonitor: app_focus / lock / unlock / 计次级键鼠活跃     │
+│   ├─ LocalActivityHTTPServer: 127.0.0.1:23002 (+ 空闲兼听 :23001)       │
+│   └─ AlmaActivityClient: 仅当 Alma 运行于 23001 时增量兼容回补          │
 ├─────────────────────────────────────────────────────────────────────────┤
-│ 存储层 (DayHelmStore)                                                   │
-│   └─ ~/.config/alma/dayhelm/ (today.json 原子写 + days/YYYY-MM-DD.json) │
+│ 存储层 (DayHelmStore & ActivityDatabase)                                │
+│   └─ ~/.config/alma/dayhelm/                                            │
+│       ├─ activity.sqlite (sessions / events / snapshots / ocr_frames)   │
+│       ├─ snapshots/YYYY-MM-DD/*.jpg (默认保留 7 天自动清理)             │
+│       └─ today.json + days/YYYY-MM-DD.json + config.json                │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -29,40 +35,34 @@
 
 ```
 Package.swift
-├── Sources/DayHelmCore/        # 纯逻辑与数据模型（无 AppKit，注入 Clock，100% 可单测）
-├── Sources/DayHelmCapture/     # Alma HTTP 客户端 + macOS AX/NSWorkspace/CGEvent 采集实现
+├── Sources/DayHelmCore/        # 纯逻辑、SQLite 存储与 Agent CLI（严禁 import AppKit，注入 Clock，100% 可单测）
+├── Sources/DayHelmCapture/     # 原生 AX + ScreenCaptureKit + Vision OCR + NWListener HTTP API + Alma 兼容客户端
 ├── Sources/DayHelmApp/         # SwiftUI 菜单栏仪表盘 + NSPanel 非抢占提醒窗
-└── Sources/DayHelmChecks/      # 确定性自检可执行程序（合成数据验证配额、合并与监督触发）
+└── Sources/DayHelmChecks/      # 确定性自检可执行程序（合成数据验证配额、SQLite、OCR、CLI 与 HTTP API）
 ```
 
 ---
 
-## 二、 混合采集层：结合 Alma 实时数据 + AX 标题补齐
+## 二、 独立原生采集与兼容层：彻底脱离 Alma 运行
 
-### 1. 为什么要做双通道混合采集？
+### 1. 为什么内置独立原生采集引擎？
 
-本机已有常驻运行的 **Alma `activity-recorder`**（`http://localhost:23001/api/activity-recorder/...`），经实测：
-- **Alma 已具备的实时数据**：
-  - 当前与今日所有 `sessions`（毫秒级 `startedAt`, `endedAt`, `triggerKind`）
-  - 实时 `events` 流：`app_focus`（应用切换时间点与 `bundleId`）、`browser_visit`（Chrome URL 与 Tab 名）、`keypress` / `click`（键鼠活跃计数）、`unlock`（解锁事件）。
-- **Alma 缺失的数据**：
-  - `snapshots` 中的 `windowTitle` 字段全部为 `null`（未保存非 Chrome 应用的窗口标题）。
+DayHelm 内置完整的 macOS 原生活动采集、视觉去重、设备端 Vision OCR、开放 SQLite 存储与兼容 HTTP API，彻底取代外部 Alma `activity-recorder` 依赖：
+1. **无需 Alma 即可独立运行**：内置 `AXWindowInspector`、`NativeEventMonitor` 与 `NativeScreenRecorder`，自行产出毫秒级 `app_focus`、`browser_visit`、`click`、`keypress`、`lock`/`unlock`、窗口标题、URL、去重快照与 OCR 文本。
+2. **可选且可开关的深度屏幕与 OCR 录制**：`Screen Recording` 权限为**可选**。当启用 `deepRecordingEnabled` 且已授权时，通过 `ImageHistogram`（32-bin 亮度直方图 + 8×8 感知哈希）执行去重捕获：仅在 `app_focus`（4s 防抖）、12s 视觉检查且变化率 `diffPct >= 0.04`（4%）、或 120s 心跳时保存 JPEG（质量 0.55）并在后台 `.utility` 队列运行 Apple Vision OCR（`["zh-Hans", "zh-Hant", "en-US", "ja"]`）。若权限被拒或用户关闭，则静默无痛降级为纯 AX 窗口标题 + URL + 事件录制，绝不弹窗纠缠。
+3. **严格隐私阻断**：当 `PrivacyRedactor` 判定当前样品 `redacted == true` 或屏幕处于锁屏状态时，**绝不截屏、绝不运行 OCR**。
+4. **双端口兼容与 Agent 数据中心**：内置 `LocalActivityHTTPServer`（仅绑定 `127.0.0.1`）默认监听 `23002`；若检测到 `23001` 空闲（Alma 未启动），自动同时兼听 `23001`，使 `alma-time-audit` 无需任何修改即可开箱即用。若 Alma 正在 `23001` 运行，则只监听 `23002` 并按需从 Alma 做历史回补（跳过自身服务防回环）。
 
-因此，DayHelm 采用 **「Alma 实时流 + 本机 AX 标题增补」** 的双通道混合方案：
-1. **开机/重启即拥有全天完整历史**：DayHelm 启动时直接拉取 `localhost:23001` 今日已有的 `sessions` 与 `events`，哪怕中途重启 App，当天的活动轨迹、切换次数也分秒不差。
-2. **2 秒轮询补齐窗口标题与 URL**：DayHelm 自身运行极轻量的 `AXWindowInspector`，每 2 秒通过 `NSWorkspace.frontmostApplication` + Accessibility (`kAXTitleAttribute` & `AXDocument`) 获取当前前台窗口标题与浏览器 URL，按时间戳增补到活动流中。
-3. **离线无缝降级**：若 `localhost:23001` 未响应，自动退化为纯本机 `NSWorkspace + AX + CGEventSource` 独立采样，保证任何情况下工具可用。
+### 2. 采集数据清单与触发频率
 
-### 2. 采集数据清单与 API
-
-| 数据源 | 字段 | 实现方式 | 权限 | 频率 |
+| 数据源 | 字段 | 实现方式 | 权限 | 频率 / 阈值 |
 |---|---|---|---|---|
-| **Alma API** | `sessions` / `events` (`app_focus`, `browser_visit`, `click`, `keypress`, `unlock`) | `GET http://localhost:23001/api/activity-recorder/sessions` | 无（本地 HTTP） | 启动全量 + 10s 增量同步 |
-| **本机 AX** | 前台应用 `appName` + `bundleId` | `NSWorkspace.frontmostApplication` + 激活通知 | 无 | 事件驱动 + 2s 轮询 |
-| **本机 AX** | 窗口标题 `windowTitle` | AX `kAXFocusedWindowAttribute` → `kAXTitleAttribute`（降级 `kAXWindows[0]`） | Accessibility | 2s 轮询 |
-| **本机 AX** | 浏览器当前 `url` | AX `AXDocument` on focused window | Accessibility | 2s 轮询 |
-| **本机 HID** | 全局空闲秒数 `idleSeconds` | `CGEventSource.secondsSinceLastEventType(.combinedSessionState, 0xFFFFFFFF)` + `HIDIdleTime` 校验 | 无 | 2s 轮询 |
-| **系统通知** | 屏幕锁定 `screenLocked` | `DistributedNotificationCenter` (`com.apple.screenIsLocked` / `Unlocked`) | 无 | 事件驱动 |
+| **本机 AX** | 前台应用 `appName` + `bundleId` | `NSWorkspace.frontmostApplication` + `didActivateApplicationNotification` | 无 | 事件驱动 + 2s 轮询 |
+| **本机 AX** | 窗口标题 `windowTitle` & `url` | AX `kAXFocusedWindowAttribute` → `kAXTitleAttribute` + `AXDocument` | Accessibility | 2s 轮询 |
+| **原生事件监听** | `app_focus` / `lock` / `unlock` / 计次活跃 | `NSWorkspace` / `DistributedNotificationCenter` / `NSEvent` 计次（不读按键内容） | 无 / 辅助功能 | 事件驱动（键鼠节流） |
+| **原生屏幕快照** | 去重 JPEG + 32-bin 直方图 + `hashHex` | `ScreenCaptureKit` (`SCScreenshotManager`) | **可选** Screen Recording | `app_focus` 4s 防抖 / 12s 视觉检查 (`diffPct >= 4%`) / 120s 心跳 |
+| **设备端 OCR** | `text` / `charCount` / `tokenCount` | Apple `Vision.VNRecognizeTextRequest` (`.accurate`) | 同上（本机离线） | 随去重快照在后台 `.utility` 队列执行 |
+| **本机 HID** | 全局空闲秒数 `idleSeconds` | `CGEventSource.secondsSinceLastEventType(.combinedSessionState, 0xFFFFFFFF)` + `HIDIdleTime` | 无 | 2s 轮询 |
 
 ### 3. 采集层统一接口
 
@@ -72,10 +72,11 @@ public struct ActivitySample: Sendable, Equatable, Codable {
     public let appName: String
     public let bundleId: String?
     public let windowTitle: String?     // 由 AX 补齐；敏感应用过滤后置 nil
-    public let url: String?             // 由 AXDocument 或 Alma browser_visit 提供
+    public let url: String?             // 由 AXDocument 提供并剥离敏感参数
     public let idleSeconds: TimeInterval
     public let screenLocked: Bool
-    public let inputActive: Bool        // 结合 Alma click/keypress 或 idleSeconds < 2s
+    public let inputActive: Bool        // 结合键鼠活跃事件或 idleSeconds < 2s
+    public let redacted: Bool           // true 时绝不保存标题/URL，且绝不截屏或 OCR
 }
 ```
 
@@ -163,7 +164,7 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 
 #### 载体 B：菜单栏下拉高密度仪表盘（Popover，固定宽 `330pt`，一屏免滚动）
 由上至下分为 5 个紧凑模块（内边距 `14pt`，模块间距 `11pt`）：
-1. **顶部品牌与采集状态栏**：左侧自定义日舵矢量徽标 + `DayHelm` 标识，右侧实时状态胶囊 `● Alma + AX 采集中`。
+1. **顶部品牌与采集状态栏 + 引擎状态微条**：左侧自定义日舵矢量徽标 + `DayHelm` 标识，右侧实时状态胶囊；下方紧凑展示 **「采集与 OCR 引擎」** 状态条（`AX 标题` 状态、`屏幕 OCR (X 帧)` 开关/授权按钮、`Agent API :23002` 端口指示）。
 2. **当前专注控制盒（Active Focus Box）**：
    - 右上角大号等宽计时器（如 `26:40`），左侧显示当前专注事项名称。
    - 单行等宽小字实时回显当前捕获到的窗口标题/URL（如 `当前窗口: 抖店后台 - 商品主图 (Chrome)`），让用户直观看到采集器在工作。
@@ -191,18 +192,51 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 
 ---
 
-## 五、 存储层与外部系统契约
+## 五、 存储层、开放 SQLite、Agent CLI 与本地 HTTP API
 
 ### 1. 本地存储路径（`~/.config/alma/dayhelm/`）
 
 ```
 ~/.config/alma/dayhelm/
-  today.json              # 今日实时热数据（原子写入：today.json.tmp -> rename）
-  days/YYYY-MM-DD.json    # 每日定稿归档（含补齐了 windowTitle 的活动区间与专注会话）
-  config.json             # 每日各事项配额配置（targetMinutes / capMinutes）与提醒阈值
+  activity.sqlite           # 开放 SQLite 数据库（WAL 模式）
+  snapshots/YYYY-MM-DD/     # 去重 JPEG 快照（0.55 质量，默认保留 7 天自动清理）
+  today.json                # 今日实时热数据（原子写入：today.json.tmp -> rename）
+  days/YYYY-MM-DD.json      # 每日定稿归档（含补齐了 windowTitle 的活动区间与专注会话）
+  config.json               # 事项配额配置 + deepRecordingEnabled / snapshotRetentionDays
 ```
 
-### 2. `today.json` 核心结构示例
+### 2. 开放 SQLite 数据库结构（`activity.sqlite`）
+
+启用 `PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;`，包含四张与 Alma 兼容并扩展了 `window_title` 与 `declared_task_id` 的核心表：
+
+- `activity_sessions`：`id`, `started_at`, `ended_at`, `duration_ms`, `trigger_kind`, `app_names`, `event_count`, `snapshot_count`, `total_bytes`, `analysis_status`, `analysis_title`, `analysis_description`, `analysis_model`, `analysis_error`, `analyzed_at`, `worth_memory`, `worth_knowledge`, `is_meeting`, `storage_tier`, `entities`, `topics`, `project`, `highlights`, `declared_task_id`, `created_at`, `updated_at`
+  - 空闲超过会话间隔（默认 `120s`，可在 `30s–300s` 间配置）、锁屏或跨日时自动切分新会话，并基于高频应用、窗口标题与专注事项自动合成 `analysis_title` 与 `analysis_description`。
+- `activity_events`：`id`, `session_id`, `timestamp`, `kind` (`app_focus` / `browser_visit` / `click` / `keypress` / `lock` / `unlock`), `app_name`, `window_title`, `url`, `data`, `created_at`
+- `activity_snapshots`：`id`, `session_id`, `timestamp`, `file_path`, `width`, `height`, `size_bytes`, `trigger` (`app_focus` / `visual_change` / `heartbeat`), `app_name`, `window_title`, `hash_hex`, `histogram` (32-bin JSON), `diff_pct`, `storage_tier`, `created_at`
+- `activity_ocr_frames`：`id`, `snapshot_id`, `session_id`, `text`, `char_count`, `token_count`, `created_at`
+
+### 3. Agent CLI 接口（`DayHelm`）
+
+任意 AI Agent 可直接通过命令行读取或检索当日活动上下文（支持 `md` 与 `json`）：
+
+```bash
+dayhelm query [--today | --since <2h|30m|YYYY-MM-DD>] [--format json|md] [--store-dir <path>]
+dayhelm search <keyword> [--limit 20] [--format json|md] [--store-dir <path>]
+dayhelm sessions [--date YYYY-MM-DD] [--id <session_id>] [--format json|md] [--store-dir <path>]
+dayhelm status [--store-dir <path>]
+dayhelm purge [--before YYYY-MM-DD] [--store-dir <path>]
+```
+
+### 4. 本地兼容 HTTP API（`127.0.0.1` 环回）
+
+由 `LocalActivityHTTPServer`（`Network.NWListener`）仅在 `127.0.0.1` 提供服务，默认端口 **`23002`**；当检测到 `23001` 未被 Alma 占用时自动兼听 **`23001`**：
+
+- `GET /api/activity-recorder/status`：采集器状态、端口、AX/Screen Recording 权限状态、今日会话/事件/快照/OCR 计数
+- `GET /api/activity-recorder/sessions?limit=...&since=...&until=...`：兼容 Alma 会话列表格式
+- `GET /api/activity-recorder/sessions/<id>`：返回 `{ session, events, snapshots, ocrFrames }`（含完整 `windowTitle` 与 `declaredTaskId`）
+- `GET /api/dayhelm/context?since=...`：面向 AI Agent 的结构化摘要（当前专注状态、今日配额、连续度指标、最近窗口标题/URL 与 OCR 片段）
+
+### 5. `today.json` 核心结构示例
 
 ```json
 {
@@ -260,9 +294,9 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 }
 ```
 
-### 3. 与 `alma-time-audit` 的协同契约
-- **读取配置**：DayHelm 只读读取 `~/.config/alma/time-audit/focus.json` 与 `config.json`。
-- **反哺标题与归因**：DayHelm 产出的 `enrichedSpans`（带真實 `windowTitle` 和 `declaredTaskId`）保存在 `~/.config/alma/dayhelm/days/YYYY-MM-DD.json`，次日 `time-audit` 可直接读取，彻底解决原本因 `windowTitle: null` 和多应用协同导致的项目归属率低问题。
+### 6. 与 `alma-time-audit` 的协同契约
+- **读取配置**：DayHelm 仅在初次初始化时只读读取 `~/.config/alma/time-audit/focus.json` 与 `config.json`。
+- **完整替换 Alma 采集源**：当 Alma 未运行时，DayHelm 自动在 `127.0.0.1:23001`（及 `23002`）提供兼容的 `/api/activity-recorder/sessions` 接口，且回传已补齐的 `windowTitle`、OCR 文本与 `declaredTaskId`；同时 `days/YYYY-MM-DD.json` 中的 `enrichedSpans` 也可被 `time-audit` 直接读取，彻底解决多应用协同下的项目归属率低问题。
 
 ---
 

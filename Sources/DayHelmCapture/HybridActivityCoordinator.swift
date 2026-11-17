@@ -21,6 +21,13 @@ public final class HybridActivityCoordinator: ObservableObject {
     @Published public private(set) var elapsedFocusSeconds: TimeInterval = 0
     @Published public private(set) var lastTaskNote: String?
 
+    @Published public var deepRecordingEnabled: Bool = true
+    @Published public private(set) var screenCaptureTrusted: Bool = false
+    @Published public private(set) var todaySnapshotCount: Int = 0
+    @Published public private(set) var todayOCRCount: Int = 0
+    @Published public private(set) var apiServerPort: UInt16?
+    @Published public private(set) var apiServerPorts: [UInt16] = []
+
     public let isSyntheticDemo: Bool
     public let storeDirectoryURL: URL
 
@@ -29,12 +36,22 @@ public final class HybridActivityCoordinator: ObservableObject {
     private let almaClient: AlmaActivityClient?
     private let inspector: any ActivityInspecting
     private let clock: any DayHelmClock
+    private let database: ActivityDatabase?
+    private let screenRecorder: NativeScreenRecorder?
+    private var httpServer: LocalActivityHTTPServer?
+    private var eventMonitor: NativeEventMonitor?
+    private var settings: DayHelmSettings
+
+    private let runtimeStateBox = RuntimeStateBox()
 
     private var timerTask: Task<Void, Never>?
     private var almaSyncTask: Task<Void, Never>?
     private var lastAlmaEventMs: Int64?
     private var latestAlmaBrowserSample: ActivitySample?
     private var lastAlmaInputAt: Date?
+    private var lastNativeInputAt: Date?
+    private var lastRecordedSampleKey: String?
+    private var lastRecordedHeartbeatAt: Date?
     private var tickCount: Int = 0
     private var isStarted: Bool = false
 
@@ -44,7 +61,10 @@ public final class HybridActivityCoordinator: ObservableObject {
         almaClient: AlmaActivityClient?,
         inspector: any ActivityInspecting,
         clock: any DayHelmClock = SystemClock(),
-        syntheticDemo: Bool = false
+        syntheticDemo: Bool = false,
+        database: ActivityDatabase? = nil,
+        screenRecorder: NativeScreenRecorder? = nil,
+        httpServer: LocalActivityHTTPServer? = nil
     ) {
         self.engine = engine
         self.store = store
@@ -52,9 +72,20 @@ public final class HybridActivityCoordinator: ObservableObject {
         self.inspector = inspector
         self.clock = clock
         self.isSyntheticDemo = syntheticDemo
+        self.database = database
+        self.screenRecorder = screenRecorder
+        self.httpServer = httpServer
+
+        let loadedSettings = store?.loadSettings() ?? .default
+        self.settings = loadedSettings
+        self.deepRecordingEnabled = loadedSettings.deepRecordingEnabled
         self.storeDirectoryURL = store?.directory ?? DayHelmStore.defaultDirectory
         self.axTrusted = inspector.isAccessibilityTrusted
+        self.screenCaptureTrusted = screenRecorder?.isScreenCaptureTrusted ?? false
+
         refreshPublishedState()
+        refreshRecorderCounts()
+        syncCachedRuntimeState()
     }
 
     public static func makeLive(
@@ -79,15 +110,39 @@ public final class HybridActivityCoordinator: ObservableObject {
 
         let inspector = AXWindowInspector(clock: clock, privacyConfig: engine.config.privacyConfig)
         let almaClient = AlmaActivityClient()
+        let database = try? ActivityDatabase(databaseURL: store.databaseURL)
+        let recorder = database.map {
+            NativeScreenRecorder(
+                database: $0,
+                snapshotsRootDir: store.snapshotsDirectory,
+                clock: clock
+            )
+        }
 
-        return HybridActivityCoordinator(
+        let coordinator = HybridActivityCoordinator(
             engine: engine,
             store: store,
             almaClient: almaClient,
             inspector: inspector,
             clock: clock,
-            syntheticDemo: false
+            syntheticDemo: false,
+            database: database,
+            screenRecorder: recorder,
+            httpServer: nil
         )
+
+        if let database {
+            coordinator.httpServer = LocalActivityHTTPServer(
+                database: database,
+                store: store,
+                clock: clock,
+                stateProvider: { [weak coordinator] in
+                    coordinator?.readCachedRuntimeState() ?? LocalActivityHTTPServer.RuntimeState()
+                }
+            )
+        }
+
+        return coordinator
     }
 
     public static func makeSyntheticDemo(
@@ -98,10 +153,8 @@ public final class HybridActivityCoordinator: ObservableObject {
         let budgets = TimeAuditConfigLoader.defaultBudgets
         let engine = DayHelmEngine(budgets: budgets, clock: clock)
 
-        // Seed synthetic morning timeline ending near `now`
         let morningStart = now.addingTimeInterval(-3.5 * 3600)
 
-        // 1. Morning ecommerce deep block (35m)
         engine.startFocus(taskId: "ecommerce", note: "完成示例商品 A 主图初稿", at: morningStart)
         engine.ingest(ActivitySample(
             timestamp: morningStart.addingTimeInterval(35 * 60),
@@ -114,7 +167,6 @@ public final class HybridActivityCoordinator: ObservableObject {
             inputActive: true
         ))
 
-        // 2. Brief thrashing segment (12 rapid switches in 5m)
         engine.stopFocus(at: morningStart.addingTimeInterval(40 * 60))
         let thrashBase = morningStart.addingTimeInterval(42 * 60)
         for i in 0..<12 {
@@ -131,7 +183,6 @@ public final class HybridActivityCoordinator: ObservableObject {
             ))
         }
 
-        // 3. Ecommerce ops block (26m)
         let opsStart = morningStart.addingTimeInterval(65 * 60)
         engine.startFocus(taskId: "ecommerce-ops", note: "处理当日退换货工单", at: opsStart)
         engine.ingest(ActivitySample(
@@ -145,7 +196,6 @@ public final class HybridActivityCoordinator: ObservableObject {
             inputActive: true
         ))
 
-        // 4. Hermes block (20m)
         let hermesStart = morningStart.addingTimeInterval(100 * 60)
         engine.startFocus(taskId: "hermes", note: "整理 Q4 行业研报摘录", at: hermesStart)
         engine.ingest(ActivitySample(
@@ -159,7 +209,6 @@ public final class HybridActivityCoordinator: ObservableObject {
             inputActive: true
         ))
 
-        // 5. Current active ecommerce focus (17m so far -> 52m total)
         let activeStart = now.addingTimeInterval(-17 * 60)
         engine.startFocus(taskId: "ecommerce", note: "优化主图卖点文案", at: activeStart)
         engine.ingest(ActivitySample(
@@ -184,6 +233,11 @@ public final class HybridActivityCoordinator: ObservableObject {
         )
         coordinator.almaConnected = true
         coordinator.axTrusted = true
+        coordinator.screenCaptureTrusted = true
+        coordinator.todaySnapshotCount = 18
+        coordinator.todayOCRCount = 18
+        coordinator.apiServerPort = LocalActivityHTTPServer.defaultPrimaryPort
+        coordinator.apiServerPorts = [LocalActivityHTTPServer.defaultPrimaryPort]
         coordinator.refreshPublishedState()
         return coordinator
     }
@@ -200,8 +254,39 @@ public final class HybridActivityCoordinator: ObservableObject {
             } else {
                 axTrusted = true
             }
-            Task { [weak self] in
-                await self?.syncFromAlma(isInitialBackfill: true)
+            screenCaptureTrusted = screenRecorder?.isScreenCaptureTrusted ?? false
+            refreshRecorderCounts()
+            syncCachedRuntimeState()
+
+            if let server = httpServer {
+                Task { [weak self] in
+                    let ports = await server.start(
+                        primaryPort: LocalActivityHTTPServer.defaultPrimaryPort,
+                        fallbackPort: LocalActivityHTTPServer.almaCompatiblePort
+                    )
+                    await MainActor.run {
+                        self?.apiServerPorts = ports
+                        self?.apiServerPort = ports.first
+                    }
+                    // Only sync from Alma if Alma actually owns 23001 (i.e. DayHelm didn't bind 23001)
+                    if !ports.contains(LocalActivityHTTPServer.almaCompatiblePort) {
+                        await self?.syncFromAlma(isInitialBackfill: true)
+                    }
+                }
+            } else {
+                Task { [weak self] in
+                    await self?.syncFromAlma(isInitialBackfill: true)
+                }
+            }
+
+            if eventMonitor == nil {
+                let monitor = NativeEventMonitor(clock: clock) { [weak self] event in
+                    Task { @MainActor [weak self] in
+                        self?.handleNativeMonitorEvent(event)
+                    }
+                }
+                monitor.start()
+                eventMonitor = monitor
             }
         }
 
@@ -218,6 +303,9 @@ public final class HybridActivityCoordinator: ObservableObject {
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 10_000_000_000)
                     guard !Task.isCancelled else { break }
+                    guard self?.httpServer?.isServingPort(LocalActivityHTTPServer.almaCompatiblePort) != true else {
+                        continue
+                    }
                     await self?.syncFromAlma(isInitialBackfill: false)
                 }
             }
@@ -230,10 +318,43 @@ public final class HybridActivityCoordinator: ObservableObject {
         timerTask = nil
         almaSyncTask?.cancel()
         almaSyncTask = nil
+        eventMonitor?.stop()
+        eventMonitor = nil
+        httpServer?.stop()
+        apiServerPort = nil
+        apiServerPorts = []
+        let endMs = Int64(clock.now().timeIntervalSince1970 * 1000)
+        try? database?.closeActiveSessionIfNeeded(endedAtMs: endMs)
         persistTodayIfNeeded()
     }
 
     // MARK: - User Actions
+
+    public func setDeepRecordingEnabled(_ enabled: Bool) {
+        deepRecordingEnabled = enabled
+        settings.deepRecordingEnabled = enabled
+        if !isSyntheticDemo, let store {
+            try? store.saveSettings(settings)
+        }
+        syncCachedRuntimeState()
+    }
+
+    @discardableResult
+    public func requestScreenCapturePermission() -> Bool {
+        let granted = screenRecorder?.requestScreenCapturePermission() ?? CGRequestScreenCaptureAccess()
+        screenCaptureTrusted = granted
+        if !granted {
+            openScreenRecordingSettings()
+        }
+        syncCachedRuntimeState()
+        return granted
+    }
+
+    public func openScreenRecordingSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
 
     public func selectTask(_ taskId: String, note: String? = nil) {
         let now = clock.now()
@@ -434,15 +555,22 @@ public final class HybridActivityCoordinator: ObservableObject {
         checkDayRolloverIfNeeded(now: now)
 
         axTrusted = inspector.isAccessibilityTrusted
+        if let screenRecorder {
+            screenCaptureTrusted = screenRecorder.isScreenCaptureTrusted
+        }
+
         var sample = inspector.inspectCurrent()
 
-        // Fuse recent Alma browser URL/title or input activity when AX cannot provide it
         if !sample.screenLocked {
             var patchedTitle = sample.windowTitle
             var patchedURL = sample.url
             var patchedInputActive = sample.inputActive
             var patchedIdle = sample.idleSeconds
 
+            if let recentNative = lastNativeInputAt, now.timeIntervalSince(recentNative) <= 3.0 {
+                patchedInputActive = true
+                patchedIdle = min(patchedIdle, now.timeIntervalSince(recentNative))
+            }
             if let recentInput = lastAlmaInputAt, now.timeIntervalSince(recentInput) <= 3.0 {
                 patchedInputActive = true
                 patchedIdle = min(patchedIdle, now.timeIntervalSince(recentInput))
@@ -480,7 +608,21 @@ public final class HybridActivityCoordinator: ObservableObject {
         if let newest = alerts.last {
             activeAlert = newest
         }
+
+        recordSampleToDatabaseIfNeeded(sample)
+        screenRecorder?.evaluatePeriodicCaptureIfNeeded(
+            sample: sample,
+            deepRecordingEnabled: deepRecordingEnabled,
+            declaredTaskId: currentDeclaredTaskId(),
+            retentionDays: settings.snapshotRetentionDays
+        ) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.refreshRecorderCounts()
+            }
+        }
+
         refreshPublishedState()
+        syncCachedRuntimeState()
     }
 
     private func onOneSecondTick() {
@@ -493,12 +635,144 @@ public final class HybridActivityCoordinator: ObservableObject {
             }
             if tickCount % 10 == 0 {
                 persistTodayIfNeeded()
+                refreshRecorderCounts()
             }
         }
     }
 
+    private func handleNativeMonitorEvent(_ event: NativeMonitorEvent) {
+        guard !isSyntheticDemo else { return }
+        let tsMs = Int64(event.timestamp.timeIntervalSince1970 * 1000)
+        let taskId = currentDeclaredTaskId()
+
+        switch event.kind {
+        case "app_focus":
+            let sample = inspector.inspectCurrent()
+            let alerts = engine.ingest(sample)
+            if let newest = alerts.last {
+                activeAlert = newest
+            }
+            if !sample.screenLocked {
+                var eventData: [String: String] = [:]
+                if let bundleId = sample.bundleId { eventData["bundleId"] = bundleId }
+                if let app = nonEmpty(sample.appName) { eventData["appName"] = app }
+                if !sample.redacted {
+                    if let title = sample.windowTitle { eventData["windowTitle"] = title }
+                    if let url = sample.url { eventData["url"] = url }
+                }
+                _ = try? database?.insertEvent(
+                    timestampMs: tsMs,
+                    kind: sample.url != nil ? "browser_visit" : "app_focus",
+                    appName: sample.appName,
+                    windowTitle: sample.redacted ? nil : sample.windowTitle,
+                    url: sample.redacted ? nil : sample.url,
+                    data: eventData,
+                    declaredTaskId: taskId,
+                    project: taskId
+                )
+                lastRecordedSampleKey = sampleKey(for: sample)
+                lastRecordedHeartbeatAt = sample.timestamp
+
+                screenRecorder?.triggerAppFocusCaptureIfNeeded(
+                    sample: sample,
+                    deepRecordingEnabled: deepRecordingEnabled,
+                    declaredTaskId: taskId
+                ) { [weak self] in
+                    Task { @MainActor [weak self] in
+                        self?.refreshRecorderCounts()
+                    }
+                }
+            }
+            refreshPublishedState()
+            syncCachedRuntimeState()
+
+        case "lock":
+            _ = try? database?.insertEvent(
+                timestampMs: tsMs,
+                kind: "lock",
+                appName: "loginwindow",
+                declaredTaskId: taskId,
+                project: taskId
+            )
+            pollOnce()
+
+        case "unlock":
+            _ = try? database?.insertEvent(
+                timestampMs: tsMs,
+                kind: "unlock",
+                appName: "loginwindow",
+                declaredTaskId: taskId,
+                project: taskId
+            )
+            pollOnce()
+
+        case "click", "keypress":
+            lastNativeInputAt = event.timestamp
+            if latestSample?.screenLocked != true {
+                _ = try? database?.insertEvent(
+                    timestampMs: tsMs,
+                    kind: event.kind,
+                    appName: latestSample?.appName,
+                    windowTitle: latestSample?.redacted == true ? nil : latestSample?.windowTitle,
+                    url: latestSample?.redacted == true ? nil : latestSample?.url,
+                    data: [:],
+                    declaredTaskId: taskId,
+                    project: taskId
+                )
+            }
+
+        default:
+            break
+        }
+    }
+
+    private func recordSampleToDatabaseIfNeeded(_ sample: ActivitySample) {
+        guard !isSyntheticDemo, let database else { return }
+        guard !sample.screenLocked, sample.idleSeconds < engine.config.idleThresholdSeconds else {
+            return
+        }
+
+        let key = sampleKey(for: sample)
+        let changed = (key != lastRecordedSampleKey)
+        let heartbeatDue = lastRecordedHeartbeatAt.map { sample.timestamp.timeIntervalSince($0) >= 30.0 } ?? true
+
+        guard changed || heartbeatDue else { return }
+
+        lastRecordedSampleKey = key
+        lastRecordedHeartbeatAt = sample.timestamp
+
+        let tsMs = Int64(sample.timestamp.timeIntervalSince1970 * 1000)
+        let taskId = currentDeclaredTaskId()
+        var eventData: [String: String] = [:]
+        if let bundleId = sample.bundleId { eventData["bundleId"] = bundleId }
+        eventData["appName"] = sample.appName
+        if !sample.redacted {
+            if let title = sample.windowTitle { eventData["windowTitle"] = title }
+            if let url = sample.url { eventData["url"] = url }
+        } else {
+            eventData["redacted"] = "true"
+        }
+
+        let kind = (!sample.redacted && sample.url != nil && changed) ? "browser_visit" : "app_focus"
+        _ = try? database.insertEvent(
+            timestampMs: tsMs,
+            kind: kind,
+            appName: sample.appName,
+            windowTitle: sample.redacted ? nil : sample.windowTitle,
+            url: sample.redacted ? nil : sample.url,
+            data: eventData,
+            declaredTaskId: taskId,
+            project: taskId
+        )
+    }
+
     private func syncFromAlma(isInitialBackfill: Bool) async {
         guard let almaClient else { return }
+        guard httpServer?.isServingPort(LocalActivityHTTPServer.almaCompatiblePort) != true else {
+            almaConnected = false
+            return
+        }
+
         let now = clock.now()
         let dayStart = startOfDay(for: now)
         let sinceMs = isInitialBackfill ? nil : lastAlmaEventMs
@@ -538,12 +812,10 @@ public final class HybridActivityCoordinator: ObservableObject {
                     for sample in newSamples {
                         _ = engine.ingest(sample)
                     }
-                    // Suppress stale alerts from historical backfill
                     for alert in engine.pendingAlerts {
                         engine.dismissAlert(id: alert.id)
                     }
                 } else {
-                    // Only append historical spans before active focus without disturbing active timer
                     for sample in newSamples where sample.timestamp >= (engine.enrichedSpans.last?.endedAt ?? .distantPast) {
                         _ = engine.ingest(sample)
                     }
@@ -559,6 +831,8 @@ public final class HybridActivityCoordinator: ObservableObject {
     private func checkDayRolloverIfNeeded(now: Date) {
         let currentDay = DayHelmDateFormatting.dayString(from: now)
         guard currentDay != engine.currentDateString else { return }
+        let endMs = Int64(now.timeIntervalSince1970 * 1000)
+        try? database?.closeActiveSessionIfNeeded(endedAtMs: endMs)
         if !isSyntheticDemo, let store {
             let prevSnapshot = engine.snapshot(at: now)
             _ = try? store.rolloverIfNeeded(currentSnapshot: prevSnapshot, newDateString: currentDay)
@@ -566,8 +840,12 @@ public final class HybridActivityCoordinator: ObservableObject {
         engine.rolloverToNewDay(currentDay)
         lastAlmaEventMs = nil
         latestAlmaBrowserSample = nil
+        lastRecordedSampleKey = nil
+        lastRecordedHeartbeatAt = nil
         activeAlert = nil
         refreshPublishedState()
+        refreshRecorderCounts()
+        syncCachedRuntimeState()
     }
 
     private func refreshPublishedState() {
@@ -587,6 +865,34 @@ public final class HybridActivityCoordinator: ObservableObject {
         } else {
             lastTaskNote = nil
         }
+        syncCachedRuntimeState()
+    }
+
+    private func refreshRecorderCounts() {
+        guard !isSyntheticDemo, let database else { return }
+        let now = clock.now()
+        let dayStart = startOfDay(for: now)
+        let dayStartMs = Int64(dayStart.timeIntervalSince1970 * 1000)
+        let dayEndMs = dayStartMs + 86_400_000 - 1
+        if let counts = try? database.todayCounts(dayStartMs: dayStartMs, dayEndMs: dayEndMs) {
+            todaySnapshotCount = counts.snapshots
+            todayOCRCount = counts.ocrFrames
+        }
+    }
+
+    private func syncCachedRuntimeState() {
+        let snap = engine.snapshot(at: clock.now())
+        let state = LocalActivityHTTPServer.RuntimeState(
+            axTrusted: axTrusted,
+            screenCaptureTrusted: screenCaptureTrusted,
+            deepRecordingEnabled: deepRecordingEnabled,
+            daySnapshot: snap
+        )
+        runtimeStateBox.update(state)
+    }
+
+    private nonisolated func readCachedRuntimeState() -> LocalActivityHTTPServer.RuntimeState {
+        runtimeStateBox.read()
     }
 
     private func updateElapsedFocusSeconds() {
@@ -607,6 +913,24 @@ public final class HybridActivityCoordinator: ObservableObject {
         guard !isSyntheticDemo, let store else { return }
         let snap = engine.snapshot(at: clock.now())
         try? store.saveToday(snap)
+    }
+
+    private func currentDeclaredTaskId() -> String? {
+        if case .focusing(let taskId, _) = engine.focusState {
+            return taskId
+        }
+        return nil
+    }
+
+    private func sampleKey(for sample: ActivitySample) -> String {
+        "\(sample.appName)|\(sample.bundleId ?? "")|\(sample.windowTitle ?? "")|\(sample.url ?? "")|\(sample.redacted)"
+    }
+
+    private func nonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
     }
 
     private func startOfDay(for date: Date) -> Date {
@@ -636,5 +960,22 @@ private final class StaticSyntheticInspector: ActivityInspecting, @unchecked Sen
             screenLocked: false,
             inputActive: true
         )
+    }
+}
+
+private final class RuntimeStateBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var state = LocalActivityHTTPServer.RuntimeState()
+
+    func update(_ newState: LocalActivityHTTPServer.RuntimeState) {
+        lock.lock()
+        state = newState
+        lock.unlock()
+    }
+
+    func read() -> LocalActivityHTTPServer.RuntimeState {
+        lock.lock()
+        defer { lock.unlock() }
+        return state
     }
 }

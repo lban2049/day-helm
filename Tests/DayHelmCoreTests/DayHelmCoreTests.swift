@@ -1,3 +1,5 @@
+import CoreGraphics
+import CoreText
 import Foundation
 @testable import DayHelmCapture
 @testable import DayHelmCore
@@ -384,6 +386,253 @@ final class DayHelmCoreTests: XCTestCase {
         XCTAssertFalse(reloaded.contains { $0.taskId == "legacy-ta-task" })
         XCTAssertFalse(reloaded.contains { $0.taskId == "ecommerce-ops" })
         XCTAssertEqual(reloaded.first { $0.taskId == created.taskId }?.displayName, "独立开发")
+    }
+
+    func testActivityDatabaseSessionLifecycleAndAlmaCompatibility() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-xct-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let db = try ActivityDatabase(databaseURL: tmpDir.appendingPathComponent("activity.sqlite"))
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+
+        let e1 = try db.insertEvent(
+            timestampMs: t0Ms,
+            kind: "app_focus",
+            appName: "Google Chrome",
+            windowTitle: "Example Shop Dashboard",
+            url: "https://shop.example.com/orders?token=secret123&page=2",
+            data: ["bundleId": "com.google.Chrome"],
+            declaredTaskId: "ecommerce",
+            project: "ecommerce"
+        )
+        XCTAssertEqual(e1.url, "https://shop.example.com/orders?page=2")
+        XCTAssertEqual(e1.windowTitle, "Example Shop Dashboard")
+
+        let snap1 = try db.insertSnapshot(
+            sessionId: e1.sessionId,
+            timestampMs: t0Ms + 15_000,
+            filePath: tmpDir.appendingPathComponent("snapshots/2026-11-17/snap1.jpg").path,
+            width: 1280,
+            height: 720,
+            sizeBytes: 24_576,
+            trigger: "app_focus",
+            appName: "Google Chrome",
+            windowTitle: "Example Shop Dashboard",
+            hashHex: "0123456789abcdef",
+            histogram: Array(repeating: 1.0 / 32.0, count: 32),
+            diffPct: 1.0,
+            declaredTaskId: "ecommerce"
+        )
+        _ = try db.insertOCRFrame(snapshotId: snap1.id, sessionId: e1.sessionId, text: "Order fulfillment metrics and SKU inventory review", createdAtMs: t0Ms + 15_000)
+
+        _ = try db.insertEvent(timestampMs: t0Ms + 45_000, kind: "lock", appName: "loginwindow")
+        let e3 = try db.insertEvent(timestampMs: t0Ms + 200_000, kind: "app_focus", appName: "Terminal", windowTitle: "swift test", declaredTaskId: "infra-billing")
+        XCTAssertNotEqual(e3.sessionId, e1.sessionId)
+
+        let sessions = try db.listSessions(sinceMs: t0Ms - 1000, untilMs: t0Ms + 300_000, limit: 10)
+        XCTAssertEqual(sessions.count, 2)
+
+        let detail = try db.getSessionDetail(sessionId: e1.sessionId)
+        XCTAssertNotNil(detail)
+        XCTAssertEqual(detail?.session.declaredTaskId, "ecommerce")
+        XCTAssertEqual(detail?.session.eventCount, 2)
+        XCTAssertEqual(detail?.session.snapshotCount, 1)
+        XCTAssertEqual(detail?.ocrFrames.count, 1)
+
+        let enc = DayHelmDateFormatting.makeEncoder()
+        let dec = DayHelmDateFormatting.makeDecoder()
+        let almaSess = try dec.decode(AlmaSession.self, from: enc.encode(detail!.session))
+        XCTAssertEqual(almaSess.id, e1.sessionId)
+        let almaEvt = try dec.decode(AlmaEvent.self, from: enc.encode(e1))
+        XCTAssertEqual(almaEvt.kind, "app_focus")
+    }
+
+    func testActivityDatabaseSearchAndAgentContext() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-xct-search-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let db = try ActivityDatabase(databaseURL: tmpDir.appendingPathComponent("activity.sqlite"))
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+
+        let ev = try db.insertEvent(timestampMs: t0Ms, kind: "browser_visit", appName: "Google Chrome", windowTitle: "Hermes Semiconductor Note", url: "https://research.example.com/semiconductor-q4", declaredTaskId: "hermes")
+        let snap = try db.insertSnapshot(sessionId: ev.sessionId, timestampMs: t0Ms + 5_000, filePath: tmpDir.appendingPathComponent("snap.jpg").path, width: 800, height: 600, sizeBytes: 10_000, appName: "Google Chrome", windowTitle: "Hermes Semiconductor Note")
+        _ = try db.insertOCRFrame(snapshotId: snap.id, sessionId: ev.sessionId, text: "Quarterly wafer fab utilization reached 92% in Q4.", createdAtMs: t0Ms + 5_000)
+
+        XCTAssertTrue(try db.search(keyword: "wafer fab", limit: 10).contains { $0.sourceKind == "ocr" })
+        XCTAssertTrue(try db.search(keyword: "semiconductor-q4", limit: 10).contains { $0.sourceKind == "event" })
+
+        let ctx = try db.queryAgentContext(sinceMs: t0Ms - 1000, untilMs: t0Ms + 60_000, maxOCRChars: 500)
+        XCTAssertEqual(ctx.sessionCount, 1)
+        XCTAssertEqual(ctx.ocrFrameCount, 1)
+        XCTAssertTrue(ctx.recentWindows.contains { $0.windowTitle == "Hermes Semiconductor Note" })
+        XCTAssertTrue(ctx.ocrHighlights.contains { $0.text.contains("wafer fab") })
+    }
+
+    func testImageHistogramAndVisionOCR() async throws {
+        let whiteImg = try makeSyntheticTextImage(text: "DayHelm OCR 2026", backgroundWhite: true)
+        let sameImg = try makeSyntheticTextImage(text: "DayHelm OCR 2026", backgroundWhite: true)
+        let darkImg = try makeSyntheticTextImage(text: "Completely Different Screen", backgroundWhite: false)
+
+        let h1 = ImageHistogram.computeHistogram(from: whiteImg, bins: 32)
+        let h2 = ImageHistogram.computeHistogram(from: sameImg, bins: 32)
+        let hDark = ImageHistogram.computeHistogram(from: darkImg, bins: 32)
+
+        XCTAssertEqual(h1.count, 32)
+        XCTAssertEqual(ImageHistogram.histogramDistance(from: h1, to: h2), 0.0, accuracy: 0.001)
+        XCTAssertGreaterThan(ImageHistogram.histogramDistance(from: h1, to: hDark), 0.5)
+        XCTAssertEqual(ImageHistogram.computePerceptualHashHex(from: whiteImg), ImageHistogram.computePerceptualHashHex(from: sameImg))
+
+        let ocr = try await VisionOCRService.recognizeText(from: whiteImg)
+        XCTAssertTrue(ocr.text.contains("DayHelm") || ocr.text.contains("2026"))
+        XCTAssertGreaterThan(ocr.charCount, 0)
+    }
+
+    func testCLIQuerySearchAndSessionsCommands() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-xct-clihub-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+        engine.startFocus(taskId: "ecommerce", at: t0)
+        engine.ingest(ActivitySample(timestamp: t0.addingTimeInterval(300), appName: "Editor", bundleId: "com.example.editor", windowTitle: "Catalog Spec", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+        try store.saveToday(engine.snapshot(at: t0.addingTimeInterval(300)))
+
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+        let ev = try db.insertEvent(timestampMs: t0Ms + 60_000, kind: "app_focus", appName: "Editor", windowTitle: "Catalog Spec", url: "https://docs.example.com/catalog", declaredTaskId: "ecommerce")
+        let snap = try db.insertSnapshot(sessionId: ev.sessionId, timestampMs: t0Ms + 65_000, filePath: store.snapshotsDirectory.appendingPathComponent("2026-11-17/s1.jpg").path, width: 640, height: 360, sizeBytes: 4096, appName: "Editor", windowTitle: "Catalog Spec")
+        _ = try db.insertOCRFrame(snapshotId: snap.id, sessionId: ev.sessionId, text: "Spring SKU pricing matrix", createdAtMs: t0Ms + 65_000)
+
+        let queryJSON = DayHelmCLI.run(arguments: ["dayhelm", "query", "--today", "--format", "json", "--store-dir", tmpDir.path], clock: ManualClock(now: t0.addingTimeInterval(300)))
+        XCTAssertEqual(queryJSON?.exitCode, 0)
+        XCTAssertTrue(queryJSON?.stdout.contains("Spring SKU pricing matrix") == true)
+
+        let searchRes = DayHelmCLI.run(arguments: ["dayhelm", "search", "SKU pricing", "--limit", "5", "--format", "json", "--store-dir", tmpDir.path], clock: ManualClock(now: t0))
+        XCTAssertEqual(searchRes?.exitCode, 0)
+        XCTAssertTrue(searchRes?.stdout.contains("Spring SKU pricing matrix") == true)
+
+        let detailRes = DayHelmCLI.run(arguments: ["dayhelm", "sessions", "--id", ev.sessionId, "--format", "json", "--store-dir", tmpDir.path], clock: ManualClock(now: t0))
+        XCTAssertEqual(detailRes?.exitCode, 0)
+        XCTAssertTrue(detailRes?.stdout.contains("https://docs.example.com/catalog") == true)
+    }
+
+    func testLocalActivityHTTPServerEndpoints() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-xct-http-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+        engine.startFocus(taskId: "hermes", at: t0)
+        engine.ingest(ActivitySample(timestamp: t0.addingTimeInterval(120), appName: "Preview", bundleId: "com.apple.Preview", windowTitle: "Earnings Call.pdf", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+        let daySnap = engine.snapshot(at: t0.addingTimeInterval(120))
+        try store.saveToday(daySnap)
+
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+        let ev = try db.insertEvent(timestampMs: t0Ms + 10_000, kind: "app_focus", appName: "Preview", windowTitle: "Earnings Call.pdf", declaredTaskId: "hermes")
+        let snap = try db.insertSnapshot(sessionId: ev.sessionId, timestampMs: t0Ms + 12_000, filePath: store.snapshotsDirectory.appendingPathComponent("2026-11-17/p1.jpg").path, width: 1024, height: 768, sizeBytes: 8192, appName: "Preview", windowTitle: "Earnings Call.pdf")
+        _ = try db.insertOCRFrame(snapshotId: snap.id, sessionId: ev.sessionId, text: "Revenue guidance raised by 14%", createdAtMs: t0Ms + 12_000)
+
+        let server = LocalActivityHTTPServer(
+            database: db,
+            store: store,
+            clock: ManualClock(now: t0.addingTimeInterval(120)),
+            stateProvider: { LocalActivityHTTPServer.RuntimeState(axTrusted: true, screenCaptureTrusted: true, deepRecordingEnabled: true, daySnapshot: daySnap) }
+        )
+        let ports = await server.start(primaryPort: 0, fallbackPort: nil)
+        defer { server.stop() }
+        let port = try XCTUnwrap(ports.first)
+
+        let session = URLSession(configuration: .ephemeral)
+        let dec = DayHelmDateFormatting.makeDecoder()
+
+        let (statusData, statusResp) = try await session.data(from: URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/status")!)
+        XCTAssertEqual((statusResp as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(try dec.decode(LocalRecorderStatusSnapshot.self, from: statusData).source, "dayhelm")
+
+        let (detailData, detailResp) = try await session.data(from: URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/sessions/\(ev.sessionId)")!)
+        XCTAssertEqual((detailResp as? HTTPURLResponse)?.statusCode, 200)
+        let detail = try dec.decode(RecordedSessionDetail.self, from: detailData)
+        XCTAssertEqual(detail.session.declaredTaskId, "hermes")
+        XCTAssertEqual(detail.events.first?.windowTitle, "Earnings Call.pdf")
+
+        let (_, missingResp) = try await session.data(from: URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/sessions/missing")!)
+        XCTAssertEqual((missingResp as? HTTPURLResponse)?.statusCode, 404)
+
+        let (ctxData, ctxResp) = try await session.data(from: URL(string: "http://127.0.0.1:\(port)/api/dayhelm/context")!)
+        XCTAssertEqual((ctxResp as? HTTPURLResponse)?.statusCode, 200)
+        let ctx = try dec.decode(DayHelmContextAPIResponse.self, from: ctxData)
+        XCTAssertEqual(ctx.activeFocus?.taskId, "hermes")
+        XCTAssertTrue(ctx.activity.ocrHighlights.contains { $0.text.contains("Revenue guidance") })
+    }
+
+    func testNativeScreenRecorderPrivacyDedupAndRetentionPrune() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-xct-rec-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate()
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+        let recorder = NativeScreenRecorder(database: db, snapshotsRootDir: store.snapshotsDirectory, clock: ManualClock(now: t0))
+
+        let imgA = try makeSyntheticTextImage(text: "Product Spec Alpha 2026", backgroundWhite: true)
+        let imgB = try makeSyntheticTextImage(text: "Night Console View", backgroundWhite: false)
+
+        let redacted = PrivacyRedactor.redact(ActivitySample(timestamp: t0, appName: "1Password", bundleId: "com.1password.1password", windowTitle: "Vault", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+        let savedRedacted = try await recorder.processCapturedImage(imgA, sample: redacted, trigger: "heartbeat", declaredTaskId: "ecommerce", runOCR: true)
+        XCTAssertFalse(savedRedacted)
+
+        let locked = ActivitySample(timestamp: t0.addingTimeInterval(5), appName: "loginwindow", bundleId: "com.apple.loginwindow", windowTitle: nil, url: nil, idleSeconds: 0, screenLocked: true, inputActive: false)
+        let savedLocked = try await recorder.processCapturedImage(imgA, sample: locked, trigger: "heartbeat", declaredTaskId: "ecommerce", runOCR: true)
+        XCTAssertFalse(savedLocked)
+
+        let s1 = ActivitySample(timestamp: t0.addingTimeInterval(10), appName: "Editor", bundleId: "com.example.editor", windowTitle: "Spec", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)
+        let saved1 = try await recorder.processCapturedImage(imgA, sample: s1, trigger: "heartbeat", declaredTaskId: "ecommerce", runOCR: true)
+        XCTAssertTrue(saved1)
+        let s2 = ActivitySample(timestamp: t0.addingTimeInterval(25), appName: "Editor", bundleId: "com.example.editor", windowTitle: "Spec", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)
+        let saved2 = try await recorder.processCapturedImage(imgA, sample: s2, trigger: "visual_change", declaredTaskId: "ecommerce", runOCR: true)
+        XCTAssertFalse(saved2)
+        let s3 = ActivitySample(timestamp: t0.addingTimeInterval(40), appName: "Terminal", bundleId: "com.apple.Terminal", windowTitle: "Console", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)
+        let saved3 = try await recorder.processCapturedImage(imgB, sample: s3, trigger: "visual_change", declaredTaskId: "infra-billing", runOCR: true)
+        XCTAssertTrue(saved3)
+
+        try store.saveBudgets(sampleBudgets())
+        try store.saveSettings(DayHelmSettings(deepRecordingEnabled: false, snapshotRetentionDays: 14))
+        XCTAssertFalse(store.loadSettings().deepRecordingEnabled)
+        XCTAssertEqual(TimeAuditConfigLoader.loadBudgets(timeAuditDirectory: tmpDir, dayhelmConfigURL: store.configURL).count, 4)
+
+        let oldDir = store.snapshotsDirectory.appendingPathComponent("2026-10-01", isDirectory: true)
+        try FileManager.default.createDirectory(at: oldDir, withIntermediateDirectories: true)
+        let oldJPEG = oldDir.appendingPathComponent("old.jpg")
+        try Data("fake".utf8).write(to: oldJPEG)
+        let pruned = try db.pruneOldSnapshots(olderThanDays: 7, snapshotsRootDir: store.snapshotsDirectory, now: t0)
+        XCTAssertEqual(pruned.deletedFiles, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldJPEG.path))
+    }
+
+    private func makeSyntheticTextImage(text: String, backgroundWhite: Bool, width: Int = 960, height: Int = 240) throws -> CGImage {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace, bitmapInfo: bitmapInfo))
+        ctx.setFillColor(red: backgroundWhite ? 1 : 0.08, green: backgroundWhite ? 1 : 0.09, blue: backgroundWhite ? 1 : 0.12, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, 48, nil)
+        let fgColor = backgroundWhite ? CGColor(red: 0, green: 0, blue: 0, alpha: 1) : CGColor(red: 0.92, green: 0.95, blue: 1, alpha: 1)
+        let attrs: [CFString: Any] = [kCTFontAttributeName: font, kCTForegroundColorAttributeName: fgColor]
+        let attrString = CFAttributedStringCreate(kCFAllocatorDefault, text as CFString, attrs as CFDictionary)!
+        let line = CTLineCreateWithAttributedString(attrString)
+        ctx.textPosition = CGPoint(x: 40, y: 95)
+        CTLineDraw(line, ctx)
+        return try XCTUnwrap(ctx.makeImage())
     }
 }
 
@@ -790,6 +1039,259 @@ struct DayHelmCoreTests {
         #expect(!reloaded.contains { $0.taskId == "legacy-ta-task" })
         #expect(!reloaded.contains { $0.taskId == "ecommerce-ops" })
         #expect(reloaded.first { $0.taskId == created.taskId }?.displayName == "独立开发")
+    }
+
+    @Test("ActivityDatabase stores sessions, events, snapshots, OCR frames and Alma-compatible detail")
+    func activityDatabaseSessionLifecycleAndAlmaCompatibility() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let db = try ActivityDatabase(databaseURL: tmpDir.appendingPathComponent("activity.sqlite"))
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+
+        let e1 = try db.insertEvent(
+            timestampMs: t0Ms,
+            kind: "app_focus",
+            appName: "Google Chrome",
+            windowTitle: "Example Shop Dashboard",
+            url: "https://shop.example.com/orders?token=secret123&page=2",
+            data: ["bundleId": "com.google.Chrome"],
+            declaredTaskId: "ecommerce",
+            project: "ecommerce"
+        )
+        #expect(e1.url == "https://shop.example.com/orders?page=2")
+        #expect(e1.windowTitle == "Example Shop Dashboard")
+
+        let snap1 = try db.insertSnapshot(
+            sessionId: e1.sessionId,
+            timestampMs: t0Ms + 15_000,
+            filePath: tmpDir.appendingPathComponent("snapshots/2026-11-17/snap1.jpg").path,
+            width: 1280,
+            height: 720,
+            sizeBytes: 24_576,
+            trigger: "app_focus",
+            appName: "Google Chrome",
+            windowTitle: "Example Shop Dashboard",
+            hashHex: "0123456789abcdef",
+            histogram: Array(repeating: 1.0 / 32.0, count: 32),
+            diffPct: 1.0,
+            declaredTaskId: "ecommerce"
+        )
+        _ = try db.insertOCRFrame(snapshotId: snap1.id, sessionId: e1.sessionId, text: "Order fulfillment metrics and SKU inventory review", createdAtMs: t0Ms + 15_000)
+
+        _ = try db.insertEvent(timestampMs: t0Ms + 45_000, kind: "lock", appName: "loginwindow")
+        let e3 = try db.insertEvent(timestampMs: t0Ms + 200_000, kind: "app_focus", appName: "Terminal", windowTitle: "swift test", declaredTaskId: "infra-billing")
+        #expect(e3.sessionId != e1.sessionId)
+
+        let sessions = try db.listSessions(sinceMs: t0Ms - 1000, untilMs: t0Ms + 300_000, limit: 10)
+        #expect(sessions.count == 2)
+
+        let detail = try db.getSessionDetail(sessionId: e1.sessionId)
+        #expect(detail != nil)
+        #expect(detail?.session.declaredTaskId == "ecommerce")
+        #expect(detail?.session.eventCount == 2)
+        #expect(detail?.session.snapshotCount == 1)
+        #expect(detail?.ocrFrames.count == 1)
+
+        let enc = DayHelmDateFormatting.makeEncoder()
+        let dec = DayHelmDateFormatting.makeDecoder()
+        let almaSess = try dec.decode(AlmaSession.self, from: enc.encode(detail!.session))
+        #expect(almaSess.id == e1.sessionId)
+        let almaEvt = try dec.decode(AlmaEvent.self, from: enc.encode(e1))
+        #expect(almaEvt.kind == "app_focus")
+    }
+
+    @Test("ActivityDatabase searches across titles, URLs, and OCR frames and builds AgentActivityContext")
+    func activityDatabaseSearchAndAgentContext() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-search-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let db = try ActivityDatabase(databaseURL: tmpDir.appendingPathComponent("activity.sqlite"))
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+
+        let ev = try db.insertEvent(timestampMs: t0Ms, kind: "browser_visit", appName: "Google Chrome", windowTitle: "Hermes Semiconductor Note", url: "https://research.example.com/semiconductor-q4", declaredTaskId: "hermes")
+        let snap = try db.insertSnapshot(sessionId: ev.sessionId, timestampMs: t0Ms + 5_000, filePath: tmpDir.appendingPathComponent("snap.jpg").path, width: 800, height: 600, sizeBytes: 10_000, appName: "Google Chrome", windowTitle: "Hermes Semiconductor Note")
+        _ = try db.insertOCRFrame(snapshotId: snap.id, sessionId: ev.sessionId, text: "Quarterly wafer fab utilization reached 92% in Q4.", createdAtMs: t0Ms + 5_000)
+
+        #expect(try db.search(keyword: "wafer fab", limit: 10).contains { $0.sourceKind == "ocr" })
+        #expect(try db.search(keyword: "semiconductor-q4", limit: 10).contains { $0.sourceKind == "event" })
+
+        let ctx = try db.queryAgentContext(sinceMs: t0Ms - 1000, untilMs: t0Ms + 60_000, maxOCRChars: 500)
+        #expect(ctx.sessionCount == 1)
+        #expect(ctx.ocrFrameCount == 1)
+        #expect(ctx.recentWindows.contains { $0.windowTitle == "Hermes Semiconductor Note" })
+        #expect(ctx.ocrHighlights.contains { $0.text.contains("wafer fab") })
+    }
+
+    @Test("ImageHistogram deduplicates identical frames and VisionOCRService recognizes CoreText CGImage text")
+    func imageHistogramAndVisionOCR() async throws {
+        let whiteImg = try makeSyntheticTextImage(text: "DayHelm OCR 2026", backgroundWhite: true)
+        let sameImg = try makeSyntheticTextImage(text: "DayHelm OCR 2026", backgroundWhite: true)
+        let darkImg = try makeSyntheticTextImage(text: "Completely Different Screen", backgroundWhite: false)
+
+        let h1 = ImageHistogram.computeHistogram(from: whiteImg, bins: 32)
+        let h2 = ImageHistogram.computeHistogram(from: sameImg, bins: 32)
+        let hDark = ImageHistogram.computeHistogram(from: darkImg, bins: 32)
+
+        #expect(h1.count == 32)
+        #expect(abs(ImageHistogram.histogramDistance(from: h1, to: h2)) < 0.001)
+        #expect(ImageHistogram.histogramDistance(from: h1, to: hDark) > 0.5)
+        #expect(ImageHistogram.computePerceptualHashHex(from: whiteImg) == ImageHistogram.computePerceptualHashHex(from: sameImg))
+
+        let ocr = try await VisionOCRService.recognizeText(from: whiteImg)
+        #expect(ocr.text.contains("DayHelm") || ocr.text.contains("2026"))
+        #expect(ocr.charCount > 0)
+    }
+
+    @Test("DayHelmCLI supports query, search, and sessions subcommands")
+    func cliQuerySearchAndSessionsCommands() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-clihub-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+        engine.startFocus(taskId: "ecommerce", at: t0)
+        engine.ingest(ActivitySample(timestamp: t0.addingTimeInterval(300), appName: "Editor", bundleId: "com.example.editor", windowTitle: "Catalog Spec", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+        try store.saveToday(engine.snapshot(at: t0.addingTimeInterval(300)))
+
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+        let ev = try db.insertEvent(timestampMs: t0Ms + 60_000, kind: "app_focus", appName: "Editor", windowTitle: "Catalog Spec", url: "https://docs.example.com/catalog", declaredTaskId: "ecommerce")
+        let snap = try db.insertSnapshot(sessionId: ev.sessionId, timestampMs: t0Ms + 65_000, filePath: store.snapshotsDirectory.appendingPathComponent("2026-11-17/s1.jpg").path, width: 640, height: 360, sizeBytes: 4096, appName: "Editor", windowTitle: "Catalog Spec")
+        _ = try db.insertOCRFrame(snapshotId: snap.id, sessionId: ev.sessionId, text: "Spring SKU pricing matrix", createdAtMs: t0Ms + 65_000)
+
+        let queryJSON = DayHelmCLI.run(arguments: ["dayhelm", "query", "--today", "--format", "json", "--store-dir", tmpDir.path], clock: ManualClock(now: t0.addingTimeInterval(300)))
+        #expect(queryJSON?.exitCode == 0)
+        #expect(queryJSON?.stdout.contains("Spring SKU pricing matrix") == true)
+
+        let searchRes = DayHelmCLI.run(arguments: ["dayhelm", "search", "SKU pricing", "--limit", "5", "--format", "json", "--store-dir", tmpDir.path], clock: ManualClock(now: t0))
+        #expect(searchRes?.exitCode == 0)
+        #expect(searchRes?.stdout.contains("Spring SKU pricing matrix") == true)
+
+        let detailRes = DayHelmCLI.run(arguments: ["dayhelm", "sessions", "--id", ev.sessionId, "--format", "json", "--store-dir", tmpDir.path], clock: ManualClock(now: t0))
+        #expect(detailRes?.exitCode == 0)
+        #expect(detailRes?.stdout.contains("https://docs.example.com/catalog") == true)
+    }
+
+    @Test("LocalActivityHTTPServer serves status, sessions, detail, 404, and context on 127.0.0.1")
+    func localActivityHTTPServerEndpoints() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-http-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+        engine.startFocus(taskId: "hermes", at: t0)
+        engine.ingest(ActivitySample(timestamp: t0.addingTimeInterval(120), appName: "Preview", bundleId: "com.apple.Preview", windowTitle: "Earnings Call.pdf", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+        let daySnap = engine.snapshot(at: t0.addingTimeInterval(120))
+        try store.saveToday(daySnap)
+
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+        let ev = try db.insertEvent(timestampMs: t0Ms + 10_000, kind: "app_focus", appName: "Preview", windowTitle: "Earnings Call.pdf", declaredTaskId: "hermes")
+        let snap = try db.insertSnapshot(sessionId: ev.sessionId, timestampMs: t0Ms + 12_000, filePath: store.snapshotsDirectory.appendingPathComponent("2026-11-17/p1.jpg").path, width: 1024, height: 768, sizeBytes: 8192, appName: "Preview", windowTitle: "Earnings Call.pdf")
+        _ = try db.insertOCRFrame(snapshotId: snap.id, sessionId: ev.sessionId, text: "Revenue guidance raised by 14%", createdAtMs: t0Ms + 12_000)
+
+        let server = LocalActivityHTTPServer(
+            database: db,
+            store: store,
+            clock: ManualClock(now: t0.addingTimeInterval(120)),
+            stateProvider: { LocalActivityHTTPServer.RuntimeState(axTrusted: true, screenCaptureTrusted: true, deepRecordingEnabled: true, daySnapshot: daySnap) }
+        )
+        let ports = await server.start(primaryPort: 0, fallbackPort: nil)
+        defer { server.stop() }
+        let port = try #require(ports.first)
+
+        let session = URLSession(configuration: .ephemeral)
+        let dec = DayHelmDateFormatting.makeDecoder()
+
+        let (statusData, statusResp) = try await session.data(from: URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/status")!)
+        #expect((statusResp as? HTTPURLResponse)?.statusCode == 200)
+        #expect((try dec.decode(LocalRecorderStatusSnapshot.self, from: statusData)).source == "dayhelm")
+
+        let (detailData, detailResp) = try await session.data(from: URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/sessions/\(ev.sessionId)")!)
+        #expect((detailResp as? HTTPURLResponse)?.statusCode == 200)
+        let detail = try dec.decode(RecordedSessionDetail.self, from: detailData)
+        #expect(detail.session.declaredTaskId == "hermes")
+        #expect(detail.events.first?.windowTitle == "Earnings Call.pdf")
+
+        let (_, missingResp) = try await session.data(from: URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/sessions/missing")!)
+        #expect((missingResp as? HTTPURLResponse)?.statusCode == 404)
+
+        let (ctxData, ctxResp) = try await session.data(from: URL(string: "http://127.0.0.1:\(port)/api/dayhelm/context")!)
+        #expect((ctxResp as? HTTPURLResponse)?.statusCode == 200)
+        let ctx = try dec.decode(DayHelmContextAPIResponse.self, from: ctxData)
+        #expect(ctx.activeFocus?.taskId == "hermes")
+        #expect(ctx.activity.ocrHighlights.contains { $0.text.contains("Revenue guidance") })
+    }
+
+    @Test("NativeScreenRecorder enforces privacy guard, deduplication, settings, and snapshot retention pruning")
+    func nativeScreenRecorderPrivacyDedupAndRetentionPrune() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-rec-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate()
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+        let recorder = NativeScreenRecorder(database: db, snapshotsRootDir: store.snapshotsDirectory, clock: ManualClock(now: t0))
+
+        let imgA = try makeSyntheticTextImage(text: "Product Spec Alpha 2026", backgroundWhite: true)
+        let imgB = try makeSyntheticTextImage(text: "Night Console View", backgroundWhite: false)
+
+        let redacted = PrivacyRedactor.redact(ActivitySample(timestamp: t0, appName: "1Password", bundleId: "com.1password.1password", windowTitle: "Vault", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+        let savedRedacted = try await recorder.processCapturedImage(imgA, sample: redacted, trigger: "heartbeat", declaredTaskId: "ecommerce", runOCR: true)
+        #expect(savedRedacted == false)
+
+        let locked = ActivitySample(timestamp: t0.addingTimeInterval(5), appName: "loginwindow", bundleId: "com.apple.loginwindow", windowTitle: nil, url: nil, idleSeconds: 0, screenLocked: true, inputActive: false)
+        let savedLocked = try await recorder.processCapturedImage(imgA, sample: locked, trigger: "heartbeat", declaredTaskId: "ecommerce", runOCR: true)
+        #expect(savedLocked == false)
+
+        let s1 = ActivitySample(timestamp: t0.addingTimeInterval(10), appName: "Editor", bundleId: "com.example.editor", windowTitle: "Spec", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)
+        let saved1 = try await recorder.processCapturedImage(imgA, sample: s1, trigger: "heartbeat", declaredTaskId: "ecommerce", runOCR: true)
+        #expect(saved1 == true)
+        let s2 = ActivitySample(timestamp: t0.addingTimeInterval(25), appName: "Editor", bundleId: "com.example.editor", windowTitle: "Spec", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)
+        let saved2 = try await recorder.processCapturedImage(imgA, sample: s2, trigger: "visual_change", declaredTaskId: "ecommerce", runOCR: true)
+        #expect(saved2 == false)
+        let s3 = ActivitySample(timestamp: t0.addingTimeInterval(40), appName: "Terminal", bundleId: "com.apple.Terminal", windowTitle: "Console", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)
+        let saved3 = try await recorder.processCapturedImage(imgB, sample: s3, trigger: "visual_change", declaredTaskId: "infra-billing", runOCR: true)
+        #expect(saved3 == true)
+
+        try store.saveBudgets(sampleBudgets())
+        try store.saveSettings(DayHelmSettings(deepRecordingEnabled: false, snapshotRetentionDays: 14))
+        #expect(store.loadSettings().deepRecordingEnabled == false)
+        #expect(TimeAuditConfigLoader.loadBudgets(timeAuditDirectory: tmpDir, dayhelmConfigURL: store.configURL).count == 4)
+
+        let oldDir = store.snapshotsDirectory.appendingPathComponent("2026-10-01", isDirectory: true)
+        try FileManager.default.createDirectory(at: oldDir, withIntermediateDirectories: true)
+        let oldJPEG = oldDir.appendingPathComponent("old.jpg")
+        try Data("fake".utf8).write(to: oldJPEG)
+        let pruned = try db.pruneOldSnapshots(olderThanDays: 7, snapshotsRootDir: store.snapshotsDirectory, now: t0)
+        #expect(pruned.deletedFiles == 1)
+        #expect(!FileManager.default.fileExists(atPath: oldJPEG.path))
+    }
+
+    private func makeSyntheticTextImage(text: String, backgroundWhite: Bool, width: Int = 960, height: Int = 240) throws -> CGImage {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        let ctx = try #require(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace, bitmapInfo: bitmapInfo))
+        ctx.setFillColor(red: backgroundWhite ? 1 : 0.08, green: backgroundWhite ? 1 : 0.09, blue: backgroundWhite ? 1 : 0.12, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, 48, nil)
+        let fgColor = backgroundWhite ? CGColor(red: 0, green: 0, blue: 0, alpha: 1) : CGColor(red: 0.92, green: 0.95, blue: 1, alpha: 1)
+        let attrs: [CFString: Any] = [kCTFontAttributeName: font, kCTForegroundColorAttributeName: fgColor]
+        let attrString = CFAttributedStringCreate(kCFAllocatorDefault, text as CFString, attrs as CFDictionary)!
+        let line = CTLineCreateWithAttributedString(attrString)
+        ctx.textPosition = CGPoint(x: 40, y: 95)
+        CTLineDraw(line, ctx)
+        return try #require(ctx.makeImage())
     }
 }
 #endif

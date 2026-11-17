@@ -53,6 +53,7 @@ struct MenuBarPopoverView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
             headerSection
+            recorderEngineBar
             activeFocusBox
             budgetListSection
             DaySpectrumRibbonView(
@@ -99,7 +100,7 @@ struct MenuBarPopoverView: View {
                     Circle()
                         .fill(coordinator.almaConnected ? DayHelmColors.successEmerald : DayHelmColors.primaryBlue)
                         .frame(width: 6, height: 6)
-                    Text(coordinator.almaConnected ? "Alma + AX 采集中" : "AX 本机采集中")
+                    Text(coordinator.almaConnected ? "Alma + 原生采集中" : "原生独立采集中")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
@@ -122,6 +123,139 @@ struct MenuBarPopoverView: View {
                 .buttonStyle(.plain)
             }
         }
+    }
+
+    private var recorderEngineBar: some View {
+        HStack(spacing: 6) {
+            Text("采集与 OCR 引擎")
+                .font(.system(size: 9.5, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            Spacer(minLength: 2)
+
+            // 1. AX Title Status
+            if coordinator.axTrusted {
+                HStack(spacing: 3) {
+                    Circle()
+                        .fill(DayHelmColors.successEmerald)
+                        .frame(width: 5, height: 5)
+                    Text("AX 标题")
+                        .font(.system(size: 9.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Button {
+                    coordinator.openAccessibilitySettings()
+                } label: {
+                    HStack(spacing: 3) {
+                        Circle()
+                            .fill(DayHelmColors.warningAmber)
+                            .frame(width: 5, height: 5)
+                        Text("AX 标题")
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(DayHelmColors.warningAmber)
+                    }
+                }
+                .buttonStyle(.plain)
+                .help("点击前往辅助功能授权")
+            }
+
+            Text("·")
+                .font(.system(size: 9.5))
+                .foregroundStyle(.quaternary)
+
+            // 2. Screen OCR Toggle / Permission Button
+            if !coordinator.deepRecordingEnabled {
+                Button {
+                    coordinator.setDeepRecordingEnabled(true)
+                } label: {
+                    HStack(spacing: 3) {
+                        Circle()
+                            .fill(Color.secondary.opacity(0.45))
+                            .frame(width: 5, height: 5)
+                        Text("屏幕 OCR 已关")
+                            .font(.system(size: 9.5, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .help("点击开启去重屏幕快照与 Vision OCR")
+            } else if coordinator.screenCaptureTrusted {
+                Button {
+                    coordinator.setDeepRecordingEnabled(false)
+                } label: {
+                    HStack(spacing: 3) {
+                        Circle()
+                            .fill(DayHelmColors.primaryBlue)
+                            .frame(width: 5, height: 5)
+                        Text("屏幕 OCR (\(coordinator.todayOCRCount) 帧)")
+                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                            .monospacedDigit()
+                            .foregroundStyle(.primary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .help("今日已捕获 \(coordinator.todaySnapshotCount) 张去重快照，\(coordinator.todayOCRCount) 帧 OCR；点击可暂停深度录屏")
+            } else {
+                HStack(spacing: 3) {
+                    Button {
+                        _ = coordinator.requestScreenCapturePermission()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "camera.viewfinder")
+                                .font(.system(size: 8.5))
+                            Text("授权录屏 OCR")
+                                .font(.system(size: 9.5, weight: .semibold))
+                        }
+                        .foregroundStyle(DayHelmColors.warningAmber)
+                    }
+                    .buttonStyle(.plain)
+                    .help("点击申请 Screen Recording 权限以启用去重快照与 Apple Vision OCR")
+
+                    Button {
+                        coordinator.setDeepRecordingEnabled(false)
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("仅使用 AX 标题录制，关闭屏幕 OCR")
+                }
+            }
+
+            Text("·")
+                .font(.system(size: 9.5))
+                .foregroundStyle(.quaternary)
+
+            // 3. Agent HTTP API Indicator
+            HStack(spacing: 3) {
+                Circle()
+                    .fill(coordinator.apiServerPort != nil ? DayHelmColors.successEmerald : Color.secondary.opacity(0.35))
+                    .frame(width: 5, height: 5)
+                Text("API :\(coordinator.apiServerPort.map(String.init) ?? "23002")")
+                    .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .help(apiServerHelpText)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5)
+        )
+    }
+
+    private var apiServerHelpText: String {
+        if coordinator.apiServerPorts.isEmpty {
+            return "本地 Agent HTTP API 未启动"
+        }
+        let portsStr = coordinator.apiServerPorts.map { "127.0.0.1:\($0)" }.joined(separator: ", ")
+        return "Agent 与 alma-time-audit 本地兼容 API 运行中：\(portsStr)"
     }
 
     // MARK: - 2. Active Focus Control Box
