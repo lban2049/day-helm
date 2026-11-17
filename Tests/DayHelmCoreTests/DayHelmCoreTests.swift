@@ -316,6 +316,75 @@ final class DayHelmCoreTests: XCTestCase {
         XCTAssertEqual(purge?.exitCode, 0)
         XCTAssertNil(try store.loadToday())
     }
+
+    func testEngineTaskCRUDAndDeleteWhileFocusing() {
+        let t0 = baseDate()
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+
+        let added = engine.addTask(
+            displayName: "深度写作",
+            colorHex: "#EC4899",
+            targetMinutes: 50,
+            capMinutes: 90,
+            keywords: ["writing", "essay"]
+        )
+        XCTAssertFalse(added.taskId.isEmpty)
+        XCTAssertEqual(engine.budgets.count, 5)
+
+        let updated = TaskBudget(
+            taskId: added.taskId,
+            displayName: "深度写作 · 专栏",
+            colorHex: "#06B6D4",
+            targetMinutes: 60,
+            capMinutes: 120,
+            keywords: ["column"]
+        )
+        engine.updateTask(updated)
+        XCTAssertEqual(engine.budgets.last?.displayName, "深度写作 · 专栏")
+        XCTAssertEqual(engine.budgets.last?.colorHex, "#06B6D4")
+        XCTAssertEqual(engine.budgets.last?.keywords, ["column"])
+
+        engine.moveTask(fromOffsets: IndexSet(integer: 4), toOffset: 0)
+        XCTAssertEqual(engine.budgets.first?.taskId, added.taskId)
+
+        engine.startFocus(taskId: added.taskId, at: t0)
+        engine.ingest(ActivitySample(timestamp: t0.addingTimeInterval(300), appName: "Editor", bundleId: "com.example.editor", windowTitle: "Draft", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+        engine.deleteTask(taskId: added.taskId)
+
+        XCTAssertEqual(engine.budgets.count, 4)
+        XCTAssertEqual(engine.focusState, .unassigned)
+    }
+
+    @MainActor
+    func testConfigLoaderRespectsSavedConfigTruthWithCoordinatorCRUD() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-xct-crud-\(UUID().uuidString)")
+        let timeAuditDir = tmpDir.appendingPathComponent("time-audit", isDirectory: true)
+        let storeDir = tmpDir.appendingPathComponent("dayhelm", isDirectory: true)
+        try FileManager.default.createDirectory(at: timeAuditDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        try #"{"primary_focus":{"project_keys":["ecommerce","legacy-ta-task"]}}"#.write(
+            to: timeAuditDir.appendingPathComponent("focus.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let store = DayHelmStore(directory: storeDir)
+        let t0 = baseDate()
+        let clock = ManualClock(now: t0)
+        let inspector = MockInspector(sample: ActivitySample(timestamp: t0, appName: "Editor", bundleId: "com.example.editor", windowTitle: "Work", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+        let initial = TimeAuditConfigLoader.loadBudgets(timeAuditDirectory: timeAuditDir, dayhelmConfigURL: store.configURL)
+        let coord = HybridActivityCoordinator(engine: DayHelmEngine(budgets: initial, clock: clock), store: store, almaClient: nil, inspector: inspector, clock: clock, syntheticDemo: false)
+
+        let created = coord.addTask(displayName: "独立开发", colorHex: "#10B981", targetMinutes: 90, capMinutes: 150, keywords: ["swift"])
+        coord.deleteTask(taskId: "legacy-ta-task")
+        coord.deleteTask(taskId: "ecommerce-ops")
+
+        let reloaded = TimeAuditConfigLoader.loadBudgets(timeAuditDirectory: timeAuditDir, dayhelmConfigURL: store.configURL)
+        XCTAssertFalse(reloaded.contains { $0.taskId == "legacy-ta-task" })
+        XCTAssertFalse(reloaded.contains { $0.taskId == "ecommerce-ops" })
+        XCTAssertEqual(reloaded.first { $0.taskId == created.taskId }?.displayName, "独立开发")
+    }
 }
 
 #elseif canImport(Testing)
@@ -650,6 +719,77 @@ struct DayHelmCoreTests {
         let purge = DayHelmCLI.run(arguments: ["dayhelm", "purge", "--store-dir", tmpDir.path], clock: ManualClock(now: t0))
         #expect(purge?.exitCode == 0)
         #expect((try store.loadToday()) == nil)
+    }
+
+    @Test("Engine supports full task CRUD and resets focus to unassigned when deleting active task")
+    func engineTaskCRUDAndDeleteWhileFocusing() {
+        let t0 = baseDate()
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+
+        let added = engine.addTask(
+            displayName: "深度写作",
+            colorHex: "#EC4899",
+            targetMinutes: 50,
+            capMinutes: 90,
+            keywords: ["writing", "essay"]
+        )
+        #expect(!added.taskId.isEmpty)
+        #expect(engine.budgets.count == 5)
+
+        let updated = TaskBudget(
+            taskId: added.taskId,
+            displayName: "深度写作 · 专栏",
+            colorHex: "#06B6D4",
+            targetMinutes: 60,
+            capMinutes: 120,
+            keywords: ["column"]
+        )
+        engine.updateTask(updated)
+        #expect(engine.budgets.last?.displayName == "深度写作 · 专栏")
+        #expect(engine.budgets.last?.colorHex == "#06B6D4")
+        #expect(engine.budgets.last?.keywords == ["column"])
+
+        engine.moveTask(fromOffsets: IndexSet(integer: 4), toOffset: 0)
+        #expect(engine.budgets.first?.taskId == added.taskId)
+
+        engine.startFocus(taskId: added.taskId, at: t0)
+        engine.ingest(ActivitySample(timestamp: t0.addingTimeInterval(300), appName: "Editor", bundleId: "com.example.editor", windowTitle: "Draft", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+        engine.deleteTask(taskId: added.taskId)
+
+        #expect(engine.budgets.count == 4)
+        #expect(engine.focusState == .unassigned)
+    }
+
+    @Test("TimeAuditConfigLoader uses config.json as primary truth once saved")
+    @MainActor
+    func configLoaderRespectsSavedConfigTruthWithCoordinatorCRUD() throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-crud-\(UUID().uuidString)")
+        let timeAuditDir = tmpDir.appendingPathComponent("time-audit", isDirectory: true)
+        let storeDir = tmpDir.appendingPathComponent("dayhelm", isDirectory: true)
+        try FileManager.default.createDirectory(at: timeAuditDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        try #"{"primary_focus":{"project_keys":["ecommerce","legacy-ta-task"]}}"#.write(
+            to: timeAuditDir.appendingPathComponent("focus.json"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let store = DayHelmStore(directory: storeDir)
+        let t0 = baseDate()
+        let clock = ManualClock(now: t0)
+        let inspector = MockInspector(sample: ActivitySample(timestamp: t0, appName: "Editor", bundleId: "com.example.editor", windowTitle: "Work", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+        let initial = TimeAuditConfigLoader.loadBudgets(timeAuditDirectory: timeAuditDir, dayhelmConfigURL: store.configURL)
+        let coord = HybridActivityCoordinator(engine: DayHelmEngine(budgets: initial, clock: clock), store: store, almaClient: nil, inspector: inspector, clock: clock, syntheticDemo: false)
+
+        let created = coord.addTask(displayName: "独立开发", colorHex: "#10B981", targetMinutes: 90, capMinutes: 150, keywords: ["swift"])
+        coord.deleteTask(taskId: "legacy-ta-task")
+        coord.deleteTask(taskId: "ecommerce-ops")
+
+        let reloaded = TimeAuditConfigLoader.loadBudgets(timeAuditDirectory: timeAuditDir, dayhelmConfigURL: store.configURL)
+        #expect(!reloaded.contains { $0.taskId == "legacy-ta-task" })
+        #expect(!reloaded.contains { $0.taskId == "ecommerce-ops" })
+        #expect(reloaded.first { $0.taskId == created.taskId }?.displayName == "独立开发")
     }
 }
 #endif

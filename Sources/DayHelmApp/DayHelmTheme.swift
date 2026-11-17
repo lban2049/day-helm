@@ -6,6 +6,15 @@ enum DayHelmColors {
     static let warningAmber = Color(hex: "#F59E0B")
     static let destructiveRed = Color(hex: "#EF4444")
     static let violetAccent = Color(hex: "#8B5CF6")
+
+    static let taskPalette: [(hex: String, name: String)] = [
+        ("#3B82F6", "推进蓝"),
+        ("#10B981", "达标绿"),
+        ("#F59E0B", "琥珀橙"),
+        ("#8B5CF6", "紫罗兰"),
+        ("#EC4899", "玫瑰红"),
+        ("#06B6D4", "仪表青")
+    ]
 }
 
 extension Color {

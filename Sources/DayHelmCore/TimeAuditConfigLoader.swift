@@ -71,15 +71,14 @@ public enum TimeAuditConfigLoader {
         timeAuditDirectory: URL = defaultTimeAuditDirectory,
         dayhelmConfigURL: URL? = defaultDayHelmConfigURL
     ) -> [TaskBudget] {
-        var budgets: [TaskBudget] = defaultBudgets
-
         if let dayhelmConfigURL,
            let data = try? Data(contentsOf: dayhelmConfigURL),
            let decoded = try? JSONDecoder().decode(DayHelmConfigFileDTO.self, from: data),
-           let customBudgets = decoded.budgets,
-           !customBudgets.isEmpty {
-            budgets = customBudgets
+           let savedBudgets = decoded.budgets {
+            return savedBudgets
         }
+
+        var budgets: [TaskBudget] = defaultBudgets
 
         let configURL = timeAuditDirectory.appendingPathComponent("config.json")
         var projectKeywordsByName: [String: [String]] = [:]

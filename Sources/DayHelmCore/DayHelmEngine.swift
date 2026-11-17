@@ -155,6 +155,138 @@ public final class DayHelmEngine: @unchecked Sendable {
         _budgets = newBudgets
     }
 
+    @discardableResult
+    public func addTask(
+        taskId: String? = nil,
+        displayName: String,
+        colorHex: String,
+        targetMinutes: Int?,
+        capMinutes: Int?,
+        keywords: [String]
+    ) -> TaskBudget {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let trimmedName = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalName = trimmedName.isEmpty ? "未命名事项" : trimmedName
+        let trimmedColor = colorHex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalColor = trimmedColor.isEmpty ? "#3B82F6" : trimmedColor
+        let cleanedKeywords = Self.cleanKeywords(keywords)
+
+        let existingIds = Set(_budgets.map(\.taskId))
+        let finalId = Self.makeUniqueTaskId(preferredId: taskId, displayName: finalName, existingIds: existingIds)
+
+        let created = TaskBudget(
+            taskId: finalId,
+            displayName: finalName,
+            colorHex: finalColor,
+            targetMinutes: targetMinutes,
+            capMinutes: capMinutes,
+            keywords: cleanedKeywords
+        )
+        _budgets.append(created)
+        return created
+    }
+
+    @discardableResult
+    public func updateTask(_ updatedBudget: TaskBudget) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let idx = _budgets.firstIndex(where: { $0.taskId == updatedBudget.taskId }) else {
+            return false
+        }
+        let trimmedName = updatedBudget.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalName = trimmedName.isEmpty ? _budgets[idx].displayName : trimmedName
+        let trimmedColor = updatedBudget.colorHex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalColor = trimmedColor.isEmpty ? _budgets[idx].colorHex : trimmedColor
+        let cleanedKeywords = Self.cleanKeywords(updatedBudget.keywords)
+
+        let normalized = TaskBudget(
+            taskId: updatedBudget.taskId,
+            displayName: finalName,
+            colorHex: finalColor,
+            targetMinutes: updatedBudget.targetMinutes,
+            capMinutes: updatedBudget.capMinutes,
+            keywords: cleanedKeywords
+        )
+        _budgets[idx] = normalized
+
+        let focused = focusedMinutesLocked(for: normalized.taskId)
+        if let cap = normalized.capMinutes, focused < Double(cap) {
+            capAlertEmittedForTask.remove(normalized.taskId)
+        }
+        if let target = normalized.targetMinutes, focused < Double(target) {
+            targetAlertEmittedForTask.remove(normalized.taskId)
+        }
+        return true
+    }
+
+    @discardableResult
+    public func deleteTask(taskId: String, at date: Date? = nil) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let originalCount = _budgets.count
+        _budgets.removeAll { $0.taskId == taskId }
+        guard _budgets.count != originalCount else {
+            return false
+        }
+
+        let ts = date ?? clock.now()
+        switch _focusState {
+        case .focusing(let activeId, _) where activeId == taskId:
+            closeActiveSessionLocked(at: ts, closingNote: nil)
+            _focusState = .unassigned
+            driftCandidate = nil
+            unassignedActiveStart = nil
+            unassignedPromptEmitted = false
+        case .paused(let pausedId, _) where pausedId == taskId:
+            _focusState = .unassigned
+            driftCandidate = nil
+            unassignedActiveStart = nil
+            unassignedPromptEmitted = false
+        default:
+            break
+        }
+
+        if driftCandidate?.taskId == taskId {
+            driftCandidate = nil
+        }
+
+        capAlertEmittedForTask.remove(taskId)
+        targetAlertEmittedForTask.remove(taskId)
+        snoozeUntilByTask.removeValue(forKey: taskId)
+
+        _pendingAlerts.removeAll { alert in
+            switch alert.kind {
+            case .quotaCapReached(let id, _, _), .quotaTargetMet(let id, _, _):
+                return id == taskId
+            case .taskDrift(_, let detectedId, _):
+                return detectedId == taskId
+            case .highFrequencySwitch, .unassignedActivePrompt:
+                return false
+            }
+        }
+        return true
+    }
+
+    public func moveTask(fromOffsets: IndexSet, toOffset: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let validOffsets = fromOffsets.filter { $0 >= 0 && $0 < _budgets.count }.sorted()
+        guard !validOffsets.isEmpty else { return }
+
+        let moving = validOffsets.map { _budgets[$0] }
+        for index in validOffsets.reversed() {
+            _budgets.remove(at: index)
+        }
+        let removedBeforeDestination = validOffsets.filter { $0 < toOffset }.count
+        let destination = min(max(0, toOffset - removedBeforeDestination), _budgets.count)
+        _budgets.insert(contentsOf: moving, at: destination)
+    }
+
     public func startFocus(taskId: String, note: String? = nil, at date: Date? = nil) {
         lock.lock()
         defer { lock.unlock() }
@@ -674,5 +806,54 @@ public final class DayHelmEngine: @unchecked Sendable {
             message: "选一个当前主攻事项，让时长准确计入今日配额。",
             actions: actions
         )
+    }
+
+    private static func cleanKeywords(_ keywords: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        for kw in keywords {
+            let trimmed = kw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let lower = trimmed.lowercased()
+            if seen.insert(lower).inserted {
+                result.append(trimmed)
+            }
+        }
+        return result
+    }
+
+    private static func makeUniqueTaskId(preferredId: String?, displayName: String, existingIds: Set<String>) -> String {
+        let baseSlug: String = {
+            if let preferredId {
+                let cleaned = preferredId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !cleaned.isEmpty {
+                    return cleaned
+                }
+            }
+            let asciiLower = displayName
+                .lowercased()
+                .map { ch -> Character in
+                    if ch.isASCII && (ch.isLetter || ch.isNumber) {
+                        return ch
+                    }
+                    return "-"
+                }
+            let collapsed = String(asciiLower)
+                .split(separator: "-", omittingEmptySubsequences: true)
+                .joined(separator: "-")
+            if !collapsed.isEmpty {
+                return collapsed
+            }
+            return "task-\(UUID().uuidString.prefix(8).lowercased())"
+        }()
+
+        if !existingIds.contains(baseSlug) {
+            return baseSlug
+        }
+        var suffix = 2
+        while existingIds.contains("\(baseSlug)-\(suffix)") {
+            suffix += 1
+        }
+        return "\(baseSlug)-\(suffix)"
     }
 }

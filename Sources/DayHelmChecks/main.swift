@@ -29,7 +29,7 @@ struct DayHelmChecksMain {
     static func main() async {
         do {
             try await runAllChecks()
-            print("ALL DAYHELM CHECKS PASSED (18/18)")
+            print("ALL DAYHELM CHECKS PASSED (20/20)")
             exit(0)
         } catch {
             fputs("DAYHELM CHECK FAILED: \(error)\n", stderr)
@@ -461,6 +461,124 @@ struct DayHelmChecksMain {
             let purgeAll = DayHelmCLI.run(arguments: ["dayhelm", "purge", "--store-dir", tmpDir.path], clock: ManualClock(now: t0))
             try checkEqual(purgeAll?.exitCode, 0, "full purge exits 0")
             try check((try store.loadToday()) == nil, "full purge removes today.json")
+        }
+
+        try await runCheck("19. DayHelmEngine Task CRUD & delete active focused task") {
+            let t0 = baseDate()
+            let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+
+            // Add custom task
+            let added = engine.addTask(
+                displayName: "深度写作",
+                colorHex: "#EC4899",
+                targetMinutes: 50,
+                capMinutes: 90,
+                keywords: ["writing", "essay"]
+            )
+            try check(!added.taskId.isEmpty, "Generated taskId must not be empty")
+            try checkEqual(engine.budgets.count, 5, "addTask appends new task")
+            try checkEqual(engine.budgets.last?.displayName, "深度写作", "Added task displayName matches")
+
+            // Update task
+            let edited = TaskBudget(
+                taskId: added.taskId,
+                displayName: "深度写作 · 专栏",
+                colorHex: "#06B6D4",
+                targetMinutes: 60,
+                capMinutes: 120,
+                keywords: ["column", "draft"]
+            )
+            engine.updateTask(edited)
+            let fetched = engine.budgets.first { $0.taskId == added.taskId }
+            try checkEqual(fetched?.displayName, "深度写作 · 专栏", "updateTask updates displayName")
+            try checkEqual(fetched?.colorHex, "#06B6D4", "updateTask updates colorHex")
+            try checkEqual(fetched?.targetMinutes, 60, "updateTask updates targetMinutes")
+            try checkEqual(fetched?.capMinutes, 120, "updateTask updates capMinutes")
+            try checkEqual(fetched?.keywords, ["column", "draft"], "updateTask updates keywords")
+
+            // Reorder task (move last item index 4 to index 0)
+            engine.moveTask(fromOffsets: IndexSet(integer: 4), toOffset: 0)
+            try checkEqual(engine.budgets.first?.taskId, added.taskId, "moveTask reorders budgets")
+
+            // Focus on the added task, advance 10m, then delete while focusing
+            engine.startFocus(taskId: added.taskId, at: t0)
+            engine.ingest(ActivitySample(timestamp: t0.addingTimeInterval(600), appName: "Editor", bundleId: "com.example.editor", windowTitle: "Draft", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+            engine.deleteTask(taskId: added.taskId)
+            try checkEqual(engine.budgets.count, 4, "deleteTask removes task")
+            try check(!engine.budgets.contains { $0.taskId == added.taskId }, "Deleted task absent from budgets")
+            try checkEqual(engine.focusState, .unassigned, "Deleting active focused task stops focus to unassigned")
+
+            // Delete while paused
+            engine.startFocus(taskId: "hermes", at: t0.addingTimeInterval(700))
+            engine.pauseFocus(at: t0.addingTimeInterval(800))
+            engine.deleteTask(taskId: "hermes")
+            try checkEqual(engine.focusState, .unassigned, "Deleting paused task resets focusState to unassigned")
+        }
+
+        try await runCheck("20. TimeAuditConfigLoader respects config.json truth & HybridActivityCoordinator CRUD persistence") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-crud-\(UUID().uuidString)")
+            let timeAuditDir = tmpDir.appendingPathComponent("time-audit", isDirectory: true)
+            let storeDir = tmpDir.appendingPathComponent("dayhelm", isDirectory: true)
+            try FileManager.default.createDirectory(at: timeAuditDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            // Seed time-audit config with project keys that user will delete/not include
+            try #"{"projects":[{"name":"ecommerce","keywords":["from-ta"]}]}"#.write(
+                to: timeAuditDir.appendingPathComponent("config.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try #"{"primary_focus":{"project_keys":["ecommerce","legacy-ta-task"]}}"#.write(
+                to: timeAuditDir.appendingPathComponent("focus.json"),
+                atomically: true,
+                encoding: .utf8
+            )
+
+            let store = DayHelmStore(directory: storeDir)
+            let t0 = baseDate()
+            let clock = ManualClock(now: t0)
+            let inspector = MockInspector(isAccessibilityTrusted: true, currentSample: ActivitySample(timestamp: t0, appName: "Editor", bundleId: "com.example.editor", windowTitle: "Work", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+
+            let coordinator = await MainActor.run { () -> HybridActivityCoordinator in
+                let initialBudgets = TimeAuditConfigLoader.loadBudgets(timeAuditDirectory: timeAuditDir, dayhelmConfigURL: store.configURL)
+                let engine = DayHelmEngine(budgets: initialBudgets, clock: clock)
+                return HybridActivityCoordinator(engine: engine, store: store, almaClient: nil, inspector: inspector, clock: clock, syntheticDemo: false)
+            }
+
+            let created = await MainActor.run { () -> TaskBudget in
+                let added = coordinator.addTask(
+                    displayName: "独立开发",
+                    colorHex: "#10B981",
+                    targetMinutes: 90,
+                    capMinutes: 150,
+                    keywords: ["xcode", "swift"]
+                )
+                coordinator.deleteTask(taskId: "legacy-ta-task")
+                coordinator.deleteTask(taskId: "ecommerce-ops")
+                coordinator.updateTask(TaskBudget(
+                    taskId: added.taskId,
+                    displayName: "独立开发 · Swift",
+                    colorHex: "#3B82F6",
+                    targetMinutes: 120,
+                    capMinutes: 180,
+                    keywords: ["swiftpm"]
+                ))
+                return added
+            }
+
+            // Reload from DayHelm config.json + same time-audit dir: must preserve exact user-customized list
+            let reloaded = TimeAuditConfigLoader.loadBudgets(timeAuditDirectory: timeAuditDir, dayhelmConfigURL: store.configURL)
+            try check(!reloaded.contains { $0.taskId == "legacy-ta-task" }, "Deleted time-audit task must NOT come back once config.json exists")
+            try check(!reloaded.contains { $0.taskId == "ecommerce-ops" }, "Deleted default task must NOT come back once config.json exists")
+            let custom = reloaded.first { $0.taskId == created.taskId }
+            try checkEqual(custom?.displayName, "独立开发 · Swift", "Reloaded custom task displayName matches")
+            try checkEqual(custom?.colorHex, "#3B82F6", "Reloaded custom task colorHex matches")
+            try checkEqual(custom?.targetMinutes, 120, "Reloaded custom task targetMinutes matches")
+            try checkEqual(custom?.capMinutes, 180, "Reloaded custom task capMinutes matches")
+            try checkEqual(custom?.keywords, ["swiftpm"], "Reloaded custom task keywords matches")
+
+            let ecommerceReloaded = reloaded.first { $0.taskId == "ecommerce" }
+            try check(ecommerceReloaded?.keywords.contains("from-ta") == true, "Initial seed still carries keywords before edits")
         }
     }
 }

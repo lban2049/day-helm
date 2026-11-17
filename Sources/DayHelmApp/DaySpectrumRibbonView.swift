@@ -77,33 +77,35 @@ struct DaySpectrumRibbonView: View {
     }
 
     private var legendRow: some View {
-        HStack(spacing: 8) {
-            ForEach(budgets.prefix(4)) { budget in
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(budgets) { budget in
+                    HStack(spacing: 3) {
+                        Circle()
+                            .fill(Color(hex: budget.colorHex))
+                            .frame(width: 6, height: 6)
+                        Text(shortLabel(for: budget.displayName))
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
                 HStack(spacing: 3) {
-                    Circle()
-                        .fill(Color(hex: budget.colorHex))
-                        .frame(width: 6, height: 6)
-                    Text(shortLabel(for: budget.displayName))
+                    ThrashingHatchView()
+                        .frame(width: 8, height: 8)
+                        .clipShape(RoundedRectangle(cornerRadius: 1.5))
+                    Text("乱切")
                         .font(.system(size: 9.5))
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
                 }
-            }
-            HStack(spacing: 3) {
-                ThrashingHatchView()
-                    .frame(width: 8, height: 8)
-                    .clipShape(RoundedRectangle(cornerRadius: 1.5))
-                Text("乱切")
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.secondary)
-            }
-            HStack(spacing: 3) {
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(Color.secondary.opacity(0.28))
-                    .frame(width: 8, height: 8)
-                Text("空闲")
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 3) {
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(Color.secondary.opacity(0.28))
+                        .frame(width: 8, height: 8)
+                    Text("空闲")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }

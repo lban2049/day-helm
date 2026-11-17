@@ -7,9 +7,13 @@ struct MenuBarLabelView: View {
     @ObservedObject var coordinator: HybridActivityCoordinator
 
     var body: some View {
-        Text(pillText)
-            .font(.system(size: 12, weight: .medium, design: .monospaced))
-            .monospacedDigit()
+        HStack(spacing: 4) {
+            Image(nsImage: DayHelmMenuBarIcon.templateImage)
+                .renderingMode(.template)
+            Text(pillText)
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .monospacedDigit()
+        }
     }
 
     private var pillText: String {
@@ -42,7 +46,9 @@ struct MenuBarLabelView: View {
 struct MenuBarPopoverView: View {
     @ObservedObject var coordinator: HybridActivityCoordinator
     @State private var noteText: String = ""
-    @State private var editingBudgetTaskId: String?
+    @State private var editingTaskId: String?
+    @State private var isCreatingTask: Bool = false
+    @State private var isManagingTasks: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
@@ -66,11 +72,7 @@ struct MenuBarPopoverView: View {
 
     private var headerSection: some View {
         HStack(alignment: .center, spacing: 8) {
-            Image(systemName: "helm")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(DayHelmColors.primaryBlue)
-                .frame(width: 24, height: 24)
-                .background(DayHelmColors.primaryBlue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            DayHelmHeaderLogoView(size: 26)
 
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
@@ -235,26 +237,132 @@ struct MenuBarPopoverView: View {
         )
     }
 
-    // MARK: - 3. Daily Quota Budget Bars
+    // MARK: - 3. Daily Quota Budget Bars & Task CRUD
 
     private var budgetListSection: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text("今日事项配额")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text("今日事项配额")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
 
-            ForEach(coordinator.taskProgressList) { progress in
-                BudgetProgressRow(
-                    progress: progress,
-                    isEditing: editingBudgetTaskId == progress.budget.taskId,
-                    onToggleEdit: {
-                        editingBudgetTaskId = (editingBudgetTaskId == progress.budget.taskId) ? nil : progress.budget.taskId
-                    },
-                    onSaveBudget: { target, cap in
-                        coordinator.updateBudget(taskId: progress.budget.taskId, targetMinutes: target, capMinutes: cap)
-                        editingBudgetTaskId = nil
+                Spacer()
+
+                if coordinator.taskProgressList.count > 1 {
+                    Button {
+                        isManagingTasks.toggle()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: isManagingTasks ? "checkmark" : "arrow.up.arrow.down")
+                                .font(.system(size: 9, weight: .semibold))
+                            Text(isManagingTasks ? "完成" : "管理")
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                        .foregroundStyle(isManagingTasks ? DayHelmColors.primaryBlue : .secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2.5)
+                        .background(
+                            isManagingTasks ? DayHelmColors.primaryBlue.opacity(0.12) : Color.primary.opacity(0.05),
+                            in: Capsule()
+                        )
                     }
-                )
+                    .buttonStyle(.plain)
+                }
+
+                Button {
+                    editingTaskId = nil
+                    isCreatingTask = true
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 9, weight: .bold))
+                        Text("新增事项")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .foregroundStyle(DayHelmColors.primaryBlue)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2.5)
+                    .background(DayHelmColors.primaryBlue.opacity(0.12), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $isCreatingTask) {
+                    TaskEditorPopover(
+                        mode: .create,
+                        initialName: "",
+                        initialColorHex: nextSuggestedColorHex(),
+                        initialKeywords: [],
+                        initialTargetMinutes: 60,
+                        initialHasTarget: true,
+                        initialCapMinutes: 90,
+                        initialHasCap: false,
+                        onSave: { name, colorHex, target, cap, keywords in
+                            coordinator.addTask(
+                                displayName: name,
+                                colorHex: colorHex,
+                                targetMinutes: target,
+                                capMinutes: cap,
+                                keywords: keywords
+                            )
+                            isCreatingTask = false
+                        },
+                        onDelete: nil,
+                        onCancel: {
+                            isCreatingTask = false
+                        }
+                    )
+                }
+            }
+
+            if coordinator.taskProgressList.isEmpty {
+                Text("暂无事项，点击右上角「+ 新增事项」开始规划")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 10)
+                    .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            } else {
+                let items = coordinator.taskProgressList
+                ForEach(Array(items.enumerated()), id: \.element.id) { index, progress in
+                    BudgetProgressRow(
+                        progress: progress,
+                        isManaging: isManagingTasks,
+                        canMoveUp: index > 0,
+                        canMoveDown: index < items.count - 1,
+                        isEditing: editingTaskId == progress.budget.taskId,
+                        onToggleEdit: {
+                            isCreatingTask = false
+                            editingTaskId = (editingTaskId == progress.budget.taskId) ? nil : progress.budget.taskId
+                        },
+                        onMoveUp: {
+                            guard index > 0 else { return }
+                            coordinator.moveTask(fromOffsets: IndexSet(integer: index), toOffset: index - 1)
+                        },
+                        onMoveDown: {
+                            guard index < items.count - 1 else { return }
+                            coordinator.moveTask(fromOffsets: IndexSet(integer: index), toOffset: index + 2)
+                        },
+                        onSaveTask: { name, colorHex, target, cap, keywords in
+                            coordinator.updateTask(
+                                TaskBudget(
+                                    taskId: progress.budget.taskId,
+                                    displayName: name,
+                                    colorHex: colorHex,
+                                    targetMinutes: target,
+                                    capMinutes: cap,
+                                    keywords: keywords
+                                )
+                            )
+                            editingTaskId = nil
+                        },
+                        onDeleteTask: {
+                            editingTaskId = nil
+                            coordinator.deleteTask(taskId: progress.budget.taskId)
+                            if coordinator.taskProgressList.count <= 1 {
+                                isManagingTasks = false
+                            }
+                        }
+                    )
+                }
             }
         }
     }
@@ -330,6 +438,11 @@ struct MenuBarPopoverView: View {
     }
 
     // MARK: - Helpers
+
+    private func nextSuggestedColorHex() -> String {
+        let idx = coordinator.taskProgressList.count % DayHelmColors.taskPalette.count
+        return DayHelmColors.taskPalette[idx].hex
+    }
 
     private var isFocusing: Bool {
         if case .focusing = coordinator.sessionState { return true }
@@ -409,14 +522,15 @@ struct MenuBarPopoverView: View {
 
 private struct BudgetProgressRow: View {
     let progress: TaskProgress
+    let isManaging: Bool
+    let canMoveUp: Bool
+    let canMoveDown: Bool
     let isEditing: Bool
     let onToggleEdit: () -> Void
-    let onSaveBudget: (Int?, Int?) -> Void
-
-    @State private var draftTarget: Int = 60
-    @State private var draftCap: Int = 90
-    @State private var hasTarget: Bool = false
-    @State private var hasCap: Bool = false
+    let onMoveUp: () -> Void
+    let onMoveDown: () -> Void
+    let onSaveTask: (String, String, Int?, Int?, [String]) -> Void
+    let onDeleteTask: () -> Void
 
     private var ratio: Double {
         let denom = Double(progress.budget.capMinutes ?? progress.budget.targetMinutes ?? 60)
@@ -451,33 +565,76 @@ private struct BudgetProgressRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
+                Circle()
+                    .fill(Color(hex: progress.budget.colorHex))
+                    .frame(width: 6, height: 6)
+
                 Text(progress.budget.displayName)
                     .font(.system(size: 11.5, weight: .medium))
                     .lineLimit(1)
 
                 Spacer()
 
-                statusBadge
+                if isManaging {
+                    HStack(spacing: 4) {
+                        Button(action: onMoveUp) {
+                            Image(systemName: "chevron.up")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .frame(width: 18, height: 18)
+                                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!canMoveUp)
+                        .opacity(canMoveUp ? 1.0 : 0.35)
 
-                Text(quotaFractionText)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
+                        Button(action: onMoveDown) {
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .frame(width: 18, height: 18)
+                                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 4))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!canMoveDown)
+                        .opacity(canMoveDown ? 1.0 : 0.35)
 
-                Button(action: {
-                    draftTarget = progress.budget.targetMinutes ?? 60
-                    hasTarget = progress.budget.targetMinutes != nil
-                    draftCap = progress.budget.capMinutes ?? 60
-                    hasCap = progress.budget.capMinutes != nil
-                    onToggleEdit()
-                }) {
+                        Button(action: onDeleteTask) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 9.5))
+                                .foregroundStyle(DayHelmColors.destructiveRed)
+                                .frame(width: 18, height: 18)
+                                .background(DayHelmColors.destructiveRed.opacity(0.10), in: RoundedRectangle(cornerRadius: 4))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else {
+                    statusBadge
+
+                    Text(quotaFractionText)
+                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+
+                Button(action: onToggleEdit) {
                     Image(systemName: "slider.horizontal.3")
                         .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(isEditing ? DayHelmColors.primaryBlue : .secondary.opacity(0.7))
                 }
                 .buttonStyle(.plain)
                 .popover(isPresented: Binding(get: { isEditing }, set: { if !$0 { onToggleEdit() } })) {
-                    budgetEditorPopover
+                    TaskEditorPopover(
+                        mode: .edit,
+                        initialName: progress.budget.displayName,
+                        initialColorHex: progress.budget.colorHex,
+                        initialKeywords: progress.budget.keywords,
+                        initialTargetMinutes: progress.budget.targetMinutes ?? 60,
+                        initialHasTarget: progress.budget.targetMinutes != nil,
+                        initialCapMinutes: progress.budget.capMinutes ?? 90,
+                        initialHasCap: progress.budget.capMinutes != nil,
+                        onSave: onSaveTask,
+                        onDelete: onDeleteTask,
+                        onCancel: onToggleEdit
+                    )
                 }
             }
 
@@ -529,48 +686,268 @@ private struct BudgetProgressRow: View {
             EmptyView()
         }
     }
+}
 
-    private var budgetEditorPopover: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("调整「\(progress.budget.displayName)」配额")
-                .font(.system(size: 12, weight: .semibold))
+private struct TaskEditorPopover: View {
+    enum Mode {
+        case create
+        case edit
+    }
 
-            Toggle(isOn: $hasTarget) {
-                HStack {
-                    Text("保底目标")
-                        .font(.system(size: 11))
+    let mode: Mode
+    let initialName: String
+    let initialColorHex: String
+    let initialKeywords: [String]
+    let initialTargetMinutes: Int
+    let initialHasTarget: Bool
+    let initialCapMinutes: Int
+    let initialHasCap: Bool
+    let onSave: (String, String, Int?, Int?, [String]) -> Void
+    let onDelete: (() -> Void)?
+    let onCancel: () -> Void
+
+    @State private var displayName: String = ""
+    @State private var selectedColorHex: String = "#3B82F6"
+    @State private var keywordsText: String = ""
+    @State private var hasTarget: Bool = true
+    @State private var targetMinutes: Int = 60
+    @State private var hasCap: Bool = false
+    @State private var capMinutes: Int = 90
+
+    private var trimmedName: String {
+        displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text(mode == .create ? "新增今日事项" : "编辑事项与配额")
+                .font(.system(size: 12.5, weight: .semibold))
+
+            // 1. Task name + Color dots
+            VStack(alignment: .leading, spacing: 6) {
+                Text("事项名称")
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                TextField("例如：电商做深 / 深度写作", text: $displayName)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+
+                HStack(spacing: 8) {
+                    Text("标识颜色")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.secondary)
                     Spacer()
-                    if hasTarget {
-                        Stepper("\(draftTarget)m", value: $draftTarget, in: 5...480, step: 5)
-                            .font(.system(size: 11, design: .monospaced))
-                            .monospacedDigit()
+                    ForEach(DayHelmColors.taskPalette, id: \.hex) { item in
+                        let isSelected = selectedColorHex.caseInsensitiveCompare(item.hex) == .orderedSame
+                        Button {
+                            selectedColorHex = item.hex
+                        } label: {
+                            Circle()
+                                .fill(Color(hex: item.hex))
+                                .frame(width: 16, height: 16)
+                                .overlay(
+                                    Circle()
+                                        .strokeBorder(Color.white, lineWidth: isSelected ? 2 : 0)
+                                )
+                                .overlay(
+                                    Circle()
+                                        .strokeBorder(Color.primary.opacity(isSelected ? 0.55 : 0.15), lineWidth: 1)
+                                        .padding(-1.5)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .help(item.name)
                     }
                 }
+                .padding(.top, 2)
             }
 
-            Toggle(isOn: $hasCap) {
+            // 2. Keywords
+            VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text("封顶上限")
-                        .font(.system(size: 11))
+                    Text("匹配关键词（可选）")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.secondary)
                     Spacer()
-                    if hasCap {
-                        Stepper("\(draftCap)m", value: $draftCap, in: 5...480, step: 5)
-                            .font(.system(size: 11, design: .monospaced))
-                            .monospacedDigit()
-                    }
+                    Text("逗号分隔")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.tertiary)
                 }
+
+                TextField("如：抖店, 1688, 主图", text: $keywordsText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11))
             }
 
-            HStack {
+            // 3. Target Minutes (Slider + direct TextField)
+            QuotaDurationEditor(
+                title: "保底目标 (Target)",
+                accentColor: DayHelmColors.primaryBlue,
+                isEnabled: $hasTarget,
+                minutes: $targetMinutes
+            )
+
+            // 4. Cap Minutes (Slider + direct TextField)
+            QuotaDurationEditor(
+                title: "封顶上限 (Cap)",
+                accentColor: DayHelmColors.warningAmber,
+                isEnabled: $hasCap,
+                minutes: $capMinutes
+            )
+
+            // 5. Footer actions
+            HStack(spacing: 8) {
+                if mode == .edit, let onDelete {
+                    Button(role: .destructive) {
+                        onDelete()
+                    } label: {
+                        Text("删除")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(DayHelmColors.destructiveRed)
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 Spacer()
+
+                Button("取消") {
+                    onCancel()
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
                 Button("保存") {
-                    onSaveBudget(hasTarget ? draftTarget : nil, hasCap ? draftCap : nil)
+                    let parsedKeywords = keywordsText
+                        .replacingOccurrences(of: "，", with: ",")
+                        .split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                    onSave(
+                        trimmedName,
+                        selectedColorHex,
+                        hasTarget ? targetMinutes : nil,
+                        hasCap ? capMinutes : nil,
+                        parsedKeywords
+                    )
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
+                .disabled(trimmedName.isEmpty)
+            }
+            .padding(.top, 2)
+        }
+        .padding(14)
+        .frame(width: 300)
+        .onAppear {
+            displayName = initialName
+            selectedColorHex = initialColorHex
+            keywordsText = initialKeywords.joined(separator: ", ")
+            hasTarget = initialHasTarget
+            targetMinutes = initialTargetMinutes
+            hasCap = initialHasCap
+            capMinutes = initialCapMinutes
+        }
+    }
+}
+
+private struct QuotaDurationEditor: View {
+    let title: String
+    let accentColor: Color
+    @Binding var isEnabled: Bool
+    @Binding var minutes: Int
+
+    @State private var textValue: String = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Toggle(isOn: $isEnabled) {
+                    Text(title)
+                        .font(.system(size: 11.5, weight: .medium))
+                }
+                .toggleStyle(.checkbox)
+
+                Spacer()
+
+                if isEnabled {
+                    HStack(spacing: 4) {
+                        TextField("60", text: $textValue)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11.5, weight: .semibold, design: .monospaced))
+                            .monospacedDigit()
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 56)
+                            .onChange(of: textValue) { _, newValue in
+                                let digits = newValue.filter(\.isNumber)
+                                if digits != newValue {
+                                    textValue = digits
+                                }
+                                if let parsed = Int(digits), parsed > 0 {
+                                    minutes = min(720, parsed)
+                                }
+                            }
+                            .onSubmit {
+                                commitText()
+                            }
+
+                        Text("分钟")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text("未启用")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            if isEnabled {
+                HStack(spacing: 7) {
+                    Text("5m")
+                        .font(.system(size: 9.5, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+
+                    Slider(
+                        value: Binding(
+                            get: { Double(min(240, max(5, minutes))) },
+                            set: { newValue in
+                                let rounded = Int(newValue.rounded())
+                                minutes = rounded
+                                textValue = "\(rounded)"
+                            }
+                        ),
+                        in: 5...240,
+                        step: 5
+                    )
+                    .tint(accentColor)
+
+                    Text("240m")
+                        .font(.system(size: 9.5, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
             }
         }
-        .padding(12)
-        .frame(width: 220)
+        .padding(8)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .onAppear {
+            textValue = "\(minutes)"
+        }
+        .onChange(of: minutes) { _, newValue in
+            if Int(textValue) != newValue {
+                textValue = "\(newValue)"
+            }
+        }
+    }
+
+    private func commitText() {
+        if let parsed = Int(textValue), parsed > 0 {
+            let clamped = min(720, max(1, parsed))
+            minutes = clamped
+            textValue = "\(clamped)"
+        } else {
+            textValue = "\(minutes)"
+        }
     }
 }

@@ -22,11 +22,23 @@ if [[ ! -x "${EXECUTABLE_SRC}" ]]; then
   exit 1
 fi
 
+ICON_SCRIPT="${ROOT_DIR}/scripts/generate-icon.swift"
+BRANDING_DIR="${ROOT_DIR}/branding"
+ICON_ICNS="${BRANDING_DIR}/AppIcon.icns"
+ICON_PNG="${BRANDING_DIR}/dayhelm-icon-1024.png"
+
+if [[ ! -f "${ICON_ICNS}" || ! -f "${ICON_PNG}" || "${ICON_SCRIPT}" -nt "${ICON_ICNS}" ]]; then
+  echo "[DayHelm] Generating app icon assets..."
+  swift "${ICON_SCRIPT}"
+fi
+
 rm -rf "${APP_BUNDLE}"
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
 cp "${EXECUTABLE_SRC}" "${MACOS_DIR}/${APP_NAME}"
 chmod +x "${MACOS_DIR}/${APP_NAME}"
+cp "${ICON_ICNS}" "${RESOURCES_DIR}/AppIcon.icns"
+cp "${ICON_PNG}" "${RESOURCES_DIR}/dayhelm-icon-1024.png"
 
 cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -39,6 +51,8 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
     <string>DayHelm</string>
     <key>CFBundleExecutable</key>
     <string>DayHelm</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.dayhelm.app</string>
     <key>CFBundleInfoDictionaryVersion</key>

@@ -83,20 +83,24 @@ public struct ActivitySample: Sendable, Equatable, Codable {
 
 ## 三、 判定与分析层（DayHelmCore）
 
-### 1. 任务与双向配额模型（Target & Cap）
+### 1. 任务与双向配额模型（Target & Cap + 动态事项管理）
 
 ```swift
 public struct TaskBudget: Sendable, Equatable, Codable, Identifiable {
     public var id: String { taskId }
-    public let taskId: String           // 如 "ecommerce", "ecommerce-ops", "hermes"
+    public let taskId: String           // 如 "ecommerce", "ecommerce-ops", "hermes" 或自动生成的唯一 slug
     public let displayName: String      // 如 "电商做深", "电商日常运营", "Hermes 投研"
     public let colorHex: String         // 用于光谱条与标签颜色
     public let targetMinutes: Int?      // 保底目标时长（如 90 分钟）
     public let capMinutes: Int?         // 封顶上限时长（如运营最多 30 分钟）
+    public let keywords: [String]       // 窗口标题 / URL 关键词（用于跑偏识别）
 }
 ```
 
-- **配置复用**：项目基础清单与关键词从 `~/.config/alma/time-audit/config.json` 与 `focus.json` 只读加载；每个事项的每日 `targetMinutes` / `capMinutes` 保存在 `~/.config/alma/dayhelm/config.json`。
+- **配置真源与冷启动初始化**：
+  - 用户在 UI 中对事项的增删改查、排序与配额调整，全量持久化至 `~/.config/alma/dayhelm/config.json`。
+  - 一旦 `dayhelm/config.json` 中已保存事项列表，`TimeAuditConfigLoader.loadBudgets` **直接以该文件为唯一真源**（不会重新灌入用户已删除的默认项或外部项）。
+  - 仅在首次启动且 `dayhelm/config.json` 尚无已保存事项时，才使用内置默认列表并与只读的 `~/.config/alma/time-audit/config.json` / `focus.json` 合并初始化。
 - **进度状态**：
   - `underTarget`：保底尚未达标（显示还差 X 分钟）
   - `targetMet`：已达保底目标（绿色达标标记）
@@ -152,22 +156,27 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 ### 2. 三个核心界面载体（无笨重主窗口）
 
 #### 载体 A：macOS 顶部菜单栏实时胶囊（MenuBar Live Pill）
-- 常驻系统菜单栏，无需点击即可用余光瞥见当前状态：
+- 常驻系统菜单栏，左侧带自定义矢量日舵（Helm）模板图标，无需点击即可用余光瞥见当前状态：
   - **专注推进中**：`● 电商做深 · 52/90m`
   - **触达封顶上限**：`▲ 日常运营 · 31/30m (已到点)`
   - **未指定专注**：`○ DayHelm · 待命`
 
 #### 载体 B：菜单栏下拉高密度仪表盘（Popover，固定宽 `330pt`，一屏免滚动）
-由上至下分为 5 个紧凑模块（内边距 `16pt`，模块间距 `12pt`）：
-1. **顶部品牌与采集状态栏**：左侧 `DayHelm` 标识，右侧实时状态胶囊 `● Alma + AX 采集中`。
+由上至下分为 5 个紧凑模块（内边距 `14pt`，模块间距 `11pt`）：
+1. **顶部品牌与采集状态栏**：左侧自定义日舵矢量徽标 + `DayHelm` 标识，右侧实时状态胶囊 `● Alma + AX 采集中`。
 2. **当前专注控制盒（Active Focus Box）**：
    - 右上角大号等宽计时器（如 `26:40`），左侧显示当前专注事项名称。
    - 单行等宽小字实时回显当前捕获到的窗口标题/URL（如 `当前窗口: 抖店后台 - 商品主图 (Chrome)`），让用户直观看到采集器在工作。
-   - **任务一键切换胶囊行（Quick Switcher Pills）**：横排展示 `电商做深`、`电商运营`、`Hermes`、`Infra`、`⏸ 杂事/休息`，单击即切，零输入成本。
-3. **今日时间配额进度条（Quota Budget List）**：
-   - 每个事项一行：左侧事项名，右侧等宽进度 `52 / 90m` + 状态微标签（`保底差 38m` / `⚠️ 已达上限` / `✓ 已达标`），下方 `7pt` 细圆角进度条。
+   - **任务一键切换胶囊行（Quick Switcher Pills）**：动态展示当前已配置的全部事项及 `⏸ 杂事/休息`，单击即切，零输入成本。
+3. **今日时间配额进度条与事项管理（Quota Budget List & Task CRUD）**：
+   - 标题栏提供 `+ 新增事项` 与 `排序/管理` 控件，支持在界面内直接完成事项增删改排，无需手改 JSON。
+   - 每个事项一行：左侧事项名，右侧等宽进度 `52 / 90m` + 状态微标签（`保底差 38m` / `⚠️ 已达上限` / `✓ 已达标`），管理模式下显示上下排序按钮，下方 `7pt` 细圆角进度条。
+   - 点击编辑图标（或 `+ 新增事项`）弹出约 `300pt` 宽的**事项与配额编辑器**：
+     - 事项名称（`TextField`）、6 色语义色点选择、匹配关键词（逗号分隔 `TextField`）。
+     - **保底目标（`targetMinutes`）**与**封顶上限（`capMinutes`）**均提供独立开关及**双模联动时长控件（`Slider(5...240, step: 5)` + 同步直输数字 `TextField`）**，支持直接键入任意分钟数或拖动滑块。
+     - 编辑模式提供`删除`与`保存`操作（删除当前正在专注的事项时自动切回待命 `.unassigned`）。
 4. **今日时间光谱条（Day Spectrum Ribbon）**：
-   - 一条 `20pt` 高的横向彩色分段条（从今日开始工作到当前时刻），直观展示各事项分布与斜纹碎片化段。
+   - 一条 `22pt` 高的横向彩色分段条（从今日开始工作到当前时刻），直观展示各事项分布与斜纹碎片化段。
 5. **底部三格遥测微指标（Telemetry Footer）**：
    - 三等分小格：`今日最长连续块 (34m)` ｜ `近期切换热度 (19/h)` ｜ `≥12m 有效块 (3个)`。
 
@@ -254,3 +263,15 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 ### 3. 与 `alma-time-audit` 的协同契约
 - **读取配置**：DayHelm 只读读取 `~/.config/alma/time-audit/focus.json` 与 `config.json`。
 - **反哺标题与归因**：DayHelm 产出的 `enrichedSpans`（带真實 `windowTitle` 和 `declaredTaskId`）保存在 `~/.config/alma/dayhelm/days/YYYY-MM-DD.json`，次日 `time-audit` 可直接读取，彻底解决原本因 `windowTitle: null` 和多应用协同导致的项目归属率低问题。
+
+---
+
+## 六、 图标资产与生产安装隔离
+
+- **应用图标生成 (`scripts/generate-icon.swift`)**：
+  - 使用 `AppKit` / `CoreGraphics` 渲染 `1024x1024` macOS Squircle 图标至 `branding/dayhelm-icon-1024.png`（深邃海蓝仪表盘渐变 `#0F172A -> #1E293B`、微光内边框、光谱分段环形刻度 `#3B82F6` / `#10B981` / `#F59E0B` 与居中舵针），并通过 `iconutil` 打包为 `branding/AppIcon.icns`。
+  - `scripts/build-app.sh` 构建 `.app` 时自动生成/更新图标并复制到 `Contents/Resources/`，并在 `Info.plist` 中配置 `CFBundleIconFile = AppIcon`。
+- **生产安装脚本 (`scripts/install-app.sh`)**：
+  - 编译 Release 包至 `build/DayHelm.app` 后，独立复制安装至 `/Applications/DayHelm.app`（仅当 `/Applications` 不可写时回退到 `~/Applications/DayHelm.app`），并重新进行 ad-hoc `codesign`。
+  - 生产应用路径与代码签名身份完全独立于仓库开发目录，日常试用不受后续 `swift build` 或源码修改影响；支持 `--launch` 参数在安装后自动重启生产版。
+

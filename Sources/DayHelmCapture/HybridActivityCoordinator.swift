@@ -319,11 +319,58 @@ public final class HybridActivityCoordinator: ObservableObject {
             )
         }
         engine.updateBudgets(updated)
-        if !isSyntheticDemo, let store {
-            try? store.saveBudgets(updated)
-        }
+        saveBudgetsIfNeeded()
         refreshPublishedState()
         persistTodayIfNeeded()
+    }
+
+    @discardableResult
+    public func addTask(
+        displayName: String,
+        colorHex: String,
+        targetMinutes: Int?,
+        capMinutes: Int?,
+        keywords: [String]
+    ) -> TaskBudget {
+        let created = engine.addTask(
+            displayName: displayName,
+            colorHex: colorHex,
+            targetMinutes: targetMinutes,
+            capMinutes: capMinutes,
+            keywords: keywords
+        )
+        saveBudgetsIfNeeded()
+        refreshPublishedState()
+        persistTodayIfNeeded()
+        return created
+    }
+
+    public func updateTask(_ updatedBudget: TaskBudget) {
+        _ = engine.updateTask(updatedBudget)
+        saveBudgetsIfNeeded()
+        refreshPublishedState()
+        persistTodayIfNeeded()
+    }
+
+    public func deleteTask(taskId: String) {
+        let now = clock.now()
+        _ = engine.deleteTask(taskId: taskId, at: now)
+        activeAlert = engine.pendingAlerts.last
+        saveBudgetsIfNeeded()
+        refreshPublishedState()
+        persistTodayIfNeeded()
+    }
+
+    public func moveTask(fromOffsets: IndexSet, toOffset: Int) {
+        engine.moveTask(fromOffsets: fromOffsets, toOffset: toOffset)
+        saveBudgetsIfNeeded()
+        refreshPublishedState()
+        persistTodayIfNeeded()
+    }
+
+    private func saveBudgetsIfNeeded() {
+        guard !isSyntheticDemo, let store else { return }
+        try? store.saveBudgets(engine.budgets)
     }
 
     public func openAccessibilitySettings() {
