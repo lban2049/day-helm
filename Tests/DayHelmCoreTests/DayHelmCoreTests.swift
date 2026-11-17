@@ -239,10 +239,44 @@ final class DayHelmCoreTests: XCTestCase {
     }
 
     private final class MockInspector: ActivityInspecting, @unchecked Sendable {
-        var isAccessibilityTrusted: Bool = true
-        let sample: ActivitySample
-        init(sample: ActivitySample) { self.sample = sample }
-        func inspectCurrent() -> ActivitySample { sample }
+        var isAccessibilityTrusted: Bool
+        var currentSample: ActivitySample
+        init(sample: ActivitySample, isAccessibilityTrusted: Bool = true) {
+            self.isAccessibilityTrusted = isAccessibilityTrusted
+            self.currentSample = sample
+        }
+        func inspectCurrent() -> ActivitySample { currentSample }
+    }
+
+    private final class MockScreenCapturer: ScreenCapturing, @unchecked Sendable {
+        private let lock = NSLock()
+        private var currentImage: CGImage
+        let isScreenCaptureTrusted: Bool
+
+        init(image: CGImage, isScreenCaptureTrusted: Bool = true) {
+            self.currentImage = image
+            self.isScreenCaptureTrusted = isScreenCaptureTrusted
+        }
+
+        func setImage(_ image: CGImage) {
+            lock.withLock {
+                currentImage = image
+            }
+        }
+
+        private func readCurrentImage() -> CGImage {
+            lock.withLock {
+                currentImage
+            }
+        }
+
+        func requestScreenCapturePermission() -> Bool {
+            isScreenCaptureTrusted
+        }
+
+        func captureMainDisplayImage() async throws -> CGImage {
+            readCurrentImage()
+        }
     }
 
     func testAlmaBrowserVisitURLTabSplitting() {
@@ -618,6 +652,716 @@ final class DayHelmCoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: oldJPEG.path))
     }
 
+    func testFullDayE2ECoordinatorPipelineMorningToRollover() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-xct-e2e-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate() // 2026-11-17T09:00:00+08:00
+        let clock = ManualClock(now: t0)
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+        let imgXcode1 = try makeSyntheticTextImage(text: "Xcode DayHelmEngine Pipeline", backgroundWhite: true)
+        let imgTerminal = try makeSyntheticTextImage(text: "Terminal Swift Test Runner", backgroundWhite: false)
+        let imgChrome = try makeSyntheticTextImage(text: "Swift Concurrency Documentation", backgroundWhite: true)
+        let imgXcode2 = try makeSyntheticTextImage(text: "DayHelmChecks Main Verification", backgroundWhite: false)
+
+        let capturer = MockScreenCapturer(image: imgXcode1, isScreenCaptureTrusted: true)
+        let recorder = NativeScreenRecorder(
+            database: db,
+            snapshotsRootDir: store.snapshotsDirectory,
+            capturer: capturer,
+            clock: clock
+        )
+        let inspector = MockInspector(
+            sample: ActivitySample(
+                timestamp: t0,
+                appName: "Xcode",
+                bundleId: "com.apple.dt.Xcode",
+                windowTitle: "DayHelmEngine.swift — focus-guard",
+                url: nil,
+                idleSeconds: 0,
+                screenLocked: false,
+                inputActive: true
+            ),
+            isAccessibilityTrusted: true
+        )
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: clock)
+        let coordinator = await MainActor.run {
+            HybridActivityCoordinator(
+                engine: engine,
+                store: store,
+                almaClient: nil,
+                inspector: inspector,
+                clock: clock,
+                syntheticDemo: false,
+                database: db,
+                screenRecorder: recorder,
+                httpServer: nil
+            )
+        }
+
+        let httpServer = LocalActivityHTTPServer(
+            database: db,
+            store: store,
+            clock: clock,
+            stateProvider: { coordinator.currentRuntimeState() }
+        )
+        let ports = await httpServer.start(primaryPort: 0, fallbackPort: nil)
+        defer { httpServer.stop() }
+        let port = try XCTUnwrap(ports.first)
+
+        // 09:00: User adds custom task "独立开发 · DayHelm" (target 60m, cap 90m) and starts focus
+        let customTask = await MainActor.run { () -> TaskBudget in
+            let created = coordinator.addTask(
+                displayName: "独立开发 · DayHelm",
+                colorHex: "#3B82F6",
+                targetMinutes: 60,
+                capMinutes: 90,
+                keywords: ["xcode", "dayhelm", "swift"]
+            )
+            coordinator.selectTask(created.taskId, note: "Full-day E2E pipeline")
+            return created
+        }
+
+        // 09:00: Xcode sample + snapshot #1 + OCR #1
+        await MainActor.run { coordinator.pollOnce() }
+        try await waitUntil("Snapshot #1 + OCR #1 recorded") {
+            await MainActor.run { coordinator.todaySnapshotCount >= 1 && coordinator.todayOCRCount >= 1 }
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        // 09:15: Terminal sample + snapshot #2 + OCR #2
+        clock.advance(by: 15 * 60)
+        capturer.setImage(imgTerminal)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Terminal",
+            bundleId: "com.apple.Terminal",
+            windowTitle: "swift test — focus-guard",
+            url: nil,
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        try await waitUntil("Snapshot #2 + OCR #2 recorded") {
+            await MainActor.run { coordinator.todaySnapshotCount >= 2 && coordinator.todayOCRCount >= 2 }
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        // 09:30: Sensitive 1Password sample -> MUST redact and produce 0 snapshots/OCR
+        clock.advance(by: 15 * 60)
+        capturer.setImage(imgChrome)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "1Password",
+            bundleId: "com.1password.1password",
+            windowTitle: "Vault Master Password",
+            url: "https://vault.1password.com/item?secret=topsecret",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+        let after1Pass = await MainActor.run { (coordinator.latestSample, coordinator.todaySnapshotCount) }
+        XCTAssertEqual(after1Pass.0?.redacted, true)
+        XCTAssertNil(after1Pass.0?.windowTitle)
+        XCTAssertNil(after1Pass.0?.url)
+        XCTAssertEqual(after1Pass.1, 2)
+
+        // 09:45: Chrome sample + snapshot #3 + OCR #3
+        clock.advance(by: 15 * 60)
+        capturer.setImage(imgChrome)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Google Chrome",
+            bundleId: "com.google.Chrome",
+            windowTitle: "Swift Concurrency Docs",
+            url: "https://docs.swift.org/concurrency?token=secret123&page=1",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        try await waitUntil("Snapshot #3 + OCR #3 recorded") {
+            await MainActor.run { coordinator.todaySnapshotCount >= 3 && coordinator.todayOCRCount >= 3 }
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        // 10:00: Xcode sample -> reaches 60m -> targetMet alert fires + snapshot #4 + OCR #4
+        clock.advance(by: 15 * 60)
+        capturer.setImage(imgXcode2)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Xcode",
+            bundleId: "com.apple.dt.Xcode",
+            windowTitle: "DayHelmChecks — main.swift",
+            url: nil,
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        try await waitUntil("Snapshot #4 + OCR #4 recorded") {
+            await MainActor.run { coordinator.todaySnapshotCount >= 4 && coordinator.todayOCRCount >= 4 }
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        let alert1000 = await MainActor.run { coordinator.activeAlert }
+        if case .quotaTargetMet(taskId: let alertedTask, _, target: 60) = alert1000?.kind {
+            XCTAssertEqual(alertedTask, customTask.taskId)
+        } else {
+            XCTFail("Expected quotaTargetMet alert at 60m, got \(String(describing: alert1000))")
+        }
+
+        // 10:05: Terminal sample -> 65m cross-app total
+        clock.advance(by: 5 * 60)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Terminal",
+            bundleId: "com.apple.Terminal",
+            windowTitle: "git status — focus-guard",
+            url: nil,
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        let customProgress = await MainActor.run {
+            coordinator.taskProgressList.first { $0.budget.taskId == customTask.taskId }
+        }
+        XCTAssertEqual(customProgress?.focusedMinutes ?? 0, 65.0, accuracy: 0.01)
+
+        // 10:05 -> 10:35: Switch to "电商日常运营" (cap 30m)
+        await MainActor.run {
+            coordinator.selectTask("ecommerce-ops", note: "Daily support queue")
+        }
+        clock.advance(by: 30 * 60)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Google Chrome",
+            bundleId: "com.google.Chrome",
+            windowTitle: "Support Ticket #301",
+            url: "https://ops.example.com/tickets/301",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        let capAlert = await MainActor.run { coordinator.activeAlert }
+        if case .quotaCapReached(taskId: "ecommerce-ops", _, cap: 30) = capAlert?.kind {
+            // OK
+        } else {
+            XCTFail("Expected quotaCapReached for ecommerce-ops at 10:35, got \(String(describing: capAlert))")
+        }
+
+        // User snoozes 15m via coordinator.handleAlertAction
+        await MainActor.run {
+            coordinator.handleAlertAction(.snooze(minutes: 15, label: "+15m 收尾"))
+        }
+        let clearedAlert = await MainActor.run { coordinator.activeAlert }
+        XCTAssertNil(clearedAlert)
+
+        // 10:40 (+5m): Alert stays suppressed
+        clock.advance(by: 5 * 60)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Google Chrome",
+            bundleId: "com.google.Chrome",
+            windowTitle: "Support Ticket #302",
+            url: "https://ops.example.com/tickets/302",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        let suppressedAlert = await MainActor.run { coordinator.activeAlert }
+        XCTAssertNil(suppressedAlert)
+
+        // 10:51 (+11m, total 16m past snooze): Alert re-arms
+        clock.advance(by: 11 * 60)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Google Chrome",
+            bundleId: "com.google.Chrome",
+            windowTitle: "Support Ticket #303",
+            url: "https://ops.example.com/tickets/303",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        let rearmedAlert = await MainActor.run { coordinator.activeAlert }
+        if case .quotaCapReached(taskId: "ecommerce-ops", _, cap: 30) = rearmedAlert?.kind {
+            // OK
+        } else {
+            XCTFail("Expected quotaCapReached to re-arm after 15m snooze")
+        }
+
+        // 11:00 (+9m): Verify HTTP server + CLI return exact accumulated task minutes, sessions, window titles & OCR
+        clock.advance(by: 9 * 60)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Google Chrome",
+            bundleId: "com.google.Chrome",
+            windowTitle: "Support Ticket #304",
+            url: "https://ops.example.com/tickets/304",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        try await Task.sleep(nanoseconds: 120_000_000)
+
+        let urlSession = URLSession(configuration: .ephemeral)
+        let dec = DayHelmDateFormatting.makeDecoder()
+
+        let (ctxData, ctxResp) = try await urlSession.data(from: URL(string: "http://127.0.0.1:\(port)/api/dayhelm/context")!)
+        XCTAssertEqual((ctxResp as? HTTPURLResponse)?.statusCode, 200)
+        let ctx = try dec.decode(DayHelmContextAPIResponse.self, from: ctxData)
+        XCTAssertEqual(ctx.budgets.first { $0.taskId == customTask.taskId }?.focusedMinutes ?? 0, 65.0, accuracy: 0.01)
+        XCTAssertEqual(ctx.budgets.first { $0.taskId == "ecommerce-ops" }?.focusedMinutes ?? 0, 55.0, accuracy: 0.01)
+        XCTAssertGreaterThanOrEqual(ctx.activity.sessionCount, 1)
+        XCTAssertTrue(ctx.activity.recentWindows.contains { $0.windowTitle == "DayHelmEngine.swift — focus-guard" })
+        XCTAssertTrue(ctx.activity.recentWindows.contains { $0.windowTitle == "Swift Concurrency Docs" })
+        XCTAssertFalse(ctx.activity.recentWindows.contains { ($0.windowTitle ?? "").contains("Vault Master Password") })
+        XCTAssertTrue(ctx.activity.ocrHighlights.contains { $0.text.contains("Terminal") || $0.text.contains("Xcode") || $0.text.contains("Concurrency") })
+
+        let (sessData, sessResp) = try await urlSession.data(from: URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/sessions")!)
+        XCTAssertEqual((sessResp as? HTTPURLResponse)?.statusCode, 200)
+        let sessJSON = String(data: sessData, encoding: .utf8) ?? ""
+        XCTAssertTrue(sessJSON.contains(ctx.activity.sessions[0].id))
+
+        let cliResult = DayHelmCLI.run(
+            arguments: ["dayhelm", "query", "--today", "--format", "json", "--store-dir", tmpDir.path],
+            clock: clock
+        )
+        XCTAssertEqual(cliResult?.exitCode, 0)
+        let cliOut = cliResult?.stdout ?? ""
+        XCTAssertTrue(cliOut.contains(customTask.taskId))
+        XCTAssertTrue(cliOut.contains("DayHelmEngine.swift — focus-guard"))
+        XCTAssertTrue(cliOut.contains("Swift Concurrency Docs"))
+        XCTAssertFalse(cliOut.contains("Vault Master Password"))
+        XCTAssertTrue(cliOut.contains("Concurrency") || cliOut.contains("Terminal") || cliOut.contains("DayHelmEngine"))
+
+        let cliJSONObj = try JSONSerialization.jsonObject(with: Data(cliOut.utf8)) as? [String: Any]
+        let cliBudgets = cliJSONObj?["budgets"] as? [[String: Any]] ?? []
+        let cliCustomMinutes = cliBudgets.first { ($0["taskId"] as? String) == customTask.taskId }?["focusedMinutes"] as? Double
+        XCTAssertEqual(cliCustomMinutes ?? 0, 65.0, accuracy: 0.01)
+
+        // 00:05 next day (2026-11-18): Rollover archives 2026-11-17.json and resets counters to 0
+        let nextDay = DayHelmDateFormatting.parseISO8601("2026-11-18T00:05:00+08:00")!
+        clock.advance(by: nextDay.timeIntervalSince(clock.now()))
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Finder",
+            bundleId: "com.apple.finder",
+            windowTitle: "Desktop",
+            url: nil,
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+
+        let archivedURL = store.daysDirectory.appendingPathComponent("2026-11-17.json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: archivedURL.path))
+        let archivedSnap = try store.loadDay(dateString: "2026-11-17")
+        XCTAssertEqual(archivedSnap?.budgets.first { $0.taskId == customTask.taskId }?.focusedMinutes ?? 0, 65.0, accuracy: 0.01)
+
+        let nextDayProgress = await MainActor.run { coordinator.taskProgressList }
+        XCTAssertTrue(nextDayProgress.allSatisfy { $0.focusedMinutes == 0 })
+        let nextSessionState = await MainActor.run { coordinator.sessionState }
+        XCTAssertEqual(nextSessionState, .unassigned)
+        XCTAssertEqual((try store.loadToday())?.date, "2026-11-18")
+    }
+
+    func testAlmaTimeAuditContractCompatibilityE2E() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-xct-alma-contract-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+        let e1 = try db.insertEvent(
+            timestampMs: t0Ms,
+            kind: "app_focus",
+            appName: "Google Chrome",
+            windowTitle: "Example Shop Orders",
+            url: "https://shop.example.com/orders",
+            data: ["bundleId": "com.google.Chrome", "appName": "Google Chrome"],
+            declaredTaskId: "ecommerce",
+            project: "ecommerce"
+        )
+        let snap1 = try db.insertSnapshot(
+            sessionId: e1.sessionId,
+            timestampMs: t0Ms + 15_000,
+            filePath: store.snapshotsDirectory.appendingPathComponent("2026-11-17/c1.jpg").path,
+            width: 1440,
+            height: 900,
+            sizeBytes: 12_345,
+            trigger: "app_focus",
+            appName: "Google Chrome",
+            windowTitle: "Example Shop Orders",
+            declaredTaskId: "ecommerce",
+            project: "ecommerce"
+        )
+        _ = try db.insertOCRFrame(
+            snapshotId: snap1.id,
+            sessionId: e1.sessionId,
+            text: "Order #9921 Shipped",
+            createdAtMs: t0Ms + 15_000
+        )
+        try db.closeSession(sessionId: e1.sessionId, endedAtMs: t0Ms + 120_000)
+
+        let server = LocalActivityHTTPServer(
+            database: db,
+            store: store,
+            clock: ManualClock(now: t0.addingTimeInterval(120)),
+            stateProvider: { LocalActivityHTTPServer.RuntimeState(axTrusted: true, screenCaptureTrusted: true, deepRecordingEnabled: true) }
+        )
+        let ports = await server.start(primaryPort: 0, fallbackPort: nil)
+        defer { server.stop() }
+        let port = try XCTUnwrap(ports.first)
+
+        let urlSession = URLSession(configuration: .ephemeral)
+
+        let (statusData, statusResp) = try await urlSession.data(from: URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/status")!)
+        XCTAssertEqual((statusResp as? HTTPURLResponse)?.statusCode, 200)
+        let statusJSON = try JSONSerialization.jsonObject(with: statusData) as? [String: Any]
+        XCTAssertTrue(isJSONBoolean(statusJSON?["running"]))
+        XCTAssertEqual(statusJSON?["running"] as? Bool, true)
+
+        let sinceMs = t0Ms - 60_000
+        let untilMs = t0Ms + 300_000
+        let listURL = URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/sessions?limit=2000&since=\(sinceMs)&until=\(untilMs)")!
+        let (listData, listResp) = try await urlSession.data(from: listURL)
+        XCTAssertEqual((listResp as? HTTPURLResponse)?.statusCode, 200)
+        let listJSON = try JSONSerialization.jsonObject(with: listData) as? [String: Any]
+        let sessions = try XCTUnwrap(listJSON?["sessions"] as? [[String: Any]])
+        XCTAssertEqual(sessions.count, 1)
+        let s0 = sessions[0]
+        XCTAssertTrue(s0["id"] is String)
+        XCTAssertTrue(isJSONInteger(s0["startedAt"]))
+        XCTAssertTrue(isJSONInteger(s0["endedAt"]))
+        XCTAssertTrue(isJSONInteger(s0["durationMs"]))
+        XCTAssertTrue(s0["appNames"] is [String])
+        XCTAssertTrue(s0["analysisStatus"] is String)
+        XCTAssertTrue(s0["analysisTitle"] is String)
+        XCTAssertTrue(s0["analysisDescription"] is String)
+        XCTAssertTrue(s0["project"] is String)
+        XCTAssertTrue(s0["highlights"] is [String])
+
+        let detailURL = URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/sessions/\(e1.sessionId)")!
+        let (detailData, detailResp) = try await urlSession.data(from: detailURL)
+        XCTAssertEqual((detailResp as? HTTPURLResponse)?.statusCode, 200)
+        let detailJSON = try JSONSerialization.jsonObject(with: detailData) as? [String: Any]
+        let events = try XCTUnwrap(detailJSON?["events"] as? [[String: Any]])
+        XCTAssertEqual(events.count, 1)
+        XCTAssertTrue(events[0]["kind"] is String)
+        XCTAssertTrue(isJSONInteger(events[0]["timestamp"]))
+        XCTAssertTrue(events[0]["appName"] is String)
+        XCTAssertTrue(events[0]["data"] is [String: Any])
+
+        let snapshots = try XCTUnwrap(detailJSON?["snapshots"] as? [[String: Any]])
+        XCTAssertEqual(snapshots.count, 1)
+        XCTAssertTrue(snapshots[0]["trigger"] is String)
+        XCTAssertTrue(snapshots[0]["appName"] is String)
+        XCTAssertTrue(snapshots[0]["windowTitle"] is String)
+    }
+
+    func testSubprocessBinaryCLIAndExitCodesE2E() throws {
+        let appBinary = try resolveDayHelmAppExecutableURL()
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-xct-proc-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let now = Date()
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: now))
+        engine.startFocus(taskId: "ecommerce", note: "Subprocess CLI E2E", at: now.addingTimeInterval(-300))
+        engine.ingest(ActivitySample(
+            timestamp: now,
+            appName: "Editor",
+            bundleId: "com.example.editor",
+            windowTitle: "Subprocess keyword window",
+            url: "https://docs.example.com/keyword",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        ))
+        try store.saveToday(engine.snapshot(at: now))
+
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+        let ev = try db.insertEvent(
+            timestampMs: nowMs - 60_000,
+            kind: "app_focus",
+            appName: "Editor",
+            windowTitle: "Subprocess keyword window",
+            url: "https://docs.example.com/keyword",
+            declaredTaskId: "ecommerce"
+        )
+        let snap = try db.insertSnapshot(
+            sessionId: ev.sessionId,
+            timestampMs: nowMs - 30_000,
+            filePath: store.snapshotsDirectory.appendingPathComponent("snap.jpg").path,
+            width: 800,
+            height: 600,
+            sizeBytes: 2048,
+            appName: "Editor",
+            windowTitle: "Subprocess keyword window"
+        )
+        _ = try db.insertOCRFrame(
+            snapshotId: snap.id,
+            sessionId: ev.sessionId,
+            text: "DayHelm subprocess keyword OCR verification",
+            createdAtMs: nowMs - 30_000
+        )
+
+        let helpProc = try runProcess(executableURL: appBinary, arguments: ["--help"])
+        XCTAssertEqual(helpProc.exitCode, 0)
+        XCTAssertTrue(helpProc.stdout.contains("Usage:") && helpProc.stdout.contains("dayhelm"))
+
+        let statusProc = try runProcess(executableURL: appBinary, arguments: ["status", "--store-dir", tmpDir.path])
+        XCTAssertEqual(statusProc.exitCode, 0)
+        XCTAssertTrue(statusProc.stdout.contains("DayHelm Status") && statusProc.stdout.contains("电商做深"))
+
+        let queryProc = try runProcess(executableURL: appBinary, arguments: ["query", "--today", "--format", "md", "--store-dir", tmpDir.path])
+        XCTAssertEqual(queryProc.exitCode, 0)
+        XCTAssertTrue(queryProc.stdout.contains("# DayHelm Activity Context") && queryProc.stdout.contains("keyword"))
+
+        let searchProc = try runProcess(executableURL: appBinary, arguments: ["search", "keyword", "--store-dir", tmpDir.path])
+        XCTAssertEqual(searchProc.exitCode, 0)
+        XCTAssertTrue(searchProc.stdout.contains("# DayHelm Search") && searchProc.stdout.contains("keyword"))
+
+        let purgeProc = try runProcess(executableURL: appBinary, arguments: ["purge", "--store-dir", tmpDir.path])
+        XCTAssertEqual(purgeProc.exitCode, 0)
+        XCTAssertTrue(purgeProc.stdout.contains("DayHelm purge completed"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.todayURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.databaseURL.path))
+
+        let unknownProc = try runProcess(executableURL: appBinary, arguments: ["unknown-flag"])
+        XCTAssertNotEqual(unknownProc.exitCode, 0)
+        XCTAssertFalse(unknownProc.stderr.isEmpty)
+    }
+
+    func testConcurrentSQLiteReaderWriterStressWALModeE2E() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-xct-stress-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+        engine.startFocus(taskId: "ecommerce", at: t0)
+        let daySnap = engine.snapshot(at: t0.addingTimeInterval(600))
+        try store.saveToday(daySnap)
+
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+        XCTAssertEqual(try db.journalMode().lowercased(), "wal")
+
+        let server = LocalActivityHTTPServer(
+            database: db,
+            store: store,
+            clock: ManualClock(now: t0.addingTimeInterval(600)),
+            stateProvider: {
+                LocalActivityHTTPServer.RuntimeState(
+                    axTrusted: true,
+                    screenCaptureTrusted: true,
+                    deepRecordingEnabled: true,
+                    daySnapshot: daySnap
+                )
+            }
+        )
+        let ports = await server.start(primaryPort: 0, fallbackPort: nil)
+        defer { server.stop() }
+        let port = try XCTUnwrap(ports.first)
+
+        let contextURL = URL(string: "http://127.0.0.1:\(port)/api/dayhelm/context")!
+        let urlSession = URLSession(configuration: .ephemeral)
+        let dec = DayHelmDateFormatting.makeDecoder()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                for i in 0..<50 {
+                    _ = try db.insertEvent(
+                        timestampMs: t0Ms + Int64(i * 2000),
+                        kind: i % 5 == 0 ? "browser_visit" : "app_focus",
+                        appName: i % 2 == 0 ? "Xcode" : "Terminal",
+                        windowTitle: "StressWindow-\(i)",
+                        url: i % 5 == 0 ? "https://example.com/stress/\(i)" : nil,
+                        declaredTaskId: "ecommerce"
+                    )
+                    try await Task.sleep(nanoseconds: 2_000_000)
+                }
+            }
+
+            group.addTask {
+                for i in 0..<25 {
+                    let snap = try db.insertSnapshot(
+                        timestampMs: t0Ms + Int64(i * 4000) + 500,
+                        filePath: store.snapshotsDirectory.appendingPathComponent("2026-11-17/stress-\(i).jpg").path,
+                        width: 1280,
+                        height: 720,
+                        sizeBytes: 4096,
+                        trigger: "visual_change",
+                        appName: "Xcode",
+                        windowTitle: "StressWindow-\(i)",
+                        declaredTaskId: "ecommerce"
+                    )
+                    _ = try db.insertOCRFrame(
+                        snapshotId: snap.id,
+                        sessionId: snap.sessionId,
+                        text: "StressOCR frame payload \(i)",
+                        createdAtMs: t0Ms + Int64(i * 4000) + 500
+                    )
+                    try await Task.sleep(nanoseconds: 3_000_000)
+                }
+            }
+
+            group.addTask {
+                for _ in 0..<25 {
+                    let (data, resp) = try await urlSession.data(from: contextURL)
+                    XCTAssertEqual((resp as? HTTPURLResponse)?.statusCode, 200)
+                    _ = try dec.decode(DayHelmContextAPIResponse.self, from: data)
+                    try await Task.sleep(nanoseconds: 3_000_000)
+                }
+            }
+
+            group.addTask {
+                for _ in 0..<15 {
+                    let res = DayHelmCLI.run(
+                        arguments: ["dayhelm", "query", "--today", "--format", "json", "--store-dir", tmpDir.path],
+                        clock: ManualClock(now: t0.addingTimeInterval(600))
+                    )
+                    XCTAssertEqual(res?.exitCode, 0)
+                    try await Task.sleep(nanoseconds: 4_000_000)
+                }
+            }
+
+            try await group.waitForAll()
+        }
+
+        let counts = try db.todayCounts(dayStartMs: t0Ms - 1000, dayEndMs: t0Ms + 86_400_000)
+        XCTAssertEqual(counts.events, 50)
+        XCTAssertEqual(counts.snapshots, 25)
+        XCTAssertEqual(counts.ocrFrames, 25)
+        XCTAssertEqual(try db.integrityCheck().lowercased(), "ok")
+        XCTAssertEqual((try db.search(keyword: "StressOCR", limit: 50)).count, 25)
+    }
+
+    private func waitUntil(
+        _ description: String,
+        timeoutSeconds: TimeInterval = 8.0,
+        condition: @escaping @Sendable () async -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if await condition() {
+                return
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        throw NSError(domain: "DayHelmCoreTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for: \(description)"])
+    }
+
+    private func isJSONBoolean(_ value: Any?) -> Bool {
+        guard let num = value as? NSNumber else { return false }
+        return CFGetTypeID(num) == CFBooleanGetTypeID()
+    }
+
+    private func isJSONInteger(_ value: Any?) -> Bool {
+        guard let num = value as? NSNumber else { return false }
+        return CFGetTypeID(num) != CFBooleanGetTypeID()
+    }
+
+    private func resolveDayHelmAppExecutableURL() throws -> URL {
+        let fm = FileManager.default
+        var candidates: [URL] = []
+
+        for bundle in Bundle.allBundles {
+            candidates.append(bundle.bundleURL.deletingLastPathComponent().appendingPathComponent("DayHelmApp"))
+        }
+        if let mainExecDir = Bundle.main.executableURL?.deletingLastPathComponent() {
+            candidates.append(mainExecDir.appendingPathComponent("DayHelmApp"))
+        }
+
+        let sourceURL = URL(fileURLWithPath: #filePath)
+        var repoRoot = sourceURL.deletingLastPathComponent()
+        while repoRoot.path != "/" {
+            if fm.fileExists(atPath: repoRoot.appendingPathComponent("Package.swift").path) {
+                break
+            }
+            repoRoot = repoRoot.deletingLastPathComponent()
+        }
+
+        candidates.append(repoRoot.appendingPathComponent(".build/arm64-apple-macosx/debug/DayHelmApp"))
+        candidates.append(repoRoot.appendingPathComponent(".build/debug/DayHelmApp"))
+        candidates.append(repoRoot.appendingPathComponent(".build/release/DayHelmApp"))
+
+        for url in candidates where fm.isExecutableFile(atPath: url.path) {
+            return url
+        }
+
+        let buildProc = try runProcess(
+            executableURL: URL(fileURLWithPath: "/usr/bin/swift"),
+            arguments: ["build", "--product", "DayHelmApp"],
+            currentDirectoryURL: repoRoot,
+            timeoutSeconds: 60.0
+        )
+        guard buildProc.exitCode == 0 else {
+            throw NSError(domain: "DayHelmCoreTests", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to build DayHelmApp: \(buildProc.stderr)"])
+        }
+
+        for url in candidates where fm.isExecutableFile(atPath: url.path) {
+            return url
+        }
+        throw NSError(domain: "DayHelmCoreTests", code: 3, userInfo: [NSLocalizedDescriptionKey: "Unable to locate compiled DayHelmApp executable"])
+    }
+
+    private func runProcess(
+        executableURL: URL,
+        arguments: [String],
+        currentDirectoryURL: URL? = nil,
+        timeoutSeconds: TimeInterval = 15.0
+    ) throws -> (exitCode: Int32, stdout: String, stderr: String) {
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        if let currentDirectoryURL {
+            process.currentDirectoryURL = currentDirectoryURL
+        }
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        let doneSemaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            doneSemaphore.signal()
+        }
+
+        try process.run()
+        let waitResult = doneSemaphore.wait(timeout: .now() + timeoutSeconds)
+        if waitResult == .timedOut {
+            process.terminate()
+            throw NSError(domain: "DayHelmCoreTests", code: 4, userInfo: [NSLocalizedDescriptionKey: "Process timed out"])
+        }
+
+        let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        return (
+            exitCode: process.terminationStatus,
+            stdout: String(data: outData, encoding: .utf8) ?? "",
+            stderr: String(data: errData, encoding: .utf8) ?? ""
+        )
+    }
+
     private func makeSyntheticTextImage(text: String, backgroundWhite: Bool, width: Int = 960, height: Int = 240) throws -> CGImage {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
@@ -886,10 +1630,44 @@ struct DayHelmCoreTests {
     }
 
     private final class MockInspector: ActivityInspecting, @unchecked Sendable {
-        var isAccessibilityTrusted: Bool = true
-        let sample: ActivitySample
-        init(sample: ActivitySample) { self.sample = sample }
-        func inspectCurrent() -> ActivitySample { sample }
+        var isAccessibilityTrusted: Bool
+        var currentSample: ActivitySample
+        init(sample: ActivitySample, isAccessibilityTrusted: Bool = true) {
+            self.isAccessibilityTrusted = isAccessibilityTrusted
+            self.currentSample = sample
+        }
+        func inspectCurrent() -> ActivitySample { currentSample }
+    }
+
+    private final class MockScreenCapturer: ScreenCapturing, @unchecked Sendable {
+        private let lock = NSLock()
+        private var currentImage: CGImage
+        let isScreenCaptureTrusted: Bool
+
+        init(image: CGImage, isScreenCaptureTrusted: Bool = true) {
+            self.currentImage = image
+            self.isScreenCaptureTrusted = isScreenCaptureTrusted
+        }
+
+        func setImage(_ image: CGImage) {
+            lock.withLock {
+                currentImage = image
+            }
+        }
+
+        private func readCurrentImage() -> CGImage {
+            lock.withLock {
+                currentImage
+            }
+        }
+
+        func requestScreenCapturePermission() -> Bool {
+            isScreenCaptureTrusted
+        }
+
+        func captureMainDisplayImage() async throws -> CGImage {
+            readCurrentImage()
+        }
     }
 
     @Test("AlmaActivityClient splits concatenated tab URLs without false positives")
@@ -1275,6 +2053,720 @@ struct DayHelmCoreTests {
         let pruned = try db.pruneOldSnapshots(olderThanDays: 7, snapshotsRootDir: store.snapshotsDirectory, now: t0)
         #expect(pruned.deletedFiles == 1)
         #expect(!FileManager.default.fileExists(atPath: oldJPEG.path))
+    }
+
+    @Test("Full-day E2E coordinator pipeline covers focus, redaction, OCR, snooze, HTTP/CLI, and rollover")
+    func fullDayE2ECoordinatorPipelineMorningToRollover() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-e2e-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate() // 2026-11-17T09:00:00+08:00
+        let clock = ManualClock(now: t0)
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+        let imgXcode1 = try makeSyntheticTextImage(text: "Xcode DayHelmEngine Pipeline", backgroundWhite: true)
+        let imgTerminal = try makeSyntheticTextImage(text: "Terminal Swift Test Runner", backgroundWhite: false)
+        let imgChrome = try makeSyntheticTextImage(text: "Swift Concurrency Documentation", backgroundWhite: true)
+        let imgXcode2 = try makeSyntheticTextImage(text: "DayHelmChecks Main Verification", backgroundWhite: false)
+
+        let capturer = MockScreenCapturer(image: imgXcode1, isScreenCaptureTrusted: true)
+        let recorder = NativeScreenRecorder(
+            database: db,
+            snapshotsRootDir: store.snapshotsDirectory,
+            capturer: capturer,
+            clock: clock
+        )
+        let inspector = MockInspector(
+            sample: ActivitySample(
+                timestamp: t0,
+                appName: "Xcode",
+                bundleId: "com.apple.dt.Xcode",
+                windowTitle: "DayHelmEngine.swift — focus-guard",
+                url: nil,
+                idleSeconds: 0,
+                screenLocked: false,
+                inputActive: true
+            ),
+            isAccessibilityTrusted: true
+        )
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: clock)
+        let coordinator = await MainActor.run {
+            HybridActivityCoordinator(
+                engine: engine,
+                store: store,
+                almaClient: nil,
+                inspector: inspector,
+                clock: clock,
+                syntheticDemo: false,
+                database: db,
+                screenRecorder: recorder,
+                httpServer: nil
+            )
+        }
+
+        let httpServer = LocalActivityHTTPServer(
+            database: db,
+            store: store,
+            clock: clock,
+            stateProvider: { coordinator.currentRuntimeState() }
+        )
+        let ports = await httpServer.start(primaryPort: 0, fallbackPort: nil)
+        defer { httpServer.stop() }
+        let port = try #require(ports.first)
+
+        // 09:00: User adds custom task "独立开发 · DayHelm" (target 60m, cap 90m) and starts focus
+        let customTask = await MainActor.run { () -> TaskBudget in
+            let created = coordinator.addTask(
+                displayName: "独立开发 · DayHelm",
+                colorHex: "#3B82F6",
+                targetMinutes: 60,
+                capMinutes: 90,
+                keywords: ["xcode", "dayhelm", "swift"]
+            )
+            coordinator.selectTask(created.taskId, note: "Full-day E2E pipeline")
+            return created
+        }
+
+        // 09:00: Xcode sample + snapshot #1 + OCR #1
+        await MainActor.run { coordinator.pollOnce() }
+        try await waitUntil("Snapshot #1 + OCR #1 recorded") {
+            await MainActor.run { coordinator.todaySnapshotCount >= 1 && coordinator.todayOCRCount >= 1 }
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        // 09:15: Terminal sample + snapshot #2 + OCR #2
+        clock.advance(by: 15 * 60)
+        capturer.setImage(imgTerminal)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Terminal",
+            bundleId: "com.apple.Terminal",
+            windowTitle: "swift test — focus-guard",
+            url: nil,
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        try await waitUntil("Snapshot #2 + OCR #2 recorded") {
+            await MainActor.run { coordinator.todaySnapshotCount >= 2 && coordinator.todayOCRCount >= 2 }
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        // 09:30: Sensitive 1Password sample -> MUST redact and produce 0 snapshots/OCR
+        clock.advance(by: 15 * 60)
+        capturer.setImage(imgChrome)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "1Password",
+            bundleId: "com.1password.1password",
+            windowTitle: "Vault Master Password",
+            url: "https://vault.1password.com/item?secret=topsecret",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+        let after1Pass = await MainActor.run { (coordinator.latestSample, coordinator.todaySnapshotCount) }
+        #expect(after1Pass.0?.redacted == true)
+        #expect(after1Pass.0?.windowTitle == nil)
+        #expect(after1Pass.0?.url == nil)
+        #expect(after1Pass.1 == 2)
+
+        // 09:45: Chrome sample + snapshot #3 + OCR #3
+        clock.advance(by: 15 * 60)
+        capturer.setImage(imgChrome)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Google Chrome",
+            bundleId: "com.google.Chrome",
+            windowTitle: "Swift Concurrency Docs",
+            url: "https://docs.swift.org/concurrency?token=secret123&page=1",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        try await waitUntil("Snapshot #3 + OCR #3 recorded") {
+            await MainActor.run { coordinator.todaySnapshotCount >= 3 && coordinator.todayOCRCount >= 3 }
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        // 10:00: Xcode sample -> reaches 60m -> targetMet alert fires + snapshot #4 + OCR #4
+        clock.advance(by: 15 * 60)
+        capturer.setImage(imgXcode2)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Xcode",
+            bundleId: "com.apple.dt.Xcode",
+            windowTitle: "DayHelmChecks — main.swift",
+            url: nil,
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        try await waitUntil("Snapshot #4 + OCR #4 recorded") {
+            await MainActor.run { coordinator.todaySnapshotCount >= 4 && coordinator.todayOCRCount >= 4 }
+        }
+        try await Task.sleep(nanoseconds: 30_000_000)
+        let alert1000 = await MainActor.run { coordinator.activeAlert }
+        if case .quotaTargetMet(taskId: let alertedTask, _, target: 60) = alert1000?.kind {
+            #expect(alertedTask == customTask.taskId)
+        } else {
+            Issue.record("Expected quotaTargetMet alert at 60m, got \(String(describing: alert1000))")
+        }
+
+        // 10:05: Terminal sample -> 65m cross-app total
+        clock.advance(by: 5 * 60)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Terminal",
+            bundleId: "com.apple.Terminal",
+            windowTitle: "git status — focus-guard",
+            url: nil,
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        let customProgress = await MainActor.run {
+            coordinator.taskProgressList.first { $0.budget.taskId == customTask.taskId }
+        }
+        #expect(abs((customProgress?.focusedMinutes ?? 0) - 65.0) < 0.01)
+
+        // 10:05 -> 10:35: Switch to "电商日常运营" (cap 30m)
+        await MainActor.run {
+            coordinator.selectTask("ecommerce-ops", note: "Daily support queue")
+        }
+        clock.advance(by: 30 * 60)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Google Chrome",
+            bundleId: "com.google.Chrome",
+            windowTitle: "Support Ticket #301",
+            url: "https://ops.example.com/tickets/301",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        let capAlert = await MainActor.run { coordinator.activeAlert }
+        if case .quotaCapReached(taskId: "ecommerce-ops", _, cap: 30) = capAlert?.kind {
+            // OK
+        } else {
+            Issue.record("Expected quotaCapReached for ecommerce-ops at 10:35, got \(String(describing: capAlert))")
+        }
+
+        // User snoozes 15m via coordinator.handleAlertAction
+        await MainActor.run {
+            coordinator.handleAlertAction(.snooze(minutes: 15, label: "+15m 收尾"))
+        }
+        let clearedAlert = await MainActor.run { coordinator.activeAlert }
+        #expect(clearedAlert == nil)
+
+        // 10:40 (+5m): Alert stays suppressed
+        clock.advance(by: 5 * 60)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Google Chrome",
+            bundleId: "com.google.Chrome",
+            windowTitle: "Support Ticket #302",
+            url: "https://ops.example.com/tickets/302",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        let suppressedAlert = await MainActor.run { coordinator.activeAlert }
+        #expect(suppressedAlert == nil)
+
+        // 10:51 (+11m, total 16m past snooze): Alert re-arms
+        clock.advance(by: 11 * 60)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Google Chrome",
+            bundleId: "com.google.Chrome",
+            windowTitle: "Support Ticket #303",
+            url: "https://ops.example.com/tickets/303",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        let rearmedAlert = await MainActor.run { coordinator.activeAlert }
+        if case .quotaCapReached(taskId: "ecommerce-ops", _, cap: 30) = rearmedAlert?.kind {
+            // OK
+        } else {
+            Issue.record("Expected quotaCapReached to re-arm after 15m snooze")
+        }
+
+        // 11:00 (+9m): Verify HTTP server + CLI return exact accumulated task minutes, sessions, window titles & OCR
+        clock.advance(by: 9 * 60)
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Google Chrome",
+            bundleId: "com.google.Chrome",
+            windowTitle: "Support Ticket #304",
+            url: "https://ops.example.com/tickets/304",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+        try await Task.sleep(nanoseconds: 120_000_000)
+
+        let urlSession = URLSession(configuration: .ephemeral)
+        let dec = DayHelmDateFormatting.makeDecoder()
+
+        let (ctxData, ctxResp) = try await urlSession.data(from: URL(string: "http://127.0.0.1:\(port)/api/dayhelm/context")!)
+        #expect((ctxResp as? HTTPURLResponse)?.statusCode == 200)
+        let ctx = try dec.decode(DayHelmContextAPIResponse.self, from: ctxData)
+        #expect(abs((ctx.budgets.first { $0.taskId == customTask.taskId }?.focusedMinutes ?? 0) - 65.0) < 0.01)
+        #expect(abs((ctx.budgets.first { $0.taskId == "ecommerce-ops" }?.focusedMinutes ?? 0) - 55.0) < 0.01)
+        #expect(ctx.activity.sessionCount >= 1)
+        #expect(ctx.activity.recentWindows.contains { $0.windowTitle == "DayHelmEngine.swift — focus-guard" })
+        #expect(ctx.activity.recentWindows.contains { $0.windowTitle == "Swift Concurrency Docs" })
+        #expect(!ctx.activity.recentWindows.contains { ($0.windowTitle ?? "").contains("Vault Master Password") })
+        #expect(ctx.activity.ocrHighlights.contains { $0.text.contains("Terminal") || $0.text.contains("Xcode") || $0.text.contains("Concurrency") })
+
+        let (sessData, sessResp) = try await urlSession.data(from: URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/sessions")!)
+        #expect((sessResp as? HTTPURLResponse)?.statusCode == 200)
+        let sessJSON = String(data: sessData, encoding: .utf8) ?? ""
+        #expect(sessJSON.contains(ctx.activity.sessions[0].id))
+
+        let cliResult = DayHelmCLI.run(
+            arguments: ["dayhelm", "query", "--today", "--format", "json", "--store-dir", tmpDir.path],
+            clock: clock
+        )
+        #expect(cliResult?.exitCode == 0)
+        let cliOut = cliResult?.stdout ?? ""
+        #expect(cliOut.contains(customTask.taskId))
+        #expect(cliOut.contains("DayHelmEngine.swift — focus-guard"))
+        #expect(cliOut.contains("Swift Concurrency Docs"))
+        #expect(!cliOut.contains("Vault Master Password"))
+        #expect(cliOut.contains("Concurrency") || cliOut.contains("Terminal") || cliOut.contains("DayHelmEngine"))
+
+        let cliJSONObj = try JSONSerialization.jsonObject(with: Data(cliOut.utf8)) as? [String: Any]
+        let cliBudgets = cliJSONObj?["budgets"] as? [[String: Any]] ?? []
+        let cliCustomMinutes = cliBudgets.first { ($0["taskId"] as? String) == customTask.taskId }?["focusedMinutes"] as? Double
+        #expect(abs((cliCustomMinutes ?? 0) - 65.0) < 0.01)
+
+        // 00:05 next day (2026-11-18): Rollover archives 2026-11-17.json and resets counters to 0
+        let nextDay = DayHelmDateFormatting.parseISO8601("2026-11-18T00:05:00+08:00")!
+        clock.advance(by: nextDay.timeIntervalSince(clock.now()))
+        inspector.currentSample = ActivitySample(
+            timestamp: clock.now(),
+            appName: "Finder",
+            bundleId: "com.apple.finder",
+            windowTitle: "Desktop",
+            url: nil,
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        )
+        await MainActor.run { coordinator.pollOnce() }
+
+        let archivedURL = store.daysDirectory.appendingPathComponent("2026-11-17.json")
+        #expect(FileManager.default.fileExists(atPath: archivedURL.path))
+        let archivedSnap = try store.loadDay(dateString: "2026-11-17")
+        #expect(abs((archivedSnap?.budgets.first { $0.taskId == customTask.taskId }?.focusedMinutes ?? 0) - 65.0) < 0.01)
+
+        let nextDayProgress = await MainActor.run { coordinator.taskProgressList }
+        #expect(nextDayProgress.allSatisfy { $0.focusedMinutes == 0 })
+        let nextSessionState = await MainActor.run { coordinator.sessionState }
+        #expect(nextSessionState == .unassigned)
+        #expect((try store.loadToday())?.date == "2026-11-18")
+    }
+
+    @Test("LocalActivityHTTPServer matches exact alma-time-audit JSON key and type contract")
+    func almaTimeAuditContractCompatibilityE2E() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-alma-contract-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+
+        let e1 = try db.insertEvent(
+            timestampMs: t0Ms,
+            kind: "app_focus",
+            appName: "Google Chrome",
+            windowTitle: "Example Shop Orders",
+            url: "https://shop.example.com/orders",
+            data: ["bundleId": "com.google.Chrome", "appName": "Google Chrome"],
+            declaredTaskId: "ecommerce",
+            project: "ecommerce"
+        )
+        let snap1 = try db.insertSnapshot(
+            sessionId: e1.sessionId,
+            timestampMs: t0Ms + 15_000,
+            filePath: store.snapshotsDirectory.appendingPathComponent("2026-11-17/c1.jpg").path,
+            width: 1440,
+            height: 900,
+            sizeBytes: 12_345,
+            trigger: "app_focus",
+            appName: "Google Chrome",
+            windowTitle: "Example Shop Orders",
+            declaredTaskId: "ecommerce",
+            project: "ecommerce"
+        )
+        _ = try db.insertOCRFrame(
+            snapshotId: snap1.id,
+            sessionId: e1.sessionId,
+            text: "Order #9921 Shipped",
+            createdAtMs: t0Ms + 15_000
+        )
+        try db.closeSession(sessionId: e1.sessionId, endedAtMs: t0Ms + 120_000)
+
+        let server = LocalActivityHTTPServer(
+            database: db,
+            store: store,
+            clock: ManualClock(now: t0.addingTimeInterval(120)),
+            stateProvider: { LocalActivityHTTPServer.RuntimeState(axTrusted: true, screenCaptureTrusted: true, deepRecordingEnabled: true) }
+        )
+        let ports = await server.start(primaryPort: 0, fallbackPort: nil)
+        defer { server.stop() }
+        let port = try #require(ports.first)
+
+        let urlSession = URLSession(configuration: .ephemeral)
+
+        let (statusData, statusResp) = try await urlSession.data(from: URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/status")!)
+        #expect((statusResp as? HTTPURLResponse)?.statusCode == 200)
+        let statusJSON = try JSONSerialization.jsonObject(with: statusData) as? [String: Any]
+        #expect(isJSONBoolean(statusJSON?["running"]))
+        #expect(statusJSON?["running"] as? Bool == true)
+
+        let sinceMs = t0Ms - 60_000
+        let untilMs = t0Ms + 300_000
+        let listURL = URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/sessions?limit=2000&since=\(sinceMs)&until=\(untilMs)")!
+        let (listData, listResp) = try await urlSession.data(from: listURL)
+        #expect((listResp as? HTTPURLResponse)?.statusCode == 200)
+        let listJSON = try JSONSerialization.jsonObject(with: listData) as? [String: Any]
+        let sessions = try #require(listJSON?["sessions"] as? [[String: Any]])
+        #expect(sessions.count == 1)
+        let s0 = sessions[0]
+        #expect(s0["id"] is String)
+        #expect(isJSONInteger(s0["startedAt"]))
+        #expect(isJSONInteger(s0["endedAt"]))
+        #expect(isJSONInteger(s0["durationMs"]))
+        #expect(s0["appNames"] is [String])
+        #expect(s0["analysisStatus"] is String)
+        #expect(s0["analysisTitle"] is String)
+        #expect(s0["analysisDescription"] is String)
+        #expect(s0["project"] is String)
+        #expect(s0["highlights"] is [String])
+
+        let detailURL = URL(string: "http://127.0.0.1:\(port)/api/activity-recorder/sessions/\(e1.sessionId)")!
+        let (detailData, detailResp) = try await urlSession.data(from: detailURL)
+        #expect((detailResp as? HTTPURLResponse)?.statusCode == 200)
+        let detailJSON = try JSONSerialization.jsonObject(with: detailData) as? [String: Any]
+        let events = try #require(detailJSON?["events"] as? [[String: Any]])
+        #expect(events.count == 1)
+        #expect(events[0]["kind"] is String)
+        #expect(isJSONInteger(events[0]["timestamp"]))
+        #expect(events[0]["appName"] is String)
+        #expect(events[0]["data"] is [String: Any])
+
+        let snapshots = try #require(detailJSON?["snapshots"] as? [[String: Any]])
+        #expect(snapshots.count == 1)
+        #expect(snapshots[0]["trigger"] is String)
+        #expect(snapshots[0]["appName"] is String)
+        #expect(snapshots[0]["windowTitle"] is String)
+    }
+
+    @Test("Compiled DayHelmApp binary executes CLI subcommands and returns expected exit codes")
+    func subprocessBinaryCLIAndExitCodesE2E() throws {
+        let appBinary = try resolveDayHelmAppExecutableURL()
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-proc-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let now = Date()
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: now))
+        engine.startFocus(taskId: "ecommerce", note: "Subprocess CLI E2E", at: now.addingTimeInterval(-300))
+        engine.ingest(ActivitySample(
+            timestamp: now,
+            appName: "Editor",
+            bundleId: "com.example.editor",
+            windowTitle: "Subprocess keyword window",
+            url: "https://docs.example.com/keyword",
+            idleSeconds: 0,
+            screenLocked: false,
+            inputActive: true
+        ))
+        try store.saveToday(engine.snapshot(at: now))
+
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+        let ev = try db.insertEvent(
+            timestampMs: nowMs - 60_000,
+            kind: "app_focus",
+            appName: "Editor",
+            windowTitle: "Subprocess keyword window",
+            url: "https://docs.example.com/keyword",
+            declaredTaskId: "ecommerce"
+        )
+        let snap = try db.insertSnapshot(
+            sessionId: ev.sessionId,
+            timestampMs: nowMs - 30_000,
+            filePath: store.snapshotsDirectory.appendingPathComponent("snap.jpg").path,
+            width: 800,
+            height: 600,
+            sizeBytes: 2048,
+            appName: "Editor",
+            windowTitle: "Subprocess keyword window"
+        )
+        _ = try db.insertOCRFrame(
+            snapshotId: snap.id,
+            sessionId: ev.sessionId,
+            text: "DayHelm subprocess keyword OCR verification",
+            createdAtMs: nowMs - 30_000
+        )
+
+        let helpProc = try runProcess(executableURL: appBinary, arguments: ["--help"])
+        #expect(helpProc.exitCode == 0)
+        #expect(helpProc.stdout.contains("Usage:") && helpProc.stdout.contains("dayhelm"))
+
+        let statusProc = try runProcess(executableURL: appBinary, arguments: ["status", "--store-dir", tmpDir.path])
+        #expect(statusProc.exitCode == 0)
+        #expect(statusProc.stdout.contains("DayHelm Status") && statusProc.stdout.contains("电商做深"))
+
+        let queryProc = try runProcess(executableURL: appBinary, arguments: ["query", "--today", "--format", "md", "--store-dir", tmpDir.path])
+        #expect(queryProc.exitCode == 0)
+        #expect(queryProc.stdout.contains("# DayHelm Activity Context") && queryProc.stdout.contains("keyword"))
+
+        let searchProc = try runProcess(executableURL: appBinary, arguments: ["search", "keyword", "--store-dir", tmpDir.path])
+        #expect(searchProc.exitCode == 0)
+        #expect(searchProc.stdout.contains("# DayHelm Search") && searchProc.stdout.contains("keyword"))
+
+        let purgeProc = try runProcess(executableURL: appBinary, arguments: ["purge", "--store-dir", tmpDir.path])
+        #expect(purgeProc.exitCode == 0)
+        #expect(purgeProc.stdout.contains("DayHelm purge completed"))
+        #expect(!FileManager.default.fileExists(atPath: store.todayURL.path))
+        #expect(!FileManager.default.fileExists(atPath: store.databaseURL.path))
+
+        let unknownProc = try runProcess(executableURL: appBinary, arguments: ["unknown-flag"])
+        #expect(unknownProc.exitCode != 0)
+        #expect(!unknownProc.stderr.isEmpty)
+    }
+
+    @Test("ActivityDatabase handles concurrent writers and HTTP/CLI readers in WAL mode without SQLITE_BUSY")
+    func concurrentSQLiteReaderWriterStressWALModeE2E() async throws {
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-st-stress-\(UUID().uuidString)")
+        let store = DayHelmStore(directory: tmpDir)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+        let t0 = baseDate()
+        let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+
+        let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+        engine.startFocus(taskId: "ecommerce", at: t0)
+        let daySnap = engine.snapshot(at: t0.addingTimeInterval(600))
+        try store.saveToday(daySnap)
+
+        let db = try ActivityDatabase(databaseURL: store.databaseURL)
+        #expect(try db.journalMode().lowercased() == "wal")
+
+        let server = LocalActivityHTTPServer(
+            database: db,
+            store: store,
+            clock: ManualClock(now: t0.addingTimeInterval(600)),
+            stateProvider: {
+                LocalActivityHTTPServer.RuntimeState(
+                    axTrusted: true,
+                    screenCaptureTrusted: true,
+                    deepRecordingEnabled: true,
+                    daySnapshot: daySnap
+                )
+            }
+        )
+        let ports = await server.start(primaryPort: 0, fallbackPort: nil)
+        defer { server.stop() }
+        let port = try #require(ports.first)
+
+        let contextURL = URL(string: "http://127.0.0.1:\(port)/api/dayhelm/context")!
+        let urlSession = URLSession(configuration: .ephemeral)
+        let dec = DayHelmDateFormatting.makeDecoder()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                for i in 0..<50 {
+                    _ = try db.insertEvent(
+                        timestampMs: t0Ms + Int64(i * 2000),
+                        kind: i % 5 == 0 ? "browser_visit" : "app_focus",
+                        appName: i % 2 == 0 ? "Xcode" : "Terminal",
+                        windowTitle: "StressWindow-\(i)",
+                        url: i % 5 == 0 ? "https://example.com/stress/\(i)" : nil,
+                        declaredTaskId: "ecommerce"
+                    )
+                    try await Task.sleep(nanoseconds: 2_000_000)
+                }
+            }
+
+            group.addTask {
+                for i in 0..<25 {
+                    let snap = try db.insertSnapshot(
+                        timestampMs: t0Ms + Int64(i * 4000) + 500,
+                        filePath: store.snapshotsDirectory.appendingPathComponent("2026-11-17/stress-\(i).jpg").path,
+                        width: 1280,
+                        height: 720,
+                        sizeBytes: 4096,
+                        trigger: "visual_change",
+                        appName: "Xcode",
+                        windowTitle: "StressWindow-\(i)",
+                        declaredTaskId: "ecommerce"
+                    )
+                    _ = try db.insertOCRFrame(
+                        snapshotId: snap.id,
+                        sessionId: snap.sessionId,
+                        text: "StressOCR frame payload \(i)",
+                        createdAtMs: t0Ms + Int64(i * 4000) + 500
+                    )
+                    try await Task.sleep(nanoseconds: 3_000_000)
+                }
+            }
+
+            group.addTask {
+                for _ in 0..<25 {
+                    let (data, resp) = try await urlSession.data(from: contextURL)
+                    #expect((resp as? HTTPURLResponse)?.statusCode == 200)
+                    _ = try dec.decode(DayHelmContextAPIResponse.self, from: data)
+                    try await Task.sleep(nanoseconds: 3_000_000)
+                }
+            }
+
+            group.addTask {
+                for _ in 0..<15 {
+                    let res = DayHelmCLI.run(
+                        arguments: ["dayhelm", "query", "--today", "--format", "json", "--store-dir", tmpDir.path],
+                        clock: ManualClock(now: t0.addingTimeInterval(600))
+                    )
+                    #expect(res?.exitCode == 0)
+                    try await Task.sleep(nanoseconds: 4_000_000)
+                }
+            }
+
+            try await group.waitForAll()
+        }
+
+        let counts = try db.todayCounts(dayStartMs: t0Ms - 1000, dayEndMs: t0Ms + 86_400_000)
+        #expect(counts.events == 50)
+        #expect(counts.snapshots == 25)
+        #expect(counts.ocrFrames == 25)
+        #expect(try db.integrityCheck().lowercased() == "ok")
+        #expect((try db.search(keyword: "StressOCR", limit: 50)).count == 25)
+    }
+
+    private func waitUntil(
+        _ description: String,
+        timeoutSeconds: TimeInterval = 8.0,
+        condition: @escaping @Sendable () async -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if await condition() {
+                return
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        throw NSError(domain: "DayHelmCoreTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for: \(description)"])
+    }
+
+    private func isJSONBoolean(_ value: Any?) -> Bool {
+        guard let num = value as? NSNumber else { return false }
+        return CFGetTypeID(num) == CFBooleanGetTypeID()
+    }
+
+    private func isJSONInteger(_ value: Any?) -> Bool {
+        guard let num = value as? NSNumber else { return false }
+        return CFGetTypeID(num) != CFBooleanGetTypeID()
+    }
+
+    private func resolveDayHelmAppExecutableURL() throws -> URL {
+        let fm = FileManager.default
+        var candidates: [URL] = []
+
+        for bundle in Bundle.allBundles {
+            candidates.append(bundle.bundleURL.deletingLastPathComponent().appendingPathComponent("DayHelmApp"))
+        }
+        if let mainExecDir = Bundle.main.executableURL?.deletingLastPathComponent() {
+            candidates.append(mainExecDir.appendingPathComponent("DayHelmApp"))
+        }
+
+        let sourceURL = URL(fileURLWithPath: #filePath)
+        var repoRoot = sourceURL.deletingLastPathComponent()
+        while repoRoot.path != "/" {
+            if fm.fileExists(atPath: repoRoot.appendingPathComponent("Package.swift").path) {
+                break
+            }
+            repoRoot = repoRoot.deletingLastPathComponent()
+        }
+
+        candidates.append(repoRoot.appendingPathComponent(".build/arm64-apple-macosx/debug/DayHelmApp"))
+        candidates.append(repoRoot.appendingPathComponent(".build/debug/DayHelmApp"))
+        candidates.append(repoRoot.appendingPathComponent(".build/release/DayHelmApp"))
+
+        for url in candidates where fm.isExecutableFile(atPath: url.path) {
+            return url
+        }
+
+        let buildProc = try runProcess(
+            executableURL: URL(fileURLWithPath: "/usr/bin/swift"),
+            arguments: ["build", "--product", "DayHelmApp"],
+            currentDirectoryURL: repoRoot,
+            timeoutSeconds: 60.0
+        )
+        guard buildProc.exitCode == 0 else {
+            throw NSError(domain: "DayHelmCoreTests", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to build DayHelmApp: \(buildProc.stderr)"])
+        }
+
+        for url in candidates where fm.isExecutableFile(atPath: url.path) {
+            return url
+        }
+        throw NSError(domain: "DayHelmCoreTests", code: 3, userInfo: [NSLocalizedDescriptionKey: "Unable to locate compiled DayHelmApp executable"])
+    }
+
+    private func runProcess(
+        executableURL: URL,
+        arguments: [String],
+        currentDirectoryURL: URL? = nil,
+        timeoutSeconds: TimeInterval = 15.0
+    ) throws -> (exitCode: Int32, stdout: String, stderr: String) {
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        if let currentDirectoryURL {
+            process.currentDirectoryURL = currentDirectoryURL
+        }
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        let doneSemaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            doneSemaphore.signal()
+        }
+
+        try process.run()
+        let waitResult = doneSemaphore.wait(timeout: .now() + timeoutSeconds)
+        if waitResult == .timedOut {
+            process.terminate()
+            throw NSError(domain: "DayHelmCoreTests", code: 4, userInfo: [NSLocalizedDescriptionKey: "Process timed out"])
+        }
+
+        let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        return (
+            exitCode: process.terminationStatus,
+            stdout: String(data: outData, encoding: .utf8) ?? "",
+            stderr: String(data: errData, encoding: .utf8) ?? ""
+        )
     }
 
     private func makeSyntheticTextImage(text: String, backgroundWhite: Bool, width: Int = 960, height: Int = 240) throws -> CGImage {

@@ -52,6 +52,7 @@ public final class HybridActivityCoordinator: ObservableObject {
     private var lastNativeInputAt: Date?
     private var lastRecordedSampleKey: String?
     private var lastRecordedHeartbeatAt: Date?
+    private var lastPersistedAt: Date?
     private var tickCount: Int = 0
     private var isStarted: Bool = false
 
@@ -559,7 +560,7 @@ public final class HybridActivityCoordinator: ObservableObject {
             screenCaptureTrusted = screenRecorder.isScreenCaptureTrusted
         }
 
-        var sample = inspector.inspectCurrent()
+        var sample = PrivacyRedactor.redact(inspector.inspectCurrent(), config: engine.config.privacyConfig)
 
         if !sample.screenLocked {
             var patchedTitle = sample.windowTitle
@@ -622,6 +623,9 @@ public final class HybridActivityCoordinator: ObservableObject {
         }
 
         refreshPublishedState()
+        if lastPersistedAt == nil || now.timeIntervalSince(lastPersistedAt!) >= 10.0 {
+            persistTodayIfNeeded()
+        }
         syncCachedRuntimeState()
     }
 
@@ -647,7 +651,7 @@ public final class HybridActivityCoordinator: ObservableObject {
 
         switch event.kind {
         case "app_focus":
-            let sample = inspector.inspectCurrent()
+            let sample = PrivacyRedactor.redact(inspector.inspectCurrent(), config: engine.config.privacyConfig)
             let alerts = engine.ingest(sample)
             if let newest = alerts.last {
                 activeAlert = newest
@@ -891,6 +895,10 @@ public final class HybridActivityCoordinator: ObservableObject {
         runtimeStateBox.update(state)
     }
 
+    public nonisolated func currentRuntimeState() -> LocalActivityHTTPServer.RuntimeState {
+        runtimeStateBox.read()
+    }
+
     private nonisolated func readCachedRuntimeState() -> LocalActivityHTTPServer.RuntimeState {
         runtimeStateBox.read()
     }
@@ -911,8 +919,10 @@ public final class HybridActivityCoordinator: ObservableObject {
 
     private func persistTodayIfNeeded() {
         guard !isSyntheticDemo, let store else { return }
-        let snap = engine.snapshot(at: clock.now())
+        let now = clock.now()
+        let snap = engine.snapshot(at: now)
         try? store.saveToday(snap)
+        lastPersistedAt = now
     }
 
     private func currentDeclaredTaskId() -> String? {

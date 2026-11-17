@@ -1084,6 +1084,26 @@ public final class ActivityDatabase: @unchecked Sendable {
         return try currentOpenSessionIdLocked()
     }
 
+    public func journalMode() throws -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        var mode = ""
+        try queryStatementLocked("PRAGMA journal_mode;", bind: { _ in }, onRow: { stmt in
+            mode = readText(stmt, 0) ?? ""
+        })
+        return mode
+    }
+
+    public func integrityCheck() throws -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        var result = ""
+        try queryStatementLocked("PRAGMA integrity_check;", bind: { _ in }, onRow: { stmt in
+            result = readText(stmt, 0) ?? ""
+        })
+        return result
+    }
+
     // MARK: - Pruning & Purge
 
     @discardableResult

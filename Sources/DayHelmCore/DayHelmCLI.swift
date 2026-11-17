@@ -65,8 +65,16 @@ public enum DayHelmCLI {
             return runStatus(args: Array(args.dropFirst()), clock: clock)
         case "--help", "-h", "help":
             return DayHelmCLIResult(exitCode: 0, stdout: helpText)
-        default:
+        case "--synthetic-demo":
             return nil
+        default:
+            if first.hasPrefix("-psn_") || first.hasPrefix("-NS") || first.hasPrefix("-Apple") {
+                return nil
+            }
+            return DayHelmCLIResult(
+                exitCode: 1,
+                stderr: "Error: Unknown command or option '\(first)'. Run 'dayhelm --help' for usage.\n"
+            )
         }
     }
 
