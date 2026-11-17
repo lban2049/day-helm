@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+APP_NAME="DayHelm"
+BUILD_CONFIG="${BUILD_CONFIG:-release}"
+OUTPUT_DIR="${OUTPUT_DIR:-${ROOT_DIR}/build}"
+APP_BUNDLE="${OUTPUT_DIR}/${APP_NAME}.app"
+CONTENTS_DIR="${APP_BUNDLE}/Contents"
+MACOS_DIR="${CONTENTS_DIR}/MacOS"
+RESOURCES_DIR="${CONTENTS_DIR}/Resources"
+
+echo "[DayHelm] Building ${APP_NAME} (${BUILD_CONFIG})..."
+cd "${ROOT_DIR}"
+swift build -c "${BUILD_CONFIG}" --product DayHelmApp
+
+BIN_DIR="$(swift build -c "${BUILD_CONFIG}" --show-bin-path)"
+EXECUTABLE_SRC="${BIN_DIR}/DayHelmApp"
+
+if [[ ! -x "${EXECUTABLE_SRC}" ]]; then
+  echo "Error: Built executable not found at ${EXECUTABLE_SRC}" >&2
+  exit 1
+fi
+
+rm -rf "${APP_BUNDLE}"
+mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
+
+cp "${EXECUTABLE_SRC}" "${MACOS_DIR}/${APP_NAME}"
+chmod +x "${MACOS_DIR}/${APP_NAME}"
+
+cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleDisplayName</key>
+    <string>DayHelm</string>
+    <key>CFBundleExecutable</key>
+    <string>DayHelm</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.dayhelm.app</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>DayHelm</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+
+echo "[DayHelm] Ad-hoc signing ${APP_BUNDLE}..."
+codesign --force --deep --sign - "${APP_BUNDLE}"
+
+echo "[DayHelm] Packaged successfully: ${APP_BUNDLE}"
+echo "  Run live:           open \"${APP_BUNDLE}\""
+echo "  Run synthetic demo: \"${MACOS_DIR}/${APP_NAME}\" --synthetic-demo"
+echo "  CLI status:         \"${MACOS_DIR}/${APP_NAME}\" status"
+echo "  CLI purge:          \"${MACOS_DIR}/${APP_NAME}\" purge --before YYYY-MM-DD"

@@ -1,263 +1,256 @@
-# 技术方案
+# 技术方案与 UI 规范（DayHelm · 日舵）
 
-## 分层
+## 一、 整体分层架构
 
-四层，只通过明确定义的接口通信，每层可单独关闭。
+四层解耦，只通过明确定义的协议通信，每层可单独关闭或替换假实现：
 
 ```
-┌─────────────────────────────────────────────┐
-│ 界面层  MenuBarExtra / NSWindow 浮层          │  可关：无 UI 时仍能采集
-├─────────────────────────────────────────────┤
-│ 判定层  专注块状态机 · 迟滞 · 配额计算         │  纯逻辑，无 I/O，可完全单测
-├─────────────────────────────────────────────┤
-│ 采集层  NSWorkspace · AX · CGEventSource      │  可关：关闭后判定层退化
-├─────────────────────────────────────────────┤
-│ 存储层  heartbeat 事件流 · 日切片 JSON         │  可关：内存模式
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│ 界面层 (DayHelmApp)                                                     │
+│   ├─ MenuBar 实时胶囊 (MenuBarExtra) + 330pt 高密度下拉仪表盘           │
+│   └─ 右上角非抢占式监督浮窗 (NSPanel: .nonactivatingPanel)              │
+├─────────────────────────────────────────────────────────────────────────┤
+│ 判定与分析层 (DayHelmCore · 纯 Swift，严禁 import AppKit)               │
+│   ├─ EventMerger: 融合 Alma 实时事件与 AX 窗口标题为连续 ActivitySpan   │
+│   ├─ QuotaTracker: 计算各事项今日累计时长、保底缺口(Target)与封顶(Cap)  │
+│   ├─ SpectrumBuilder: 生成今日时间光谱条数据与连续块/切换频次指标       │
+│   └─ SlidingSupervisor: 滑动窗口检测配额到点、持续跑偏与高频碎片化乱切  │
+├─────────────────────────────────────────────────────────────────────────┤
+│ 混合采集层 (DayHelmCapture)                                             │
+│   ├─ AlmaActivityClient: 增量拉取 localhost:23001 实时 sessions/events  │
+│   └─ AXWindowInspector: 2s 轮询 NSWorkspace + AX 补齐窗口标题与 URL     │
+├─────────────────────────────────────────────────────────────────────────┤
+│ 存储层 (DayHelmStore)                                                   │
+│   └─ ~/.config/alma/dayhelm/ (today.json 原子写 + days/YYYY-MM-DD.json) │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**判定层不得 import AppKit。** 这是硬约束——它必须能在命令行里用假时钟确定性测试。
+### SwiftPM 模块划分（统一工程结构）
 
-## 采集层
+```
+Package.swift
+├── Sources/DayHelmCore/        # 纯逻辑与数据模型（无 AppKit，注入 Clock，100% 可单测）
+├── Sources/DayHelmCapture/     # Alma HTTP 客户端 + macOS AX/NSWorkspace/CGEvent 采集实现
+├── Sources/DayHelmApp/         # SwiftUI 菜单栏仪表盘 + NSPanel 非抢占提醒窗
+└── Sources/DayHelmChecks/      # 确定性自检可执行程序（合成数据验证配额、合并与监督触发）
+```
 
-### 采集什么
+---
 
-| 数据 | API | 权限 | 频率 |
-|---|---|---|---|
-| 前台应用 | `NSWorkspace.frontmostApplication` + `didActivateApplicationNotification` | 无 | 事件驱动 |
-| 窗口标题 | AX `kAXTitleAttribute`（`kAXFocusedWindowAttribute` → title） | Accessibility | 2s 轮询 |
-| 浏览器 URL | AX `AXDocument` on focused window | Accessibility | 2s 轮询 |
-| 空闲时长 | `CGEventSource.secondsSinceLastEventType(.combinedSessionState, any)` | 无 | 2s 轮询 |
-| 屏幕锁定 | `DistributedNotificationCenter` 的 `com.apple.screenIsLocked` / `Unlocked` | 无 | 事件驱动 |
+## 二、 混合采集层：结合 Alma 实时数据 + AX 标题补齐
 
-### 已验证的实现要点（本机实测）
+### 1. 为什么要做双通道混合采集？
 
-- `AXIsProcessTrusted()` 在 Alma.app 与终端环境下均为 `true`；独立 ad-hoc 签名的二进制也能读到标题
-- 标题降级链：`kAXFocusedWindow` → `kAXWindows[0]` → 只记 app 名
-- **`AXDocument` 是意外收获**：浏览器当前 URL 直接可读，不用 AppleScript、不用浏览器扩展
-- 空闲检测**必须**用 `CGEventType(rawValue: 0xFFFFFFFF)`（整体空闲），**不能**用 `.keyDown`——实测 `.keyDown` 给出 82s 而整体空闲是 7s，只用鼠标时会误判离开
-- `0xFFFFFFFF` 不是公开 API，需用 IOKit `HIDIdleTime` 做一致性校验，偏差过大时降级
-- **不要在 `main()` 顶部裸调空闲 API**：实测在极短生命周期进程里会偶发阻塞。必须在有 RunLoop 的上下文调用
+本机已有常驻运行的 **Alma `activity-recorder`**（`http://localhost:23001/api/activity-recorder/...`），经实测：
+- **Alma 已具备的实时数据**：
+  - 当前与今日所有 `sessions`（毫秒级 `startedAt`, `endedAt`, `triggerKind`）
+  - 实时 `events` 流：`app_focus`（应用切换时间点与 `bundleId`）、`browser_visit`（Chrome URL 与 Tab 名）、`keypress` / `click`（键鼠活跃计数）、`unlock`（解锁事件）。
+- **Alma 缺失的数据**：
+  - `snapshots` 中的 `windowTitle` 字段全部为 `null`（未保存非 Chrome 应用的窗口标题）。
 
-### 采集层接口
+因此，DayHelm 采用 **「Alma 实时流 + 本机 AX 标题增补」** 的双通道混合方案：
+1. **开机/重启即拥有全天完整历史**：DayHelm 启动时直接拉取 `localhost:23001` 今日已有的 `sessions` 与 `events`，哪怕中途重启 App，当天的活动轨迹、切换次数也分秒不差。
+2. **2 秒轮询补齐窗口标题与 URL**：DayHelm 自身运行极轻量的 `AXWindowInspector`，每 2 秒通过 `NSWorkspace.frontmostApplication` + Accessibility (`kAXTitleAttribute` & `AXDocument`) 获取当前前台窗口标题与浏览器 URL，按时间戳增补到活动流中。
+3. **离线无缝降级**：若 `localhost:23001` 未响应，自动退化为纯本机 `NSWorkspace + AX + CGEventSource` 独立采样，保证任何情况下工具可用。
+
+### 2. 采集数据清单与 API
+
+| 数据源 | 字段 | 实现方式 | 权限 | 频率 |
+|---|---|---|---|---|
+| **Alma API** | `sessions` / `events` (`app_focus`, `browser_visit`, `click`, `keypress`, `unlock`) | `GET http://localhost:23001/api/activity-recorder/sessions` | 无（本地 HTTP） | 启动全量 + 10s 增量同步 |
+| **本机 AX** | 前台应用 `appName` + `bundleId` | `NSWorkspace.frontmostApplication` + 激活通知 | 无 | 事件驱动 + 2s 轮询 |
+| **本机 AX** | 窗口标题 `windowTitle` | AX `kAXFocusedWindowAttribute` → `kAXTitleAttribute`（降级 `kAXWindows[0]`） | Accessibility | 2s 轮询 |
+| **本机 AX** | 浏览器当前 `url` | AX `AXDocument` on focused window | Accessibility | 2s 轮询 |
+| **本机 HID** | 全局空闲秒数 `idleSeconds` | `CGEventSource.secondsSinceLastEventType(.combinedSessionState, 0xFFFFFFFF)` + `HIDIdleTime` 校验 | 无 | 2s 轮询 |
+| **系统通知** | 屏幕锁定 `screenLocked` | `DistributedNotificationCenter` (`com.apple.screenIsLocked` / `Unlocked`) | 无 | 事件驱动 |
+
+### 3. 采集层统一接口
 
 ```swift
-protocol ActivitySource {
-    var events: AsyncStream<ActivitySample> { get }
-}
-
-struct ActivitySample {
-    let timestamp: Date
-    let appName: String
-    let bundleId: String?
-    let windowTitle: String?     // nil = 读不到，不是空字符串
-    let url: String?             // 仅浏览器
-    let idleSeconds: TimeInterval
-    let screenLocked: Bool
+public struct ActivitySample: Sendable, Equatable, Codable {
+    public let timestamp: Date
+    public let appName: String
+    public let bundleId: String?
+    public let windowTitle: String?     // 由 AX 补齐；敏感应用过滤后置 nil
+    public let url: String?             // 由 AXDocument 或 Alma browser_visit 提供
+    public let idleSeconds: TimeInterval
+    public let screenLocked: Bool
+    public let inputActive: Bool        // 结合 Alma click/keypress 或 idleSeconds < 2s
 }
 ```
 
-测试用 `FakeActivitySource` 回放录制好的合成样本，**不碰真实屏幕**。
+---
 
-## 判定层：专注块状态机
+## 三、 判定与分析层（DayHelmCore）
 
-核心逻辑，必须可完全确定性测试。
-
-### 状态
+### 1. 任务与双向配额模型（Target & Cap）
 
 ```swift
-enum FocusState {
-    case idle                                  // 未开始
-    case focused(since: Date, blockId: UUID)   // 在块内
-    case drifting(since: Date, from: UUID)     // 越界，但未判定为中断
-    case interrupted(blockId: UUID)            // 已确认中断
+public struct TaskBudget: Sendable, Equatable, Codable, Identifiable {
+    public var id: String { taskId }
+    public let taskId: String           // 如 "ecommerce", "ecommerce-ops", "hermes"
+    public let displayName: String      // 如 "电商做深", "电商日常运营", "Hermes 投研"
+    public let colorHex: String         // 用于光谱条与标签颜色
+    public let targetMinutes: Int?      // 保底目标时长（如 90 分钟）
+    public let capMinutes: Int?         // 封顶上限时长（如运营最多 30 分钟）
 }
 ```
 
-### 状态迁移
+- **配置复用**：项目基础清单与关键词从 `~/.config/alma/time-audit/config.json` 与 `focus.json` 只读加载；每个事项的每日 `targetMinutes` / `capMinutes` 保存在 `~/.config/alma/dayhelm/config.json`。
+- **进度状态**：
+  - `underTarget`：保底尚未达标（显示还差 X 分钟）
+  - `targetMet`：已达保底目标（绿色达标标记）
+  - `approachingCap`：已达封顶上限的 85%（预警）
+  - `capReached`：已触达或超过封顶上限（琥珀色高亮 + 触发换挡提醒）
 
-| 从 | 事件 | 到 | 条件 |
-|---|---|---|---|
-| idle | 用户开始 | focused | 已填交付物 + 归属项目 |
-| focused | 前台应用离开白名单 | drifting | 立即 |
-| drifting | 回到白名单内 | focused | 原块延续，**不重新计时** |
-| drifting | 持续越界 > `interruptGracePeriod` | 用户确认后 interrupted | 默认 30s |
-| drifted→focused | — | focused | 记录一次 `microReturn`（微切换），计入切换次数但不打断块 |
-| interrupted | 用户回位并确认 | focused | 新块，`resumeNote` 显示 |
-| focused | 空闲 > `idleThreshold` | idle | 默认 5 min，不记中断（人不在不算打断） |
+### 2. 专注会话与时间累计（容许跨应用协同）
 
-### 迟滞（必须）
+```swift
+public enum FocusSessionState: Sendable, Equatable, Codable {
+    case unassigned                                     // 杂事/未指定专注事项（后台仍记录客观活动）
+    case focusing(taskId: String, startedAt: Date)      // 正在专注某事项
+    case paused(taskId: String, pausedAt: Date)         // 锁屏或长空闲自动暂停
+}
+```
 
-原始信号会抖动。规则：
+- **跨应用包容原则**：当用户声明处于 `.focusing(taskId: "ecommerce")` 时，只要人在场（未锁屏、且未超过 `idleThreshold` 5 分钟长空闲），期间切换到预览、Finder、表格、终端或通用网页等辅助工具，**时长持续累计入当前声明的 `taskId`**，不会因为切换应用而打断连续块。
+- **在场判定（Presence）**：结合 `screenLocked == false` 且（`idleSeconds < 300s` 或 Alma 当前 session 处于活跃态），避免阅读思考时被误判离开。
 
-- 状态迁移需**连续 3 个采样周期**（2s × 3 = 6s）观察到一致信号才生效
-- 单次 2s 抖动不得产生任何 UI 或计数
-- 依据：用户切换率 50–78 次/小时，按瞬时信号提醒会疯狂误报
+### 3. 今日时间光谱条（Day Spectrum Ribbon）与连续度计算
 
-### 专注块判定
+将当天从首个活跃时刻到当前的连续时间轴，切分为带语义的区间（`SpectrumSegment`）：
 
-一个"有效长块"必须同时满足：
+- **事项专注段**：按当前归属的 `taskId` 着色（如蓝色代表 `电商做深`，琥珀色代表 `电商运营`，绿色代表 `Hermes`）。
+- **高频乱切段（Thrashing Segment）**：当滑动窗口（如 5–10 分钟）内切换频次超过阈值（如折合 > 45 次/小时且平均停留 < 45 秒）时，在光谱条上标记为**斜纹警示段**，直观暴露注意力溃散时段。
+- **空闲/离开段**：灰色底色。
 
-- 时长 ≥ `minBlockDuration`（初值 **12 分钟**，不是 25）
-- 块内无 `interrupted` 状态
-- `microReturn` 次数 ≤ `maxMicroReturns`（初值 5）——允许少量微切，超过则降级为"碎块"
+### 4. 三类轻量监督提醒触发器（Supervisor Triggers）
 
-块分级：
-
-| 分级 | 条件 | 呈现 |
+| 触发器 | 触发条件 | 冷却与防打扰策略 |
 |---|---|---|
-| `deep` | ≥25 min 且无中断、微切 ≤2 | 主屏高亮 |
-| `solid` | ≥12 min 且无中断 | 计入配额 |
-| `fragmented` | 有中断或微切超标 | 只记录，不计配额 |
+| **1. 配额封顶/达标提醒** (`quotaAlert`) | 当前专注事项累计时长刚达到 `capMinutes`（强制提醒换挡）或 `targetMinutes`（温和知会达标） | 每个事项每天默认触发 1 次；用户点「+15m 收尾」后延后 15 分钟再提醒一次 |
+| **2. 跨项目跑偏提醒** (`driftAlert`) | 阶段 2 细化：声明在做事项 A，但最近连续 N 分钟窗口标题/URL 明确命中事项 B 的特征关键词 | 用户可点「改计入事项 B」、「回到事项 A」或「顺手处理（静音 10 分钟）」 |
+| **3. 高频乱切提醒** (`thrashingAlert`) | 阶段 2 细化：短滑动窗口内应用/标签高频横跳，无法形成连续块 | 触发后至少冷却 30 分钟，绝不连续弹窗 |
 
-### 配额计算
+---
+
+## 四、 UI 方案与视觉设计规范（Precision Telemetry 精密仪表风）
+
+摒弃传统番茄钟的大留白和本地截图工具的笨重窗口，采用类似 **Linear / Raycast / iStat Menus** 的高信息密度、等宽数字对齐、语义化色彩设计。
+
+### 1. 视觉 Token（Design System）
+
+- **字体与数字排版**：
+  - 界面文本：系统原生 `SF Pro Text`
+  - 所有计时、配额比值、窗口路径、统计数字：**强制使用等宽数字 `.system(..., design: .monospaced)` 或 `.monospacedDigit()`**，确保秒表跳动与进度对齐时零抖动。
+- **四色语义体系**：
+  - **推进蓝 (`Primary Blue`)**：当前专注进行中、保底配额正常累积。
+  - **达标绿 (`Success Emerald`)**：今日保底目标（Target）已达成、采集状态健康。
+  - **封顶琥珀 (`Warning Amber`)**：触达今日时间上限（Cap，如日常运营满 30m），需要立即收尾换挡。
+  - **斜纹警示红 (`Destructive Hatch`)**：高频碎片化乱切时段。
+
+### 2. 三个核心界面载体（无笨重主窗口）
+
+#### 载体 A：macOS 顶部菜单栏实时胶囊（MenuBar Live Pill）
+- 常驻系统菜单栏，无需点击即可用余光瞥见当前状态：
+  - **专注推进中**：`● 电商做深 · 52/90m`
+  - **触达封顶上限**：`▲ 日常运营 · 31/30m (已到点)`
+  - **未指定专注**：`○ DayHelm · 待命`
+
+#### 载体 B：菜单栏下拉高密度仪表盘（Popover，固定宽 `330pt`，一屏免滚动）
+由上至下分为 5 个紧凑模块（内边距 `16pt`，模块间距 `12pt`）：
+1. **顶部品牌与采集状态栏**：左侧 `DayHelm` 标识，右侧实时状态胶囊 `● Alma + AX 采集中`。
+2. **当前专注控制盒（Active Focus Box）**：
+   - 右上角大号等宽计时器（如 `26:40`），左侧显示当前专注事项名称。
+   - 单行等宽小字实时回显当前捕获到的窗口标题/URL（如 `当前窗口: 抖店后台 - 商品主图 (Chrome)`），让用户直观看到采集器在工作。
+   - **任务一键切换胶囊行（Quick Switcher Pills）**：横排展示 `电商做深`、`电商运营`、`Hermes`、`Infra`、`⏸ 杂事/休息`，单击即切，零输入成本。
+3. **今日时间配额进度条（Quota Budget List）**：
+   - 每个事项一行：左侧事项名，右侧等宽进度 `52 / 90m` + 状态微标签（`保底差 38m` / `⚠️ 已达上限` / `✓ 已达标`），下方 `7pt` 细圆角进度条。
+4. **今日时间光谱条（Day Spectrum Ribbon）**：
+   - 一条 `20pt` 高的横向彩色分段条（从今日开始工作到当前时刻），直观展示各事项分布与斜纹碎片化段。
+5. **底部三格遥测微指标（Telemetry Footer）**：
+   - 三等分小格：`今日最长连续块 (34m)` ｜ `近期切换热度 (19/h)` ｜ `≥12m 有效块 (3个)`。
+
+#### 载体 C：右上角非抢占式监督浮窗（Non-activating HUD Toast，宽 `350pt`）
+- **实现方式**：使用 `NSPanel`，设置 `styleMask: [.nonactivatingPanel, .borderless]`，`level: .floating`，`collectionBehavior: [.canJoinAllSpaces, .fullScreenAuxiliary]`。
+- **核心体验保证**：**绝不抢占当前键盘焦点（Key Window）**——当你正在终端或浏览器打字时，它从屏幕右上角温和滑出，不会吞掉你的任何按键，也不搞 15 秒倒计时锁死。
+- **卡片结构**：
+  - 左侧 `4pt` 语义色竖条（琥珀色=配额封顶，蓝色=跑偏提醒）。
+  - 顶部一句话结论（如 `⏰ 【电商日常运营】已达到今日 30m 上限`）。
+  - 中部一行客观数据说明（如 `今天「电商做深」还差 38 分钟达标，建议现在换挡`）。
+  - 底部 2–3 个快捷动作按钮（如 `[ 切到「电商做深」 ]`、`[ +15m 收尾 ]`、`[ 转入休息 ]`）。
+
+---
+
+## 五、 存储层与外部系统契约
+
+### 1. 本地存储路径（`~/.config/alma/dayhelm/`）
 
 ```
-今日投入(项目) = Σ solid 及以上块中归属于该项目的分钟数
-缺口 = 配额 - 今日投入
+~/.config/alma/dayhelm/
+  today.json              # 今日实时热数据（原子写入：today.json.tmp -> rename）
+  days/YYYY-MM-DD.json    # 每日定稿归档（含补齐了 windowTitle 的活动区间与专注会话）
+  config.json             # 每日各事项配额配置（targetMinutes / capMinutes）与提醒阈值
 ```
 
-- 配额来源：`~/.config/alma/time-audit/focus.json` 的 `primary_focus`
-- **只读不写。** 本工具不产生新的配置真源
-- 若 `focus.json` 存在但解析失败 → 主屏明确显示"配额不可用"，**不猜默认值**
-- 若 `focus.json` 不存在 → 无配额模式，只显示连续块指标
-
-## 存储层
-
-### 格式：heartbeat 事件流（抄 ActivityWatch）
-
-不做"每 2 秒写一条"。同一 `data` 的相邻事件在 `pulsetime`（默认 60s）窗口内**合并**为一条并延长 `duration`。
+### 2. `today.json` 核心结构示例
 
 ```json
 {
   "schemaVersion": 1,
   "date": "2026-11-17",
-  "blocks": [
+  "activeFocus": {
+    "taskId": "ecommerce",
+    "startedAt": "2026-11-17T11:45:00+08:00"
+  },
+  "budgets": [
     {
-      "id": "uuid",
-      "project": "ecommerce",
-      "intent": "上 3 个新品的主图",
-      "startedAt": "2026-11-17T09:12:00+08:00",
-      "endedAt": null,
-      "minutes": 34.5,
-      "grade": "deep",
-      "interruptions": 1,
-      "microReturns": 2,
-      "resumeNote": "改到第 2 个品的详情图，停在这",
-      "interruptLog": [
-        { "at": "2026-11-17T09:31:00+08:00", "app": "WeChat", "seconds": 47 }
-      ]
+      "taskId": "ecommerce",
+      "displayName": "电商做深",
+      "focusedMinutes": 52.0,
+      "targetMinutes": 90,
+      "capMinutes": 120,
+      "status": "under_target"
+    },
+    {
+      "taskId": "ecommerce-ops",
+      "displayName": "电商日常运营",
+      "focusedMinutes": 31.0,
+      "targetMinutes": null,
+      "capMinutes": 30,
+      "status": "cap_reached"
     }
   ],
-  "switches": [
-    { "at": "2026-11-17T09:31:00+08:00", "from": "ecommerce", "to": "WeChat", "kind": "interrupt" }
+  "focusSessions": [
+    {
+      "id": "sess_focus_01",
+      "taskId": "ecommerce",
+      "startedAt": "2026-11-17T09:15:00+08:00",
+      "endedAt": "2026-11-17T09:50:00+08:00",
+      "minutes": 35.0,
+      "note": "完成第 1 个品的主图筛选"
+    }
   ],
-  "totals": {
-    "activeMinutes": 186,
-    "longestBlockMinutes": 41,
-    "blocksSolidOrAbove": 4,
-    "switchesPerHour": 22.1
+  "enrichedSpans": [
+    {
+      "startedAt": "2026-11-17T09:15:00+08:00",
+      "endedAt": "2026-11-17T09:22:10+08:00",
+      "appName": "Google Chrome",
+      "bundleId": "com.google.Chrome",
+      "windowTitle": "抖店后台 - 商品管理",
+      "url": "https://fxg.jinritemai.com/ffa/mshop/homepage/index",
+      "declaredTaskId": "ecommerce"
+    }
+  ],
+  "metrics": {
+    "activeMinutes": 164.0,
+    "longestBlockMinutes": 35.0,
+    "solidBlocksCount": 3,
+    "recentSwitchesPerHour": 19.2
   }
 }
 ```
 
-### 路径
-
-```
-~/.config/alma/focus-live/
-  today.json          # 秒级更新，原子写入（写临时文件 + rename）
-  blocks/YYYY-MM-DD.json  # 日终定稿，只追加
-  config.json         # 本工具自己的设置（阈值、白名单），不含配额
-```
-
-- `today.json` **不可被 time-audit 直接依赖**（它是热文件，随时变化）。定稿数据在 `blocks/`
-- 原子写入：先写 `today.json.tmp` 再 `rename`，避免读到半个 JSON
-- 日切：跨零点时把 `today.json` 定稿到 `blocks/<前一天>.json`，再初始化新的
-
-### 与 time-audit 的契约
-
-- `focus-guard` **只产出**，不读 time-audit 的日报
-- time-audit 可选地读 `blocks/*.json` 来提升项目归属率（该改动属 time-audit 项目）
-- schema 变更必须升 `schemaVersion`，并在 `docs/decisions/` 记录迁移方式
-
-## 界面层
-
-### 菜单栏
-
-`MenuBarExtra(systemImage:)` + `.menuBarExtraStyle(.window)`，`LSUIElement = true`。
-
-已知风险：图标被拖掉后 app 自动终止（官方文档明说）→ 需要 launchd 保活。
-
-主屏四个数：
-```
-当前块   12:34
-今日最长 41 分钟
-今日切换 17 次
-每小时   22.1 次
----
-电商做深  缺口 56 分钟
-```
-
-### 切换浮层
-
-```swift
-window.level = .screenSaver                     // rawValue 1000
-window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary,
-                             .stationary, .ignoresCycle]
-window.styleMask = [.borderless]
-window.canBecomeKey = true                      // .borderless 默认 false，必须手动设
-```
-
-内容（三样，不多不少）：
-
-```
-你要产出的是：
-「上 3 个新品的主图」
-
-[ 继续原任务 ]        [ 记录中断并离开 ]
-
-离开将在 15 秒后可用
-```
-
-### 能力边界（必须对用户诚实）
-
-浮层**做不到**的事，要在文档和 UI 里说明，不做虚假承诺：
-
-- 盖不住菜单栏（WindowServer 独立合成通道，layer 排序绕不过）
-- 挡不住 Cmd+Tab（浮层仍在，但用户已经切走了）
-- 挡不住三指切 Space / Mission Control
-- 挡不住 Cmd+Opt+Esc 强制退出
-
-因此设计上**不宣称"锁定"**，只宣称"摩擦 + 记录"。
-
-### 提醒不用通知
-
-`UNUserNotificationCenter` 无法做到"必须交互才消失"（`alertStyle` 是用户侧设置，只能读）。
-所有需要强交互的提醒一律用自己的 NSWindow。
-
-`interruptionLevel = .timeSensitive` 可用于**不需要强制交互**的轻提示（可穿透专注模式）。
-
-## 依赖
-
-- Swift / SwiftUI，SwiftPM
-- 无第三方依赖（目标）。任何引入需 ADR
-- 最低 macOS 版本：待定，倾向 `.v14`（与 local-screen-time-journal 一致）
-
-## 打包
-
-个人自用，**不需要签名与公证**。
-
-- `codesign --force --deep --sign - App.app`（ad-hoc）即可
-- 风险：ad-hoc 重签可能触发 TCC 重置 → 开发期用**固定路径**原地替换二进制
-- 更稳的做法：申请**免费的 Apple Development 证书**（不需付费账号），签名身份稳定，TCC 授权稳定得多
-- 参考 `~/dev/code/local-screen-time-journal/prototypes/stage0/build-app.sh` 的打包脚本
-
-## 未验证 / 需要实测的部分
-
-| 项 | 状态 |
-|---|---|
-| macOS 26 是否进一步限制窗口标题读取 | 本机宽松，不可外推 |
-| Stage Manager 开启时浮层行为 | 本机 Stage Manager 关闭，未测 |
-| ad-hoc 重签是否触发 TCC 重置 | 未敢动现有授权，未测 |
-| 多显示器下 `.canJoinAllSpaces` 的实际覆盖范围 | 未测 |
-| `0xFFFFFFFF` 空闲 API 与 `HIDIdleTime` 的偏差范围 | 未测 |
+### 3. 与 `alma-time-audit` 的协同契约
+- **读取配置**：DayHelm 只读读取 `~/.config/alma/time-audit/focus.json` 与 `config.json`。
+- **反哺标题与归因**：DayHelm 产出的 `enrichedSpans`（带真實 `windowTitle` 和 `declaredTaskId`）保存在 `~/.config/alma/dayhelm/days/YYYY-MM-DD.json`，次日 `time-audit` 可直接读取，彻底解决原本因 `windowTitle: null` 和多应用协同导致的项目归属率低问题。

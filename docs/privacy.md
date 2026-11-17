@@ -1,4 +1,4 @@
-# 隐私与权限
+# 隐私与权限（DayHelm · 日舵）
 
 本机采集的数据包含窗口标题与浏览器 URL，属于高敏感个人数据。本文件是硬边界。
 
@@ -6,38 +6,38 @@
 
 | 数据 | 粒度 | 用途 |
 |---|---|---|
-| 前台应用名 + bundleId | 事件 + 2s 轮询 | 判断是否在白名单内 |
-| 窗口标题 | 2s 轮询 | 识别具体在做什么，供项目归属 |
-| 浏览器当前 URL | 2s 轮询 | 区分"目标性访问"与"泛刷" |
-| 空闲时长（秒数，不含内容） | 2s 轮询 | 判断人是否在 |
+| Alma 实时活动事件 (`app_focus`, `browser_visit`, `click`, `keypress`, `unlock`) | 本地环回增量同步 | 获取当天完整会话边界、切换时间点与键鼠活跃计数 |
+| 前台应用名 + bundleId | 事件 + 2s 轮询 | 记录应用切换频次与活动归属 |
+| 窗口标题 | 2s 轮询 (AX) | 补齐 Alma 缺失的窗口标题，识别具体工作内容并辅助跑偏检测 |
+| 浏览器当前 URL | 2s 轮询 (AX) | 区分不同项目页面与泛刷行为 |
+| 空闲时长（秒数，不含内容） | 2s 轮询 | 判断人是否在场，避免空转计入专注时长 |
 | 屏幕锁定状态 | 事件 | 排除锁屏时段 |
-| 专注块元数据（交付物、备注） | 用户输入 | 会话记录与回位 |
+| 专注事项元数据（当前事项、目标配额、备注） | 用户输入 | 当日配额追踪与上下文恢复 |
 
 ## 明确不采集
 
 - 音频、摄像头
-- 键盘输入**内容**（只取空闲时长，不取按键内容）
+- 键盘输入**具体文本内容**（只取活跃计数与空闲时长，不取具体按键内容）
 - 剪贴板
-- 鼠标轨迹、点击坐标
-- 屏幕截图、OCR 文本
-- 网络请求内容
+- 屏幕截图、OCR 文本（DayHelm 自身不做截图）
+- 出站公网网络请求内容
 
-> 禁止通过按键监听推断用户输入。空闲检测只读取"距上次事件多少秒"，不读取事件本身。
+> 禁止通过按键监听推断用户输入文本。
 
 ## 本地存储
 
 所有数据留在本机：
 
 ```
-~/.config/alma/focus-live/
+~/.config/alma/dayhelm/
   today.json           # 今日热数据
-  blocks/*.json        # 日终定稿
-  config.json          # 阈值与白名单
+  days/*.json          # 日终定稿
+  config.json          # 每日各事项配额目标与提醒阈值
 ```
 
 - 无遥测、无崩溃上报、无云同步、无网络分析
-- 进程**不发任何出站网络请求**。若未来需要，必须先改本文件并取得用户明确同意
-- 不读写 `~/.config/alma/time-audit/` 下除 `focus.json`（只读）以外的任何文件
+- 进程**不发任何出站公网网络请求**（仅通过环回地址 `http://localhost:23001` 只读读取本机 Alma `activity-recorder` 的实时事件）
+- 不修改 `~/.config/alma/time-audit/` 下的任何文件（仅只读读取 `focus.json` 与 `config.json`）
 
 ## 敏感应用过滤
 
@@ -62,30 +62,30 @@
 ## 权限
 
 | 权限 | 必需性 | 用途 | 拒绝后的降级 |
-|---|---|---|---|
-| Accessibility（辅助功能） | 必需 | 读窗口标题与浏览器 URL | 仅记录 app 名，项目归属退化为"按应用" |
-| Screen Recording | **不需要** | — | 本工具不做截图 |
+|---|---|---|
+| Accessibility（辅助功能） | 必需 | 读窗口标题与浏览器 URL（补齐 Alma 缺失的窗口标题） | 仅记录 app 名与 Alma 基础事件 |
+| Screen Recording | **不需要** | — | DayHelm 自身不做截图 |
 
-关于 Screen Recording：窗口标题有两条路，AX 或 `CGWindowList`。本工具**只走 AX**，因此不需要 Screen Recording 权限。这一点与 Alma recorder 不同（它虽然也写 AX 路径，但字段被硬编码为 null）。
+关于 Screen Recording：窗口标题有两条路，AX 或 `CGWindowList`。本工具**只走 AX**，因此不需要 Screen Recording 权限。这一点正好补齐了 Alma recorder（`windowTitle` 硬编码为 null）的短板。
 
 权限被拒绝时：
 
 - 不弹反复纠缠的对话框
 - 在菜单栏主屏明确显示"权限缺失，标题不可用"，并给一个跳转系统设置的按钮
-- 采集继续运行，降级为仅 app 名
+- 采集继续运行，降级为仅记录 app 名与 Alma 基础事件
 
 ## 数据删除
 
 必须提供一条命令，删除后不可恢复：
 
 ```bash
-focus-guard purge            # 删除 ~/.config/alma/focus-live/ 全部内容
-focus-guard purge --before 2026-11-01   # 按日期删除
+dayhelm purge            # 删除 ~/.config/alma/dayhelm/ 全部内容
+dayhelm purge --before 2026-11-01   # 按日期删除
 ```
 
 删除时必须：
 
-- 同时清理 `today.json`、`blocks/`、`config.json` 中的用户输入内容（交付物文本、备注）
+- 同时清理 `today.json`、`days/`、`config.json` 中的用户输入内容（备注文本等）
 - 明确打印删除了什么、多少字节
 - 不做"软删除"、不留备份
 
@@ -103,6 +103,7 @@ focus-guard purge --before 2026-11-01   # 按日期删除
 ```
 data/
 today.json
+days/
 blocks/
 *.sqlite
 *.sqlite-*
