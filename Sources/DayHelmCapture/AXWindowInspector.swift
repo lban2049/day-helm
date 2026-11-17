@@ -7,7 +7,14 @@ import IOKit
 
 public protocol ActivityInspecting: AnyObject, Sendable {
     var isAccessibilityTrusted: Bool { get }
+    func requestAccessibilityPrompt() -> Bool
     func inspectCurrent() -> ActivitySample
+}
+
+public extension ActivityInspecting {
+    func requestAccessibilityPrompt() -> Bool {
+        isAccessibilityTrusted
+    }
 }
 
 public final class AXWindowInspector: ActivityInspecting, @unchecked Sendable {
@@ -38,6 +45,13 @@ public final class AXWindowInspector: ActivityInspecting, @unchecked Sendable {
 
     public var isAccessibilityTrusted: Bool {
         AXIsProcessTrusted()
+    }
+
+    @discardableResult
+    public func requestAccessibilityPrompt() -> Bool {
+        let promptKey = "AXTrustedCheckOptionPrompt" as CFString
+        let options = [promptKey: kCFBooleanTrue as Any] as CFDictionary
+        return AXIsProcessTrustedWithOptions(options)
     }
 
     public var isScreenLocked: Bool {

@@ -80,8 +80,14 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-echo "[DayHelm] Ad-hoc signing ${APP_BUNDLE}..."
-codesign --force --deep --sign - "${APP_BUNDLE}"
+SIGN_IDENTITY="-"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Stage0 Local Code Signing"; then
+  SIGN_IDENTITY="Stage0 Local Code Signing"
+fi
+
+echo "[DayHelm] Signing ${APP_BUNDLE} with identity '${SIGN_IDENTITY}'..."
+codesign --force --deep --sign "${SIGN_IDENTITY}" "${APP_BUNDLE}"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${APP_BUNDLE}" 2>/dev/null || true
 
 echo "[DayHelm] Packaged successfully: ${APP_BUNDLE}"
 echo "  Run live:           open \"${APP_BUNDLE}\""

@@ -195,6 +195,11 @@ public final class HybridActivityCoordinator: ObservableObject {
         isStarted = true
 
         if !isSyntheticDemo {
+            if !inspector.isAccessibilityTrusted {
+                axTrusted = inspector.requestAccessibilityPrompt()
+            } else {
+                axTrusted = true
+            }
             Task { [weak self] in
                 await self?.syncFromAlma(isInitialBackfill: true)
             }
@@ -374,6 +379,7 @@ public final class HybridActivityCoordinator: ObservableObject {
     }
 
     public func openAccessibilitySettings() {
+        axTrusted = inspector.requestAccessibilityPrompt()
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }

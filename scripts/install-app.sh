@@ -57,10 +57,18 @@ echo "[DayHelm] Installing standalone bundle to ${DEST_APP}..."
 rm -rf "${DEST_APP}"
 cp -R "${SRC_APP}" "${DEST_APP}"
 
-# 5. Re-apply ad-hoc codesign at final production path
-echo "[DayHelm] Ad-hoc signing ${DEST_APP}..."
-codesign --force --deep --sign - "${DEST_APP}"
+# 5. Apply stable code signing at final production path
+SIGN_IDENTITY="-"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "Stage0 Local Code Signing"; then
+  SIGN_IDENTITY="Stage0 Local Code Signing"
+fi
+
+echo "[DayHelm] Signing ${DEST_APP} with identity '${SIGN_IDENTITY}'..."
+codesign --force --deep --sign "${SIGN_IDENTITY}" "${DEST_APP}"
 codesign -v "${DEST_APP}"
+
+# 6. Register with LaunchServices so System Settings & Finder refresh the icon and path
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${DEST_APP}" 2>/dev/null || true
 
 echo "[DayHelm] Installed successfully: ${DEST_APP}"
 
