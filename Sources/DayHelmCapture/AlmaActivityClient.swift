@@ -153,6 +153,10 @@ public final class AlmaActivityClient: @unchecked Sendable {
     public let baseURL: URL
     private let transport: any AlmaHTTPTransport
     private let decoder = JSONDecoder()
+    private let cacheLock = NSLock()
+    private var endedSessionEventsCache: [String: [AlmaEvent]] = [:]
+    private var endedSessionOrder: [String] = []
+    private let maxCachedEndedSessions = 64
 
     public init(
         baseURL: URL = AlmaActivityClient.defaultBaseURL,
@@ -240,14 +244,36 @@ public final class AlmaActivityClient: @unchecked Sendable {
                 if let embedded = session.events {
                     allEvents.append(contentsOf: embedded)
                 } else {
-                    do {
-                        let events = try await fetchSessionEvents(sessionId: session.id)
-                        if events.isEmpty, let firstApp = session.appNames?.first, !firstApp.isEmpty {
-                            let start = Date(timeIntervalSince1970: TimeInterval(session.startedAtMs) / 1000.0)
-                            fallbackSamples.append(
-                                ActivitySample(
-                                    timestamp: start,
-                                    appName: firstApp,
+                    let cachedEvents: [AlmaEvent]?
+                    if session.endedAtMs != nil {
+                        cachedEvents = cacheLock.withLock { endedSessionEventsCache[session.id] }
+                    } else {
+                        cachedEvents = nil
+                    }
+
+                    if let cachedEvents {
+                        allEvents.append(contentsOf: cachedEvents)
+                    } else {
+                        do {
+                            let events = try await fetchSessionEvents(sessionId: session.id)
+                            if session.endedAtMs != nil {
+                                cacheLock.withLock {
+                                    if endedSessionEventsCache[session.id] == nil {
+                                        while endedSessionOrder.count >= maxCachedEndedSessions {
+                                            let evicted = endedSessionOrder.removeFirst()
+                                            endedSessionEventsCache.removeValue(forKey: evicted)
+                                        }
+                                        endedSessionOrder.append(session.id)
+                                    }
+                                    endedSessionEventsCache[session.id] = events
+                                }
+                            }
+                            if events.isEmpty, let firstApp = session.appNames?.first, !firstApp.isEmpty {
+                                let start = Date(timeIntervalSince1970: TimeInterval(session.startedAtMs) / 1000.0)
+                                fallbackSamples.append(
+                                    ActivitySample(
+                                        timestamp: start,
+                                        appName: firstApp,
                                     bundleId: nil,
                                     windowTitle: nil,
                                     url: nil,
@@ -259,9 +285,10 @@ public final class AlmaActivityClient: @unchecked Sendable {
                         } else {
                             allEvents.append(contentsOf: events)
                         }
-                    } catch {
-                        // Individual session detail failure shouldn't drop already fetched sessions
-                        continue
+                        } catch {
+                            // Individual session detail failure shouldn't drop already fetched sessions
+                            continue
+                        }
                     }
                 }
             }

@@ -9,20 +9,20 @@
 | 本机活动事件（`app_focus`, `browser_visit`, `click`, `keypress`, `typing_pause`, `lock`, `unlock`） | 毫秒级事件 + 2s 轮询（仅计数与时间戳，不录具体按键字符） | 基础监听（全局键鼠仅计次） | 构建完整会话边界、切换时间点与活跃度 |
 | 前台应用名 + `bundleId` | 事件驱动 + 2s 轮询 | 无需权限 | 记录应用切换频次与活动归属 |
 | 窗口标题 `windowTitle` | 2s 轮询 (AX `kAXTitleAttribute`) | Accessibility | 识别具体工作内容、补齐会话标题并辅助跑偏检测 |
-| 浏览器当前 `url` | 2s 轮询 (AX `AXDocument`) | Accessibility | 区分不同项目页面与泛刷行为（写入前剥离敏感 query 参数） |
-| 屏幕快照（可选深度录制） | 32-bin 直方图去重（`diffPct >= 4%`；`app_focus` 4s / `click` 10s / `typing_pause` 静默 2s 后 / 120s 心跳），JPEG 0.55 压缩 | **可选** `Screen Recording` + `deepRecordingEnabled` 开关 | 保留视觉工作上下文并驱动设备端 OCR；超过 1 天降采样为 480px/0.4，默认 7 天自动清理 |
-| 设备端 OCR 文本（可选深度录制） | 随去重快照在后台 `.utility` 队列运行 Apple Vision OCR（`zh-Hans` / `zh-Hant` / `en-US` / `ja`） | 同上（**完全本机离线识别**） | 为 AI Agent 与 `alma-time-audit` 提供可检索的屏幕语义摘要 |
+| 浏览器当前 `url` | 2s 轮询 (AX `AXDocument`)，缺失时经隐私预检后用 1s 超时 AppleScript 兜底（含熔断） | Accessibility (+ 可选 Automation) | 区分不同项目页面与泛刷行为（写入前剥离敏感 query 参数；锁屏或命中 `PrivacyRedactor` 绝不调用 AppleScript） |
+| 屏幕快照（可选深度录制） | 32-bin 直方图 (`>= 4%`) + 160×90 缩略像素差 (`>= 2%`) 双条件去重（`320px` 探针预检 + `1920px` JPEG 0.55） | **可选** `Screen Recording` + `deepRecordingEnabled` 开关 | 保留视觉工作上下文并驱动设备端 OCR；`>1天` 降采样为 `1280px/0.4` (`warm`)，`>7天` 降采样为 `640px/0.3` (`cold`)，默认保留 7 天且总磁盘上限 `10 GB`（超限裁至 `7.5 GB`） |
+| 设备端 OCR 文本（可选深度录制） | 随去重快照（`app_focus` 立即执行，非 `app_focus` 最小间隔 `25s`，按 `ocrEveryN` + 会话内连续去重），由短命无头子进程 `DayHelm __ocr-worker`（空闲 `15s` 或满 `10` 帧退出）从落盘 JPEG 按 `1280px` 缩略解码后运行 Apple Vision OCR（`.accurate`、`usesLanguageCorrection = false`） | 同上（**完全本机离线识别**） | 为 AI Agent 与 `alma-time-audit` 提供可检索的屏幕语义摘要 |
 | 空闲时长（秒数，不含内容） | 2s 轮询 (`CGEventSource` / `IOHIDSystem`) | 无需权限 | 判断人是否在场，避免空转计入专注时长 |
-| 屏幕锁定状态 | `DistributedNotificationCenter` 事件 | 无需权限 | 排除锁屏时段并立即终止截屏与 OCR |
+| 屏幕锁定状态 | `DistributedNotificationCenter` + 休眠/唤醒事件 | 无需权限 | 排除锁屏与休眠时段并立即终止截屏与 OCR |
 | 专注事项元数据（当前事项、目标配额、备注） | 用户输入 | — | 当日配额追踪与上下文恢复 |
 | Alma 历史回补事件（可选兼容） | 本地环回 `http://localhost:23001` 只读增量同步 | 无（仅当 Alma 运行时） | 兼容已有 Alma 会话历史 |
 
 ## 明确不采集
 
 - 音频、摄像头
-- 键盘输入**具体文本内容**（`NSEvent` 全局监听严格只记触发时间戳与活跃计数，**禁止访问 `characters` / `keyCode` 推断用户输入文本**）
+- 键盘输入**具体文本内容**（`NSEvent` 全局监听严格只记触发时间戳与聚合次数 `data.count`，**禁止访问 `characters` / `keyCode` / `modifierFlags` 推断用户输入文本，也不记录鼠标坐标**）
 - 剪贴板
-- 脱敏应用的屏幕截图与 OCR（命中 `PrivacyRedactor` 或锁屏时**绝对不截屏、不运行 OCR**）
+- 脱敏应用的屏幕截图与 OCR（命中 `PrivacyRedactor` 或锁屏时**绝对不截屏、不运行 OCR、不调用浏览器 AppleScript**）
 - 出站公网网络请求内容
 
 > 禁止通过按键监听推断用户输入文本。
@@ -33,11 +33,11 @@
 
 ```
 ~/.config/alma/dayhelm/
-  activity.sqlite        # 开放 SQLite 数据库（WAL 模式）：sessions / events / snapshots / ocr_frames
-  snapshots/YYYY-MM-DD/  # 去重后的 JPEG 快照（超过 1 天降采样为 480px/0.4，默认 7 天自动清理，OCR 文本与元数据保留）
+  activity.sqlite        # 开放 SQLite 数据库（WAL 模式）：sessions / events / snapshots / ocr_frames / ocr_fts
+  snapshots/YYYY-MM-DD/  # 去重后的 JPEG 快照（>1天 warm 1280px/0.4；>7天 cold 640px/0.3；默认 7 天过期清理 + 10GB 容量封顶）
   today.json             # 今日实时配额与上下文热数据（原子写）
   days/YYYY-MM-DD.json   # 日终定稿归档
-  config.json            # 事项配额、关键词与 deepRecordingEnabled / snapshotRetentionDays 配置
+  config.json            # 事项配额、关键词与采集器设置（含采集启停、防抖/心跳/空闲/停顿/轮询/JPEG 质量、Vision OCR 与语言/采样间隔、全局键鼠监听开关、sensitiveBundleIds、留存天数与存储上限）
 ```
 
 - 无遥测、无崩溃上报、无云同步、无网络分析
@@ -72,7 +72,7 @@
 即使未被 `PrivacyRedactor` 整条拦截，写入 SQLite 前仍会对以下字段做凭据擦除：
 
 - 事件 `data` 的每个值、快照 `window_title`、OCR 文本；
-- `Bearer/Basic <token>`、`api_key|token|secret|password|pwd|authorization ... = <value>`、`sk-...`、`ghp_...`、`xoxb-...`、`AKIA...`、JWT 三段式 → 敏感片段替换为 `***`；
+- `Bearer/Basic <token>`、`api_key|token|secret|password|pwd|authorization ... = <value>`、`sk-...`、`ghp_...`、`xoxb-...`、`AKIA...`、`AIza...`（Google API Key）、JWT 三段式、PEM 私钥块（`-----BEGIN ... PRIVATE KEY-----`）、美国 SSN（`\d{3}-\d{2}-\d{4}`）以及通过 Luhn 校验的 13–19 位银行卡号 → 敏感片段替换为脱敏掩码（如 `***` 或 `****-****-****-<last4>`）；
 - 任何形似 URL 的值额外走 `sanitizeURL`，删除 `token/session/sig/secret/password/auth/key` 查询参数。
 
 该脱敏位于 `ActivityDatabase` 写入口，CLI、HTTP 回填与测试均无法绕过。

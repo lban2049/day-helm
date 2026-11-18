@@ -112,7 +112,9 @@ public enum TimeAuditConfigLoader {
                 colorHex: budget.colorHex,
                 targetMinutes: budget.targetMinutes,
                 capMinutes: budget.capMinutes,
-                keywords: merged
+                keywords: merged,
+                appBundleIds: budget.appBundleIds,
+                domains: budget.domains
             )
         }
 

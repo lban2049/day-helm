@@ -4,7 +4,16 @@ import DayHelmCore
 import Foundation
 
 @MainActor
+public final class MenuBarPillModel: ObservableObject {
+    @Published public var text: String = "○ DayHelm · 待命"
+    public init() {}
+}
+
+@MainActor
 public final class HybridActivityCoordinator: ObservableObject {
+    public let pillModel = MenuBarPillModel()
+    public private(set) var isPopoverVisible: Bool = false
+    public private(set) var isRecorderWindowVisible: Bool = false
     @Published public private(set) var sessionState: FocusSessionState = .unassigned
     @Published public private(set) var taskProgressList: [TaskProgress] = []
     @Published public private(set) var spectrumSegments: [SpectrumSegment] = []
@@ -22,6 +31,9 @@ public final class HybridActivityCoordinator: ObservableObject {
     @Published public private(set) var lastTaskNote: String?
 
     @Published public var deepRecordingEnabled: Bool = true
+    @Published public private(set) var recorderSettings: DayHelmSettings = .default
+    @Published public private(set) var recorderStats: RecorderStorageStats = RecorderStorageStats()
+    @Published public private(set) var recentSessions: [RecordedSessionSummary] = []
     @Published public private(set) var screenCaptureTrusted: Bool = false
     @Published public private(set) var todaySnapshotCount: Int = 0
     @Published public private(set) var todayOCRCount: Int = 0
@@ -32,6 +44,7 @@ public final class HybridActivityCoordinator: ObservableObject {
     public let storeDirectoryURL: URL
 
     private let engine: DayHelmEngine
+    private let basePrivacyConfig: PrivacyRedactorConfig
     private let store: DayHelmStore?
     private let almaClient: AlmaActivityClient?
     private let inspector: any ActivityInspecting
@@ -41,11 +54,13 @@ public final class HybridActivityCoordinator: ObservableObject {
     private var httpServer: LocalActivityHTTPServer?
     private var eventMonitor: NativeEventMonitor?
     private var settings: DayHelmSettings
+    private var syntheticSessionDetails: [RecordedSessionDetail] = []
 
     private let runtimeStateBox = RuntimeStateBox()
 
     private var timerTask: Task<Void, Never>?
     private var almaSyncTask: Task<Void, Never>?
+    private var typingPauseTask: Task<Void, Never>?
     private var lastAlmaEventMs: Int64?
     private var latestAlmaBrowserSample: ActivitySample?
     private var lastAlmaInputAt: Date?
@@ -55,14 +70,14 @@ public final class HybridActivityCoordinator: ObservableObject {
     private var lastRecordedAt: Date?
     private var lastRecordedAppName: String?
     private var lastRecordedURLKey: String?
-    private var pendingTypingPauseAt: Date?
     private var idleSessionClosed: Bool = false
     private var lastPersistedAt: Date?
     private var tickCount: Int = 0
     private var isStarted: Bool = false
+    private var recorderCountRefreshInFlight: Bool = false
 
     private let minTitleChangeInterval: TimeInterval = 5.0
-    private let typingPauseQuietSeconds: TimeInterval = 2.0
+    private var typingPauseQuietSeconds: TimeInterval = 2.0
 
     public init(
         engine: DayHelmEngine,
@@ -76,6 +91,7 @@ public final class HybridActivityCoordinator: ObservableObject {
         httpServer: LocalActivityHTTPServer? = nil
     ) {
         self.engine = engine
+        self.basePrivacyConfig = engine.config.privacyConfig
         self.store = store
         self.almaClient = almaClient
         self.inspector = inspector
@@ -87,10 +103,17 @@ public final class HybridActivityCoordinator: ObservableObject {
 
         let loadedSettings = store?.loadSettings() ?? .default
         self.settings = loadedSettings
+        self.recorderSettings = loadedSettings
         self.deepRecordingEnabled = loadedSettings.deepRecordingEnabled
+        self.typingPauseQuietSeconds = TimeInterval(max(200, loadedSettings.typingPauseQuietMs)) / 1000.0
         self.storeDirectoryURL = store?.directory ?? DayHelmStore.defaultDirectory
         self.axTrusted = inspector.isAccessibilityTrusted
         self.screenCaptureTrusted = screenRecorder?.isScreenCaptureTrusted ?? false
+
+        let effectivePrivacy = loadedSettings.makePrivacyRedactorConfig(base: basePrivacyConfig)
+        engine.updatePrivacyConfig(effectivePrivacy)
+        inspector.updatePrivacyConfig(effectivePrivacy)
+        screenRecorder?.applySettings(loadedSettings)
 
         refreshPublishedState()
         refreshRecorderCounts()
@@ -247,8 +270,187 @@ public final class HybridActivityCoordinator: ObservableObject {
         coordinator.todayOCRCount = 18
         coordinator.apiServerPort = LocalActivityHTTPServer.defaultPrimaryPort
         coordinator.apiServerPorts = [LocalActivityHTTPServer.defaultPrimaryPort]
+
+        let demoDetails = Self.makeSyntheticSessionDetails(now: now)
+        coordinator.syntheticSessionDetails = demoDetails
+        coordinator.recentSessions = demoDetails.map(\.session)
+        coordinator.recorderStats = RecorderStorageStats(
+            totalSessions: demoDetails.count,
+            totalEvents: demoDetails.reduce(0) { $0 + $1.events.count },
+            totalSnapshots: demoDetails.reduce(0) { $0 + $1.snapshots.count },
+            totalOCRFrames: demoDetails.reduce(0) { $0 + $1.ocrFrames.count },
+            usedSnapshotBytes: 42_600_000,
+            activeSessionId: demoDetails.first?.session.id,
+            activeSessionStartedAt: demoDetails.first?.session.startedAt
+        )
         coordinator.refreshPublishedState()
         return coordinator
+    }
+
+    private static func makeSyntheticSessionDetails(now: Date) -> [RecordedSessionDetail] {
+        let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+        let s1Start = nowMs - 17 * 60_000
+        let s2Start = nowMs - 70 * 60_000
+        let s2End = s2Start + 26 * 60_000
+        let s3Start = nowMs - 210 * 60_000
+        let s3End = s3Start + 35 * 60_000
+
+        let d1 = RecordedSessionDetail(
+            session: RecordedSessionSummary(
+                id: "demo_sess_1",
+                startedAt: s1Start,
+                endedAt: nil,
+                durationMs: nil,
+                triggerKind: "app_focus",
+                appNames: ["Example Browser", "Terminal"],
+                eventCount: 4,
+                snapshotCount: 2,
+                totalBytes: 184_000,
+                analysisStatus: "analyzed",
+                analysisTitle: "Example Shop 商品详情页与脚本联调",
+                analysisDescription: "优化主图卖点文案并验证本地导出脚本输出。",
+                storageTier: "hot",
+                entities: ["domain": ["shop.example.com"], "repo": ["focus-guard"]],
+                topics: ["主图优化", "详情页预览"],
+                project: "ecommerce",
+                declaredTaskId: "ecommerce",
+                createdAt: s1Start,
+                updatedAt: nowMs - 10_000,
+                clickCount: 32,
+                keypressCount: 218
+            ),
+            events: [
+                RecordedActivityEvent(
+                    id: "demo_evt_1",
+                    sessionId: "demo_sess_1",
+                    timestamp: s1Start,
+                    kind: "app_focus",
+                    appName: "Example Browser",
+                    windowTitle: "Example Shop — 商品详情页预览",
+                    url: "https://shop.example.com/product/102",
+                    createdAt: s1Start
+                ),
+                RecordedActivityEvent(
+                    id: "demo_evt_2",
+                    sessionId: "demo_sess_1",
+                    timestamp: s1Start + 5 * 60_000,
+                    kind: "keypress",
+                    appName: "Terminal",
+                    windowTitle: "swift test — focus-guard",
+                    data: ["count": "120"],
+                    createdAt: s1Start + 5 * 60_000
+                )
+            ],
+            snapshots: [
+                RecordedSnapshot(
+                    id: "demo_snap_1",
+                    sessionId: "demo_sess_1",
+                    timestamp: s1Start + 60_000,
+                    filePath: "/tmp/demo_snap_1.jpg",
+                    width: 1440,
+                    height: 900,
+                    sizeBytes: 92_000,
+                    trigger: "app_focus",
+                    appName: "Example Browser",
+                    windowTitle: "Example Shop — 商品详情页预览",
+                    storageTier: "hot",
+                    createdAt: s1Start + 60_000
+                )
+            ],
+            ocrFrames: [
+                RecordedOCRFrame(
+                    id: "demo_ocr_1",
+                    snapshotId: "demo_snap_1",
+                    sessionId: "demo_sess_1",
+                    text: "Example Shop · 商品详情页主图卖点检查\nSKU: EX-102 · 状态: 待上线",
+                    charCount: 38,
+                    tokenCount: 16,
+                    createdAt: s1Start + 60_000
+                )
+            ]
+        )
+
+        let d2 = RecordedSessionDetail(
+            session: RecordedSessionSummary(
+                id: "demo_sess_2",
+                startedAt: s2Start,
+                endedAt: s2End,
+                durationMs: s2End - s2Start,
+                triggerKind: "app_focus",
+                appNames: ["Example Browser"],
+                eventCount: 6,
+                snapshotCount: 3,
+                totalBytes: 248_000,
+                analysisStatus: "analyzed",
+                analysisTitle: "Support Ticket #1042 退换货工单处理",
+                analysisDescription: "核对订单物流状态并完成工单回复。",
+                storageTier: "hot",
+                entities: ["domain": ["ops.example.com"]],
+                topics: ["工单处理"],
+                project: "ecommerce-ops",
+                declaredTaskId: "ecommerce-ops",
+                createdAt: s2Start,
+                updatedAt: s2End,
+                clickCount: 45,
+                keypressCount: 164
+            ),
+            events: [
+                RecordedActivityEvent(
+                    id: "demo_evt_3",
+                    sessionId: "demo_sess_2",
+                    timestamp: s2Start,
+                    kind: "browser_visit",
+                    appName: "Example Browser",
+                    windowTitle: "Support Ticket #1042 — 订单处理",
+                    url: "https://ops.example.com/tickets/1042",
+                    createdAt: s2Start
+                )
+            ],
+            snapshots: [],
+            ocrFrames: []
+        )
+
+        let d3 = RecordedSessionDetail(
+            session: RecordedSessionSummary(
+                id: "demo_sess_3",
+                startedAt: s3Start,
+                endedAt: s3End,
+                durationMs: s3End - s3Start,
+                triggerKind: "app_focus",
+                appNames: ["Example Notes", "Example Browser"],
+                eventCount: 9,
+                snapshotCount: 4,
+                totalBytes: 312_000,
+                analysisStatus: "analyzed",
+                analysisTitle: "Hermes Q4 行业研报摘录整理",
+                analysisDescription: "整理宏观数据摘要并归档关键结论。",
+                isMeeting: false,
+                storageTier: "warm",
+                entities: ["domain": ["docs.example.com"]],
+                topics: ["Q4 研报", "行业分析"],
+                project: "hermes",
+                declaredTaskId: "hermes",
+                createdAt: s3Start,
+                updatedAt: s3End,
+                clickCount: 28,
+                keypressCount: 342
+            ),
+            events: [
+                RecordedActivityEvent(
+                    id: "demo_evt_4",
+                    sessionId: "demo_sess_3",
+                    timestamp: s3Start,
+                    kind: "app_focus",
+                    appName: "Example Notes",
+                    windowTitle: "Hermes Equity Research — 行业周报",
+                    createdAt: s3Start
+                )
+            ],
+            snapshots: [],
+            ocrFrames: []
+        )
+
+        return [d1, d2, d3]
     }
 
     // MARK: - Lifecycle
@@ -258,6 +460,8 @@ public final class HybridActivityCoordinator: ObservableObject {
         isStarted = true
 
         if !isSyntheticDemo {
+            _ = try? database?.finalizeStaleOpenSessionsOnStartup()
+
             if !inspector.isAccessibilityTrusted {
                 axTrusted = inspector.requestAccessibilityPrompt()
             } else {
@@ -265,6 +469,7 @@ public final class HybridActivityCoordinator: ObservableObject {
             }
             screenCaptureTrusted = screenRecorder?.isScreenCaptureTrusted ?? false
             refreshRecorderCounts()
+            refreshRecorderSessions()
             syncCachedRuntimeState()
 
             if let server = httpServer {
@@ -286,13 +491,23 @@ public final class HybridActivityCoordinator: ObservableObject {
             }
 
             if eventMonitor == nil {
-                let monitor = NativeEventMonitor(clock: clock) { [weak self] event in
-                    Task { @MainActor [weak self] in
-                        self?.handleNativeMonitorEvent(event)
+                let monitor = NativeEventMonitor(
+                    clock: clock,
+                    inputMonitoringEnabled: settings.inputMonitoringEnabled,
+                    onRawInput: { [weak self] isKeypress, at in
+                        Task { @MainActor [weak self] in
+                            self?.handleRawInput(isKeypress: isKeypress, at: at)
+                        }
+                    },
+                    onEvent: { [weak self] event in
+                        Task { @MainActor [weak self] in
+                            self?.handleNativeMonitorEvent(event)
+                        }
                     }
-                }
+                )
                 monitor.start()
                 eventMonitor = monitor
+                syncCachedRuntimeState()
             }
         }
 
@@ -321,6 +536,8 @@ public final class HybridActivityCoordinator: ObservableObject {
         timerTask = nil
         almaSyncTask?.cancel()
         almaSyncTask = nil
+        typingPauseTask?.cancel()
+        typingPauseTask = nil
         eventMonitor?.stop()
         eventMonitor = nil
         httpServer?.stop()
@@ -328,18 +545,127 @@ public final class HybridActivityCoordinator: ObservableObject {
         apiServerPorts = []
         let endMs = Int64(clock.now().timeIntervalSince1970 * 1000)
         try? database?.closeActiveSessionIfNeeded(endedAtMs: endMs)
+        VisionOCRService.shutdownWorker()
         persistTodayIfNeeded()
     }
 
     // MARK: - User Actions
 
     public func setDeepRecordingEnabled(_ enabled: Bool) {
-        deepRecordingEnabled = enabled
-        settings.deepRecordingEnabled = enabled
+        var next = settings
+        next.deepRecordingEnabled = enabled
+        updateRecorderSettings(next)
+    }
+
+    public func updateRecorderSettings(_ newSettings: DayHelmSettings) {
+        let normalized = DayHelmSettings(
+            activityRecorderEnabled: newSettings.activityRecorderEnabled,
+            deepRecordingEnabled: newSettings.deepRecordingEnabled,
+            visionOCREnabled: newSettings.visionOCREnabled,
+            inputMonitoringEnabled: newSettings.inputMonitoringEnabled,
+            appFocusDebounceMs: newSettings.appFocusDebounceMs,
+            heartbeatIntervalMs: newSettings.heartbeatIntervalMs,
+            recorderIdleThresholdMs: newSettings.recorderIdleThresholdMs,
+            typingPauseQuietMs: newSettings.typingPauseQuietMs,
+            visualCheckIntervalMs: newSettings.visualCheckIntervalMs,
+            jpegQuality: newSettings.jpegQuality,
+            ocrLanguages: newSettings.ocrLanguages,
+            sensitiveBundleIds: newSettings.sensitiveBundleIds,
+            snapshotRetentionDays: newSettings.snapshotRetentionDays,
+            snapshotMaxStorageBytes: newSettings.snapshotMaxStorageBytes,
+            ocrEveryN: newSettings.ocrEveryN
+        )
+
+        let wasRecorderEnabled = settings.activityRecorderEnabled
+        settings = normalized
+        recorderSettings = normalized
+        deepRecordingEnabled = normalized.deepRecordingEnabled
+        typingPauseQuietSeconds = TimeInterval(max(200, normalized.typingPauseQuietMs)) / 1000.0
+
         if !isSyntheticDemo, let store {
-            try? store.saveSettings(settings)
+            try? store.saveSettings(normalized)
+        }
+
+        let effectivePrivacy = normalized.makePrivacyRedactorConfig(base: basePrivacyConfig)
+        engine.updatePrivacyConfig(effectivePrivacy)
+        inspector.updatePrivacyConfig(effectivePrivacy)
+        screenRecorder?.applySettings(normalized)
+        eventMonitor?.setInputMonitoringEnabled(normalized.inputMonitoringEnabled)
+
+        if wasRecorderEnabled && !normalized.activityRecorderEnabled {
+            typingPauseTask?.cancel()
+            typingPauseTask = nil
+            if !isSyntheticDemo, let database {
+                let endMs = Int64(clock.now().timeIntervalSince1970 * 1000)
+                try? database.closeActiveSessionIfNeeded(endedAtMs: endMs)
+            }
+            idleSessionClosed = true
+        } else if !wasRecorderEnabled && normalized.activityRecorderEnabled {
+            idleSessionClosed = false
+        }
+
+        refreshRecorderCounts()
+        refreshRecorderSessions()
+        syncCachedRuntimeState()
+    }
+
+    public func refreshPermissions() {
+        axTrusted = inspector.isAccessibilityTrusted
+        if let screenRecorder {
+            screenCaptureTrusted = screenRecorder.isScreenCaptureTrusted
         }
         syncCachedRuntimeState()
+    }
+
+    public func refreshRecorderSessions(searchQuery: String? = nil, limit: Int = 50) {
+        let trimmedQuery = searchQuery?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if isSyntheticDemo {
+            if trimmedQuery.isEmpty {
+                recentSessions = Array(syntheticSessionDetails.map(\.session).prefix(max(1, limit)))
+            } else {
+                let lower = trimmedQuery.lowercased()
+                recentSessions = syntheticSessionDetails
+                    .filter { detail in
+                        let s = detail.session
+                        if (s.analysisTitle?.lowercased().contains(lower) ?? false)
+                            || (s.analysisDescription?.lowercased().contains(lower) ?? false)
+                            || s.appNames.contains(where: { $0.lowercased().contains(lower) })
+                            || (s.project?.lowercased().contains(lower) ?? false) {
+                            return true
+                        }
+                        if detail.events.contains(where: {
+                            ($0.appName?.lowercased().contains(lower) ?? false)
+                                || ($0.windowTitle?.lowercased().contains(lower) ?? false)
+                                || ($0.url?.lowercased().contains(lower) ?? false)
+                        }) {
+                            return true
+                        }
+                        return detail.ocrFrames.contains(where: { $0.text.lowercased().contains(lower) })
+                    }
+                    .map(\.session)
+                    .prefix(max(1, limit))
+                    .map { $0 }
+            }
+            return
+        }
+
+        guard let database else {
+            recentSessions = []
+            return
+        }
+
+        if trimmedQuery.isEmpty {
+            recentSessions = (try? database.listSessions(limit: max(1, limit))) ?? []
+        } else {
+            recentSessions = (try? database.searchSessions(keyword: trimmedQuery, limit: max(1, limit))) ?? []
+        }
+    }
+
+    public func loadSessionDetail(sessionId: String) -> RecordedSessionDetail? {
+        if isSyntheticDemo {
+            return syntheticSessionDetails.first(where: { $0.session.id == sessionId })
+        }
+        return try? database?.getSessionDetail(sessionId: sessionId)
     }
 
     @discardableResult
@@ -368,8 +694,8 @@ public final class HybridActivityCoordinator: ObservableObject {
             engine.dismissAlert(id: alert.id)
             activeAlert = nil
         }
-        refreshPublishedState()
-        persistTodayIfNeeded()
+        let metrics = refreshPublishedState(now: now)
+        persistTodayIfNeeded(now: now, precomputedMetrics: metrics)
     }
 
     public func pauseFocus(note: String? = nil) {
@@ -381,8 +707,8 @@ public final class HybridActivityCoordinator: ObservableObject {
             engine.dismissAlert(id: alert.id)
             activeAlert = nil
         }
-        refreshPublishedState()
-        persistTodayIfNeeded()
+        let metrics = refreshPublishedState(now: now)
+        persistTodayIfNeeded(now: now, precomputedMetrics: metrics)
     }
 
     public func stopToStandby(note: String? = nil) {
@@ -394,8 +720,8 @@ public final class HybridActivityCoordinator: ObservableObject {
             engine.dismissAlert(id: alert.id)
             activeAlert = nil
         }
-        refreshPublishedState()
-        persistTodayIfNeeded()
+        let metrics = refreshPublishedState(now: now)
+        persistTodayIfNeeded(now: now, precomputedMetrics: metrics)
     }
 
     public func handleAlertAction(_ action: SupervisorAction) {
@@ -430,9 +756,12 @@ public final class HybridActivityCoordinator: ObservableObject {
         if let currentAlert {
             engine.dismissAlert(id: currentAlert.id)
         }
-        activeAlert = engine.pendingAlerts.last
-        refreshPublishedState()
-        persistTodayIfNeeded()
+        let nextAlert = engine.pendingAlerts.last
+        if activeAlert != nextAlert {
+            activeAlert = nextAlert
+        }
+        let metrics = refreshPublishedState(now: now)
+        persistTodayIfNeeded(now: now, precomputedMetrics: metrics)
     }
 
     public func updateBudget(taskId: String, targetMinutes: Int?, capMinutes: Int?) {
@@ -444,13 +773,16 @@ public final class HybridActivityCoordinator: ObservableObject {
                 colorHex: budget.colorHex,
                 targetMinutes: targetMinutes,
                 capMinutes: capMinutes,
-                keywords: budget.keywords
+                keywords: budget.keywords,
+                appBundleIds: budget.appBundleIds,
+                domains: budget.domains
             )
         }
         engine.updateBudgets(updated)
         saveBudgetsIfNeeded()
-        refreshPublishedState()
-        persistTodayIfNeeded()
+        let now = clock.now()
+        let metrics = refreshPublishedState(now: now)
+        persistTodayIfNeeded(now: now, precomputedMetrics: metrics)
     }
 
     @discardableResult
@@ -459,42 +791,52 @@ public final class HybridActivityCoordinator: ObservableObject {
         colorHex: String,
         targetMinutes: Int?,
         capMinutes: Int?,
-        keywords: [String]
+        keywords: [String],
+        appBundleIds: [String] = [],
+        domains: [String] = []
     ) -> TaskBudget {
         let created = engine.addTask(
             displayName: displayName,
             colorHex: colorHex,
             targetMinutes: targetMinutes,
             capMinutes: capMinutes,
-            keywords: keywords
+            keywords: keywords,
+            appBundleIds: appBundleIds,
+            domains: domains
         )
         saveBudgetsIfNeeded()
-        refreshPublishedState()
-        persistTodayIfNeeded()
+        let now = clock.now()
+        let metrics = refreshPublishedState(now: now)
+        persistTodayIfNeeded(now: now, precomputedMetrics: metrics)
         return created
     }
 
     public func updateTask(_ updatedBudget: TaskBudget) {
         _ = engine.updateTask(updatedBudget)
         saveBudgetsIfNeeded()
-        refreshPublishedState()
-        persistTodayIfNeeded()
+        let now = clock.now()
+        let metrics = refreshPublishedState(now: now)
+        persistTodayIfNeeded(now: now, precomputedMetrics: metrics)
     }
 
     public func deleteTask(taskId: String) {
         let now = clock.now()
         _ = engine.deleteTask(taskId: taskId, at: now)
-        activeAlert = engine.pendingAlerts.last
+        let nextAlert = engine.pendingAlerts.last
+        if activeAlert != nextAlert {
+            activeAlert = nextAlert
+        }
         saveBudgetsIfNeeded()
-        refreshPublishedState()
-        persistTodayIfNeeded()
+        let metrics = refreshPublishedState(now: now)
+        persistTodayIfNeeded(now: now, precomputedMetrics: metrics)
     }
 
     public func moveTask(fromOffsets: IndexSet, toOffset: Int) {
         engine.moveTask(fromOffsets: fromOffsets, toOffset: toOffset)
         saveBudgetsIfNeeded()
-        refreshPublishedState()
-        persistTodayIfNeeded()
+        let now = clock.now()
+        let metrics = refreshPublishedState(now: now)
+        persistTodayIfNeeded(now: now, precomputedMetrics: metrics)
     }
 
     private func saveBudgetsIfNeeded() {
@@ -553,16 +895,28 @@ public final class HybridActivityCoordinator: ObservableObject {
 
     // MARK: - Polling & Sync
 
+    private var recorderIdleThresholdSeconds: TimeInterval {
+        TimeInterval(max(5000, settings.recorderIdleThresholdMs)) / 1000.0
+    }
+
     public func pollOnce() {
         let now = clock.now()
         checkDayRolloverIfNeeded(now: now)
 
-        axTrusted = inspector.isAccessibilityTrusted
+        let nextAxTrusted = inspector.isAccessibilityTrusted
+        if axTrusted != nextAxTrusted {
+            axTrusted = nextAxTrusted
+        }
         if let screenRecorder {
-            screenCaptureTrusted = screenRecorder.isScreenCaptureTrusted
+            let nextScreenCaptureTrusted = screenRecorder.isScreenCaptureTrusted
+            if screenCaptureTrusted != nextScreenCaptureTrusted {
+                screenCaptureTrusted = nextScreenCaptureTrusted
+            }
         }
 
-        var sample = PrivacyRedactor.redact(inspector.inspectCurrent(), config: engine.config.privacyConfig)
+        let privacy = engine.effectivePrivacyConfig
+        let rawSample = inspector.inspectCurrent()
+        var sample = (inspector is AXWindowInspector) ? rawSample : PrivacyRedactor.redact(rawSample, config: privacy)
 
         if !sample.screenLocked {
             var patchedTitle = sample.windowTitle
@@ -586,10 +940,7 @@ public final class HybridActivityCoordinator: ObservableObject {
                 patchedURL = patchedURL ?? almaBrowser.url
             }
 
-            if patchedTitle != sample.windowTitle
-                || patchedURL != sample.url
-                || patchedInputActive != sample.inputActive
-                || patchedIdle != sample.idleSeconds {
+            if patchedTitle != sample.windowTitle || patchedURL != sample.url {
                 sample = PrivacyRedactor.redact(
                     ActivitySample(
                         timestamp: sample.timestamp,
@@ -602,168 +953,294 @@ public final class HybridActivityCoordinator: ObservableObject {
                         inputActive: patchedInputActive,
                         redacted: sample.redacted
                     ),
-                    config: engine.config.privacyConfig
+                    config: privacy
+                )
+            } else if patchedInputActive != sample.inputActive || patchedIdle != sample.idleSeconds {
+                sample = ActivitySample(
+                    timestamp: sample.timestamp,
+                    appName: sample.appName,
+                    bundleId: sample.bundleId,
+                    windowTitle: sample.windowTitle,
+                    url: sample.url,
+                    idleSeconds: patchedIdle,
+                    screenLocked: sample.screenLocked,
+                    inputActive: patchedInputActive,
+                    redacted: sample.redacted
                 )
             }
         }
 
-        let alerts = engine.ingest(sample)
-        if let newest = alerts.last {
+        let alerts = engine.ingestAlreadyRedacted(sample)
+        if let newest = alerts.last, activeAlert != newest {
             activeAlert = newest
         }
 
-        // Idle / locked: close the open session at its last activity and stop screenshots.
-        let isAbsent = sample.screenLocked || sample.idleSeconds >= engine.config.idleThresholdSeconds
-        if isAbsent {
-            pendingTypingPauseAt = nil
-            if !idleSessionClosed, !isSyntheticDemo, let database {
-                try? database.closeActiveSessionAtLastActivity()
-                idleSessionClosed = true
+        var didRecordSample = false
+        let wasFirstRecord = (lastRecordedAt == nil)
+        if settings.activityRecorderEnabled {
+            // Idle / locked: close the open session at its last activity and stop screenshots.
+            let idleThreshold = recorderIdleThresholdSeconds
+            let isAbsent = sample.screenLocked || sample.idleSeconds >= idleThreshold
+            if isAbsent {
+                typingPauseTask?.cancel()
+                typingPauseTask = nil
+                if !idleSessionClosed, !isSyntheticDemo, let database {
+                    try? database.closeActiveSessionAtLastActivity()
+                    idleSessionClosed = true
+                }
+            } else {
+                idleSessionClosed = false
             }
-        } else {
-            idleSessionClosed = false
-            if let pending = pendingTypingPauseAt,
-               sample.timestamp.timeIntervalSince(pending) >= typingPauseQuietSeconds {
-                pendingTypingPauseAt = nil
-                screenRecorder?.triggerTypingPauseCaptureIfNeeded(
+
+            didRecordSample = recordSampleToDatabaseIfNeeded(sample)
+            if !isAbsent {
+                screenRecorder?.evaluatePeriodicCaptureIfNeeded(
                     sample: sample,
                     deepRecordingEnabled: deepRecordingEnabled,
                     declaredTaskId: currentDeclaredTaskId(),
-                    idleThresholdSeconds: engine.config.idleThresholdSeconds
+                    idleThresholdSeconds: idleThreshold,
+                    retentionDays: settings.snapshotRetentionDays,
+                    maxStorageBytes: settings.snapshotMaxStorageBytes,
+                    ocrEveryN: settings.ocrEveryN
                 ) { [weak self] in
                     Task { @MainActor [weak self] in
-                        self?.refreshRecorderCounts()
+                        guard let self, !self.shouldGateBackgroundUI else { return }
+                        self.refreshRecorderCountsAsync()
                     }
                 }
             }
+        } else {
+            typingPauseTask?.cancel()
+            typingPauseTask = nil
         }
 
-        recordSampleToDatabaseIfNeeded(sample)
-        if !isAbsent {
-            screenRecorder?.evaluatePeriodicCaptureIfNeeded(
-                sample: sample,
-                deepRecordingEnabled: deepRecordingEnabled,
-                declaredTaskId: currentDeclaredTaskId(),
-                idleThresholdSeconds: engine.config.idleThresholdSeconds,
-                retentionDays: settings.snapshotRetentionDays
-            ) { [weak self] in
-                Task { @MainActor [weak self] in
-                    self?.refreshRecorderCounts()
-                }
-            }
-        }
         screenRecorder?.runRetentionMaintenanceIfNeeded(
             retentionDays: settings.snapshotRetentionDays,
+            maxStorageBytes: settings.snapshotMaxStorageBytes,
             now: now
         )
 
-        refreshPublishedState()
-        if lastPersistedAt == nil || now.timeIntervalSince(lastPersistedAt!) >= 10.0 {
-            persistTodayIfNeeded()
+        let precomputedMetrics = refreshPublishedState(now: now)
+        if didRecordSample && !shouldGateBackgroundUI {
+            if wasFirstRecord {
+                refreshRecorderCounts()
+            } else {
+                refreshRecorderCountsAsync()
+            }
         }
-        syncCachedRuntimeState()
+        if lastPersistedAt == nil || now.timeIntervalSince(lastPersistedAt!) >= 30.0 {
+            persistTodayIfNeeded(now: now, precomputedMetrics: precomputedMetrics)
+        }
+    }
+
+    private var shouldGateBackgroundUI: Bool {
+        isStarted && !isPopoverVisible && !isRecorderWindowVisible
+    }
+
+    public func setPopoverVisible(_ visible: Bool) {
+        isPopoverVisible = visible
+        if visible {
+            refreshPublishedState(now: clock.now(), forceUI: true)
+            refreshRecorderCountsAsync()
+        }
+    }
+
+    public func setRecorderWindowVisible(_ visible: Bool) {
+        isRecorderWindowVisible = visible
+        if visible {
+            refreshPublishedState(now: clock.now(), forceUI: true)
+            refreshRecorderCountsAsync()
+        }
+    }
+
+    public func releaseHistoryWindowCaches() {
+        if !isSyntheticDemo {
+            recentSessions = []
+        }
     }
 
     private func onOneSecondTick() {
         tickCount += 1
-        updateElapsedFocusSeconds()
+        if isPopoverVisible {
+            updateElapsedFocusSeconds()
+        }
 
         if !isSyntheticDemo {
             if tickCount % 2 == 0 {
                 pollOnce()
             }
-            if tickCount % 10 == 0 {
-                persistTodayIfNeeded()
-                refreshRecorderCounts()
+            if tickCount % 10 == 0 && !shouldGateBackgroundUI {
+                refreshRecorderCountsAsync()
             }
         }
+    }
+
+    public func handleMonitorEventForTesting(_ event: NativeMonitorEvent) {
+        handleNativeMonitorEvent(event)
+    }
+
+    private func handleRawInput(isKeypress: Bool, at timestamp: Date) {
+        guard !isSyntheticDemo, settings.activityRecorderEnabled, settings.inputMonitoringEnabled else { return }
+        lastNativeInputAt = timestamp
+        guard isKeypress else { return }
+
+        typingPauseTask?.cancel()
+        let quietNanos = UInt64(typingPauseQuietSeconds * 1_000_000_000)
+        typingPauseTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: quietNanos)
+            guard !Task.isCancelled, let self else { return }
+            self.triggerTypingPauseCaptureAfterQuietWindow()
+        }
+    }
+
+    private func triggerTypingPauseCaptureAfterQuietWindow() {
+        guard !isSyntheticDemo, settings.activityRecorderEnabled else { return }
+        let sample = PrivacyRedactor.redact(inspector.inspectCurrent(), config: engine.effectivePrivacyConfig)
+        let idleThreshold = recorderIdleThresholdSeconds
+        guard !sample.screenLocked,
+              !sample.redacted,
+              sample.idleSeconds < idleThreshold else {
+            return
+        }
+        screenRecorder?.triggerTypingPauseCaptureIfNeeded(
+            sample: sample,
+            deepRecordingEnabled: deepRecordingEnabled,
+            declaredTaskId: currentDeclaredTaskId(),
+            idleThresholdSeconds: idleThreshold,
+            ocrEveryN: settings.ocrEveryN
+        ) { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, !self.shouldGateBackgroundUI else { return }
+                self.refreshRecorderCountsAsync()
+            }
+        }
+    }
+
+    private func resolveSampleForInputEvent(at timestamp: Date) -> ActivitySample {
+        if let existing = latestSample, abs(timestamp.timeIntervalSince(existing.timestamp)) <= 1.5 {
+            return existing
+        }
+        let fresh = PrivacyRedactor.redact(inspector.inspectCurrent(), config: engine.effectivePrivacyConfig)
+        return fresh
     }
 
     private func handleNativeMonitorEvent(_ event: NativeMonitorEvent) {
         guard !isSyntheticDemo else { return }
         let tsMs = Int64(event.timestamp.timeIntervalSince1970 * 1000)
         let taskId = currentDeclaredTaskId()
+        let privacy = engine.effectivePrivacyConfig
+        let idleThreshold = recorderIdleThresholdSeconds
 
         switch event.kind {
         case "app_focus":
-            let sample = PrivacyRedactor.redact(inspector.inspectCurrent(), config: engine.config.privacyConfig)
+            let sample = PrivacyRedactor.redact(inspector.inspectCurrent(), config: privacy)
             let alerts = engine.ingest(sample)
-            if let newest = alerts.last {
+            if let newest = alerts.last, activeAlert != newest {
                 activeAlert = newest
             }
-            if !sample.screenLocked {
-                recordSampleToDatabaseIfNeeded(sample)
+            if settings.activityRecorderEnabled, !sample.screenLocked {
+                _ = recordSampleToDatabaseIfNeeded(sample)
                 screenRecorder?.triggerAppFocusCaptureIfNeeded(
                     sample: sample,
                     deepRecordingEnabled: deepRecordingEnabled,
                     declaredTaskId: taskId,
-                    idleThresholdSeconds: engine.config.idleThresholdSeconds
+                    idleThresholdSeconds: idleThreshold,
+                    ocrEveryN: settings.ocrEveryN
                 ) { [weak self] in
                     Task { @MainActor [weak self] in
-                        self?.refreshRecorderCounts()
+                        guard let self, !self.shouldGateBackgroundUI else { return }
+                        self.refreshRecorderCountsAsync()
                     }
                 }
             }
             refreshPublishedState()
-            syncCachedRuntimeState()
+            if !shouldGateBackgroundUI {
+                refreshRecorderCountsAsync()
+            }
+
+        case "will_sleep":
+            typingPauseTask?.cancel()
+            typingPauseTask = nil
+            VisionOCRService.shutdownWorker()
+            if !idleSessionClosed, let database {
+                try? database.closeActiveSessionAtLastActivity()
+                idleSessionClosed = true
+            }
+
+        case "did_wake":
+            screenRecorder?.resetDeduplicationBaseline()
+            let current = inspector.inspectCurrent()
+            if !current.screenLocked {
+                idleSessionClosed = false
+            }
 
         case "lock":
-            _ = try? database?.insertEvent(
-                timestampMs: tsMs,
-                kind: "lock",
-                appName: "loginwindow",
-                declaredTaskId: taskId,
-                project: taskId
-            )
-            pollOnce()
-
-        case "unlock":
-            _ = try? database?.insertEvent(
-                timestampMs: tsMs,
-                kind: "unlock",
-                appName: "loginwindow",
-                declaredTaskId: taskId,
-                project: taskId
-            )
-            pollOnce()
-
-        case "click", "keypress":
-            lastNativeInputAt = event.timestamp
-            if event.kind == "keypress" {
-                pendingTypingPauseAt = event.timestamp
-            }
-            if latestSample?.screenLocked != true {
+            typingPauseTask?.cancel()
+            typingPauseTask = nil
+            VisionOCRService.shutdownWorker()
+            if settings.activityRecorderEnabled {
                 _ = try? database?.insertEvent(
                     timestampMs: tsMs,
-                    kind: event.kind,
-                    appName: latestSample?.appName,
-                    windowTitle: latestSample?.redacted == true ? nil : latestSample?.windowTitle,
-                    url: latestSample?.redacted == true ? nil : latestSample?.url,
-                    data: [:],
+                    kind: "lock",
+                    appName: "loginwindow",
                     declaredTaskId: taskId,
                     project: taskId
                 )
             }
-            if event.kind == "click", let sample = latestSample, !sample.screenLocked {
+            pollOnce()
+
+        case "unlock":
+            screenRecorder?.resetDeduplicationBaseline()
+            idleSessionClosed = false
+            if settings.activityRecorderEnabled {
+                _ = try? database?.insertEvent(
+                    timestampMs: tsMs,
+                    kind: "unlock",
+                    appName: "loginwindow",
+                    declaredTaskId: taskId,
+                    project: taskId
+                )
+            }
+            pollOnce()
+
+        case "click", "keypress":
+            guard settings.activityRecorderEnabled, settings.inputMonitoringEnabled else { return }
+            lastNativeInputAt = event.timestamp
+            let activeSample = resolveSampleForInputEvent(at: event.timestamp)
+            if !activeSample.screenLocked {
+                _ = try? database?.insertEvent(
+                    timestampMs: tsMs,
+                    kind: event.kind,
+                    appName: activeSample.appName,
+                    windowTitle: activeSample.redacted ? nil : activeSample.windowTitle,
+                    url: activeSample.redacted ? nil : activeSample.url,
+                    data: ["count": String(max(1, event.count))],
+                    declaredTaskId: taskId,
+                    project: taskId
+                )
+            }
+            if event.kind == "click", !activeSample.screenLocked {
                 let clickSample = ActivitySample(
                     timestamp: event.timestamp,
-                    appName: sample.appName,
-                    bundleId: sample.bundleId,
-                    windowTitle: sample.windowTitle,
-                    url: sample.url,
-                    idleSeconds: sample.idleSeconds,
-                    screenLocked: sample.screenLocked,
+                    appName: activeSample.appName,
+                    bundleId: activeSample.bundleId,
+                    windowTitle: activeSample.windowTitle,
+                    url: activeSample.url,
+                    idleSeconds: 0,
+                    screenLocked: activeSample.screenLocked,
                     inputActive: true,
-                    redacted: sample.redacted
+                    redacted: activeSample.redacted
                 )
                 screenRecorder?.triggerClickCaptureIfNeeded(
                     sample: clickSample,
                     deepRecordingEnabled: deepRecordingEnabled,
                     declaredTaskId: taskId,
-                    idleThresholdSeconds: engine.config.idleThresholdSeconds
+                    idleThresholdSeconds: idleThreshold,
+                    ocrEveryN: settings.ocrEveryN
                 ) { [weak self] in
                     Task { @MainActor [weak self] in
-                        self?.refreshRecorderCounts()
+                        guard let self, !self.shouldGateBackgroundUI else { return }
+                        self.refreshRecorderCountsAsync()
                     }
                 }
             }
@@ -773,10 +1250,11 @@ public final class HybridActivityCoordinator: ObservableObject {
         }
     }
 
-    private func recordSampleToDatabaseIfNeeded(_ sample: ActivitySample) {
-        guard !isSyntheticDemo, let database else { return }
-        guard !sample.screenLocked, sample.idleSeconds < engine.config.idleThresholdSeconds else {
-            return
+    @discardableResult
+    private func recordSampleToDatabaseIfNeeded(_ sample: ActivitySample) -> Bool {
+        guard !isSyntheticDemo, settings.activityRecorderEnabled, let database else { return false }
+        guard !sample.screenLocked, sample.idleSeconds < recorderIdleThresholdSeconds else {
+            return false
         }
 
         let key = ActivityTextNormalizer.normalizedChangeKey(
@@ -787,14 +1265,15 @@ public final class HybridActivityCoordinator: ObservableObject {
         )
         let appChanged = (sample.appName != lastRecordedAppName)
         let keyChanged = (key != lastRecordedSampleKey)
-        let heartbeatDue = lastRecordedHeartbeatAt.map { sample.timestamp.timeIntervalSince($0) >= 30.0 } ?? true
+        let heartbeatDue = (sample.idleSeconds < 30.0)
+            && (lastRecordedHeartbeatAt.map { sample.timestamp.timeIntervalSince($0) >= 30.0 } ?? true)
         // Title-only jitter is throttled; app switches are always recorded immediately.
         let withinTitleThrottle: Bool = {
             guard !appChanged, let last = lastRecordedAt else { return false }
             return sample.timestamp.timeIntervalSince(last) < minTitleChangeInterval
         }()
 
-        guard heartbeatDue || (keyChanged && !withinTitleThrottle) else { return }
+        guard heartbeatDue || (keyChanged && !withinTitleThrottle) else { return false }
 
         let tsMs = Int64(sample.timestamp.timeIntervalSince1970 * 1000)
         let taskId = currentDeclaredTaskId()
@@ -841,12 +1320,15 @@ public final class HybridActivityCoordinator: ObservableObject {
         if kind == ActivityEventKind.browserVisit.rawValue {
             lastRecordedURLKey = urlKey
         }
+        return true
     }
 
     private func syncFromAlma(isInitialBackfill: Bool) async {
         guard let almaClient else { return }
         guard httpServer?.isServingPort(LocalActivityHTTPServer.almaReservedPort) != true else {
-            almaConnected = false
+            if almaConnected {
+                almaConnected = false
+            }
             return
         }
 
@@ -858,10 +1340,12 @@ public final class HybridActivityCoordinator: ObservableObject {
             dayStart: dayStart,
             dayEnd: now.addingTimeInterval(60),
             sinceEventMs: sinceMs,
-            privacyConfig: engine.config.privacyConfig
+            privacyConfig: engine.effectivePrivacyConfig
         )
 
-        almaConnected = result.connected
+        if almaConnected != result.connected {
+            almaConnected = result.connected
+        }
         if let latestMs = result.latestEventTimestampMs {
             lastAlmaEventMs = max(lastAlmaEventMs ?? 0, latestMs)
         }
@@ -897,8 +1381,8 @@ public final class HybridActivityCoordinator: ObservableObject {
                         _ = engine.ingest(sample)
                     }
                 }
-                refreshPublishedState()
-                persistTodayIfNeeded()
+                let metrics = refreshPublishedState(now: now)
+                persistTodayIfNeeded(now: now, precomputedMetrics: metrics)
             }
         }
     }
@@ -919,83 +1403,187 @@ public final class HybridActivityCoordinator: ObservableObject {
         latestAlmaBrowserSample = nil
         lastRecordedSampleKey = nil
         lastRecordedHeartbeatAt = nil
-        activeAlert = nil
-        refreshPublishedState()
+        if activeAlert != nil {
+            activeAlert = nil
+        }
+        refreshPublishedState(now: now)
         refreshRecorderCounts()
-        syncCachedRuntimeState()
     }
 
-    private func refreshPublishedState() {
-        let now = clock.now()
-        sessionState = engine.focusState
-        taskProgressList = engine.taskProgress()
-        let spectrum = engine.currentSpectrumAndMetrics(at: now)
-        spectrumSegments = spectrum.segments
-        metrics = spectrum.metrics
-        latestSample = engine.lastSample
-        updateElapsedFocusSeconds()
+    @discardableResult
+    private func refreshPublishedState(now: Date? = nil, forceUI: Bool = false) -> DayMetrics? {
+        let ts = now ?? clock.now()
+        let nextSessionState = engine.focusState
+        if sessionState != nextSessionState {
+            sessionState = nextSessionState
+        }
+        let nextProgress = engine.taskProgress()
+        let nextPill = Self.formatPillText(sessionState: nextSessionState, progressList: nextProgress)
+        if pillModel.text != nextPill {
+            pillModel.text = nextPill
+        }
 
-        if case .focusing(let taskId, _) = sessionState {
-            lastTaskNote = engine.lastNote(for: taskId)
-        } else if case .paused(let taskId, _) = sessionState {
-            lastTaskNote = engine.lastNote(for: taskId)
+        if shouldGateBackgroundUI && !forceUI {
+            syncCachedRuntimeState()
+            return nil
+        }
+
+        if taskProgressList != nextProgress {
+            taskProgressList = nextProgress
+        }
+        let spectrum = engine.currentSpectrumAndMetrics(at: ts)
+        if spectrumSegments != spectrum.segments {
+            spectrumSegments = spectrum.segments
+        }
+        if metrics != spectrum.metrics {
+            metrics = spectrum.metrics
+        }
+        let nextSample = engine.lastSample
+        if latestSample != nextSample {
+            latestSample = nextSample
+        }
+        if isPopoverVisible {
+            updateElapsedFocusSeconds(now: ts)
+        } else if case .focusing = nextSessionState {
+            // Keep elapsedFocusSeconds paused while popover is hidden to avoid 1Hz SwiftUI invalidation.
+        } else if elapsedFocusSeconds != 0 {
+            elapsedFocusSeconds = 0
+        }
+
+        let nextNote: String?
+        if case .focusing(let taskId, _) = nextSessionState {
+            nextNote = engine.lastNote(for: taskId)
+        } else if case .paused(let taskId, _) = nextSessionState {
+            nextNote = engine.lastNote(for: taskId)
         } else {
-            lastTaskNote = nil
+            nextNote = nil
+        }
+        if lastTaskNote != nextNote {
+            lastTaskNote = nextNote
         }
         syncCachedRuntimeState()
+        return spectrum.metrics
     }
 
-    private func refreshRecorderCounts() {
+    private static func formatPillText(sessionState: FocusSessionState, progressList: [TaskProgress]) -> String {
+        guard case .focusing(let taskId, _) = sessionState,
+              let progress = progressList.first(where: { $0.budget.taskId == taskId }) else {
+            return "○ DayHelm · 待命"
+        }
+
+        let focused = Int(progress.focusedMinutes.rounded())
+        let rawName = progress.budget.displayName
+        let shortName = (rawName == "电商日常运营") ? "日常运营" : rawName
+
+        if case .capReached = progress.status, let cap = progress.budget.capMinutes {
+            return "▲ \(shortName) · \(focused)/\(cap)m"
+        }
+        if let target = progress.budget.targetMinutes {
+            return "● \(shortName) · \(focused)/\(target)m"
+        }
+        if let cap = progress.budget.capMinutes {
+            return "● \(shortName) · \(focused)/\(cap)m"
+        }
+        return "● \(shortName) · \(focused)m"
+    }
+
+    public func refreshRecorderCounts() {
         guard !isSyntheticDemo, let database else { return }
         let now = clock.now()
         let dayStart = startOfDay(for: now)
         let dayStartMs = Int64(dayStart.timeIntervalSince1970 * 1000)
         let dayEndMs = dayStartMs + 86_400_000 - 1
         if let counts = try? database.todayCounts(dayStartMs: dayStartMs, dayEndMs: dayEndMs) {
-            todaySnapshotCount = counts.snapshots
-            todayOCRCount = counts.ocrFrames
+            if todaySnapshotCount != counts.snapshots {
+                todaySnapshotCount = counts.snapshots
+            }
+            if todayOCRCount != counts.ocrFrames {
+                todayOCRCount = counts.ocrFrames
+            }
+        }
+        if let stats = try? database.recorderStorageStats(), recorderStats != stats {
+            recorderStats = stats
+        }
+    }
+
+    public func refreshRecorderCountsAsync() {
+        guard !isSyntheticDemo, let database, !recorderCountRefreshInFlight else { return }
+        recorderCountRefreshInFlight = true
+        let now = clock.now()
+        let dayStart = startOfDay(for: now)
+        let dayStartMs = Int64(dayStart.timeIntervalSince1970 * 1000)
+        let dayEndMs = dayStartMs + 86_400_000 - 1
+
+        Task.detached(priority: .utility) { [weak self, database] in
+            let counts = try? database.todayCounts(dayStartMs: dayStartMs, dayEndMs: dayEndMs)
+            let stats = try? database.recorderStorageStats()
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.recorderCountRefreshInFlight = false
+                if let counts {
+                    if self.todaySnapshotCount != counts.snapshots {
+                        self.todaySnapshotCount = counts.snapshots
+                    }
+                    if self.todayOCRCount != counts.ocrFrames {
+                        self.todayOCRCount = counts.ocrFrames
+                    }
+                }
+                if let stats, self.recorderStats != stats {
+                    self.recorderStats = stats
+                }
+            }
         }
     }
 
     private func syncCachedRuntimeState() {
-        let snap = engine.snapshot(at: clock.now())
+        let keypressEffective = eventMonitor?.isKeypressMonitoringEffective ?? inspector.isAccessibilityTrusted
         let state = LocalActivityHTTPServer.RuntimeState(
             axTrusted: axTrusted,
             screenCaptureTrusted: screenCaptureTrusted,
+            keypressMonitoringEffective: keypressEffective,
+            activityRecorderEnabled: settings.activityRecorderEnabled,
             deepRecordingEnabled: deepRecordingEnabled,
-            daySnapshot: snap
+            daySnapshot: nil,
+            settings: settings
         )
         runtimeStateBox.update(state)
     }
 
     public nonisolated func currentRuntimeState() -> LocalActivityHTTPServer.RuntimeState {
-        runtimeStateBox.read()
+        var state = runtimeStateBox.read()
+        state.daySnapshot = engine.snapshot(at: clock.now())
+        return state
     }
 
     private nonisolated func readCachedRuntimeState() -> LocalActivityHTTPServer.RuntimeState {
         runtimeStateBox.read()
     }
 
-    private func updateElapsedFocusSeconds() {
+    private func updateElapsedFocusSeconds(now: Date? = nil) {
+        let nextElapsed: TimeInterval
         if case .focusing(let taskId, _) = engine.focusState {
             if let openSession = engine.focusSessions.last(where: { $0.taskId == taskId && $0.endedAt == nil }) {
                 let baseSeconds = openSession.minutes * 60.0
-                let extra = max(0, clock.now().timeIntervalSince(openSession.startedAt.addingTimeInterval(baseSeconds)))
-                elapsedFocusSeconds = max(baseSeconds, baseSeconds + extra)
-                return
+                let ts = now ?? clock.now()
+                let extra = max(0, ts.timeIntervalSince(openSession.startedAt.addingTimeInterval(baseSeconds)))
+                nextElapsed = max(baseSeconds, baseSeconds + extra)
+            } else {
+                nextElapsed = engine.focusedMinutes(for: taskId) * 60.0
             }
-            elapsedFocusSeconds = engine.focusedMinutes(for: taskId) * 60.0
         } else {
-            elapsedFocusSeconds = 0
+            nextElapsed = 0
+        }
+        if elapsedFocusSeconds != nextElapsed {
+            elapsedFocusSeconds = nextElapsed
         }
     }
 
-    private func persistTodayIfNeeded() {
+    private func persistTodayIfNeeded(now: Date? = nil, precomputedMetrics: DayMetrics? = nil) {
         guard !isSyntheticDemo, let store else { return }
-        let now = clock.now()
-        let snap = engine.snapshot(at: now)
+        let ts = now ?? clock.now()
+        let snap = engine.snapshot(at: ts, precomputedMetrics: precomputedMetrics)
         try? store.saveToday(snap)
-        lastPersistedAt = now
+        lastPersistedAt = ts
     }
 
     private func currentDeclaredTaskId() -> String? {

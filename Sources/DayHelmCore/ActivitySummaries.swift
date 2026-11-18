@@ -267,6 +267,105 @@ public struct WeeklyActivitySummaryRecord: Sendable, Equatable, Codable {
     }
 }
 
+/// Alma-compatible `/api/activity-recorder/digest` response payload.
+public struct ActivityDigestSummary: Sendable, Equatable, Codable {
+    public let sinceMs: Int64
+    public let untilMs: Int64
+    public let hours: Int
+    public let sessionCount: Int
+    public let totalActiveMs: Int64
+    public let eventCount: Int
+    public let snapshotCount: Int
+    public let ocrFrameCount: Int
+    public let clickCount: Int
+    public let keypressCount: Int
+    public let inputEventsPerMinute: Double
+    public let topApps: [ActivityDailySummaryStats.AppDuration]
+    public let topDomains: [String]
+    public let highlights: [String]
+
+    public init(
+        sinceMs: Int64,
+        untilMs: Int64,
+        hours: Int,
+        sessionCount: Int,
+        totalActiveMs: Int64,
+        eventCount: Int,
+        snapshotCount: Int,
+        ocrFrameCount: Int,
+        clickCount: Int,
+        keypressCount: Int,
+        inputEventsPerMinute: Double,
+        topApps: [ActivityDailySummaryStats.AppDuration],
+        topDomains: [String],
+        highlights: [String]
+    ) {
+        self.sinceMs = sinceMs
+        self.untilMs = untilMs
+        self.hours = hours
+        self.sessionCount = sessionCount
+        self.totalActiveMs = totalActiveMs
+        self.eventCount = eventCount
+        self.snapshotCount = snapshotCount
+        self.ocrFrameCount = ocrFrameCount
+        self.clickCount = clickCount
+        self.keypressCount = keypressCount
+        self.inputEventsPerMinute = inputEventsPerMinute
+        self.topApps = topApps
+        self.topDomains = topDomains
+        self.highlights = highlights
+    }
+}
+
+/// Alma-compatible deterministic skeleton report (`/api/activity-recorder/report/<dateKey>`, no LLM).
+public struct ActivityDailyReport: Sendable, Equatable, Codable {
+    public let dateKey: String
+    public let skeletonOnly: Bool
+    public let markdown: String
+    public let stats: ActivityDailySummaryStats
+
+    public init(
+        dateKey: String,
+        skeletonOnly: Bool = true,
+        markdown: String,
+        stats: ActivityDailySummaryStats
+    ) {
+        self.dateKey = dateKey
+        self.skeletonOnly = skeletonOnly
+        self.markdown = markdown
+        self.stats = stats
+    }
+
+    public static func renderMarkdown(dateKey: String, stats: ActivityDailySummaryStats) -> String {
+        let activeMinutes = Int((Double(stats.totalActiveMs) / 60_000.0).rounded())
+        var lines: [String] = [
+            "# Activity Report · \(dateKey)",
+            "",
+            "- Sessions: \(stats.sessionCount)",
+            "- Active Time: \(activeMinutes)m (\(stats.totalActiveMs) ms)",
+            "- Events: \(stats.eventCount) (Clicks: \(stats.clickCount), Keypresses: \(stats.keypressCount), \(String(format: "%.1f", stats.inputEventsPerMinute))/min)",
+            "- Snapshots: \(stats.snapshotCount) · OCR Frames: \(stats.ocrFrameCount) (\(stats.ocrCharCount) chars)"
+        ]
+        if !stats.apps.isEmpty {
+            lines.append("")
+            lines.append("## Top Applications")
+            for entry in stats.apps {
+                let mins = Int((Double(entry.durationMs) / 60_000.0).rounded())
+                lines.append("- \(entry.app): \(mins)m")
+            }
+        }
+        if !stats.keyMoments.isEmpty {
+            lines.append("")
+            lines.append("## Key Moments")
+            for moment in stats.keyMoments {
+                let mins = Int((Double(moment.durationMs) / 60_000.0).rounded())
+                lines.append("- \(moment.title) (\(mins)m)")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+}
+
 public enum ActivitySummaryError: Error, CustomStringConvertible, Equatable {
     case invalidDateKey(String)
     case invalidWeekKey(String)

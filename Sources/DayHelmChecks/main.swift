@@ -4,6 +4,7 @@ import ImageIO
 import DayHelmCapture
 import DayHelmCore
 import Foundation
+import SQLite3
 
 private struct CheckFailure: Error, CustomStringConvertible {
     let description: String
@@ -32,7 +33,7 @@ struct DayHelmChecksMain {
     static func main() async {
         do {
             try await runAllChecks()
-            print("ALL DAYHELM CHECKS PASSED (41/41)")
+            print("ALL DAYHELM CHECKS PASSED (50/50)")
             exit(0)
         } catch {
             fputs("DAYHELM CHECK FAILED: \(error)\n", stderr)
@@ -2144,6 +2145,671 @@ struct DayHelmChecksMain {
             let recorder = payload?["recorder"] as? [String: Any]
             try checkEqual(recorder?["clickCount"] as? Int, 1, "CLI status json reports clickCount")
             try checkEqual(recorder?["keypressCount"] as? Int, 1, "CLI status json reports keypressCount")
+        }
+
+        try await runCheck("42. Browser parity: Dia/SafariTP, AppleScript router, circuit breaker & privacy guard") {
+            try check(ActivityClassifier.isBrowser(appName: "Dia", bundleId: "company.thebrowser.dia"), "Dia bundle is browser")
+            try check(ActivityClassifier.isBrowser(appName: "Safari Technology Preview", bundleId: "com.apple.safaritechnologypreview"), "SafariTP bundle is browser")
+            try check(!ActivityClassifier.isBrowser(appName: "Obsidian", bundleId: "md.obsidian"), "Obsidian must not false-match dia")
+            try check(BrowserTabScriptRouter.appleScriptSource(appName: "Arc", bundleId: "company.thebrowser.browser") != nil, "Arc produces AppleScript")
+            var called = 0
+            _ = AXWindowInspector.resolveBrowserFallbackIfNeeded(
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                existingTitle: "Bank Login",
+                existingURL: nil,
+                screenLocked: false,
+                privacyConfig: .default
+            ) { _, _ in
+                called += 1
+                return ("https://bank.example.com", "Bank")
+            }
+            try checkEqual(called, 0, "Redacted browser title must block AppleScript fallback")
+        }
+
+        try await runCheck("43. Aggregated input events & O(1) incremental database session counters") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-agg-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let db = try ActivityDatabase(databaseURL: tmpDir.appendingPathComponent("activity.sqlite"))
+            let t0Ms = Int64(baseDate().timeIntervalSince1970 * 1000)
+
+            let e1 = try db.insertEvent(timestampMs: t0Ms, kind: "click", appName: "Xcode", data: ["count": "15"])
+            _ = try db.insertEvent(sessionId: e1.sessionId, timestampMs: t0Ms + 2_000, kind: "keypress", appName: "Xcode", data: ["count": "30"])
+            try db.closeSession(sessionId: e1.sessionId, endedAtMs: t0Ms + 60_000)
+            let detail = try db.getSessionDetail(sessionId: e1.sessionId)
+            try checkEqual(detail?.session.clickCount, 15, "Session clickCount sums data.count")
+            try checkEqual(detail?.session.keypressCount, 30, "Session keypressCount sums data.count")
+            try checkEqual(db.fullCounterResyncCount, 0, "New sessions update counters in O(1) without resync")
+        }
+
+        try await runCheck("44. Pixel diff, DisplayGeometry, FTS5 trigram, is_meeting, regex entities & extended redaction") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-fts-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let db = try ActivityDatabase(databaseURL: tmpDir.appendingPathComponent("activity.sqlite"))
+            let t0Ms = Int64(baseDate().timeIntervalSince1970 * 1000)
+            let e = try db.insertEvent(
+                timestampMs: t0Ms,
+                kind: "browser_visit",
+                appName: "Google Chrome",
+                windowTitle: "Tencent Meeting · github.com/acme/dayhelm/pull/9",
+                url: "https://github.com/acme/dayhelm/pull/9"
+            )
+            let s = try db.insertSnapshot(sessionId: e.sessionId, timestampMs: t0Ms + 1_000, filePath: tmpDir.appendingPathComponent("a.jpg").path, width: 100, height: 100, sizeBytes: 100)
+            _ = try db.insertOCRFrame(snapshotId: s.id, sessionId: e.sessionId, text: "晶圆厂良率分析 " + "AIza" + "SyD-1234567890ABCDEFGHIJKLMNOPQRS", createdAtMs: t0Ms + 1_000)
+            try db.closeSession(sessionId: e.sessionId, endedAtMs: t0Ms + 60_000)
+            let summary = try db.getSessionDetail(sessionId: e.sessionId)?.session
+            try checkEqual(summary?.isMeeting, true, "Meeting session sets isMeeting")
+            try checkEqual(summary?.entities["repo"], ["acme/dayhelm"], "Extracts GitHub repo entity")
+            try checkEqual(summary?.entities["pr"], ["#9"], "Extracts PR entity")
+            let hits = try db.searchOCR(keyword: "晶圆厂")
+            try checkEqual(hits.count, 1, "FTS5 trigram matches CJK OCR query")
+            try check(hits.first?.text.contains("AIza***") == true, "Google API key masked on OCR write")
+        }
+
+        try await runCheck("45. Extended HTTP API routes: permissions, config, digest, report, pagination & prefix") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-httpext-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+            let t0 = baseDate()
+            let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+            let sess = try db.startSession(id: "feed1234-0000-0000-0000-000000000001", startedAtMs: t0Ms)
+            _ = try db.insertEvent(sessionId: sess.id, timestampMs: t0Ms + 1_000, kind: "app_focus", appName: "Terminal")
+            try db.closeSession(sessionId: sess.id, endedAtMs: t0Ms + 60_000)
+            let server = LocalActivityHTTPServer(database: db, store: store, clock: ManualClock(now: t0))
+
+            try checkEqual(server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/permissions").statusCode, 200, "/permissions returns 200")
+            try checkEqual(server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/config").statusCode, 200, "/config returns 200")
+            try checkEqual(server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/digest?hours=24").statusCode, 200, "/digest returns 200")
+            try checkEqual(server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/report/2026-11-17").statusCode, 200, "/report/<dateKey> returns 200")
+            try checkEqual(server.handleRawHTTPRequestLineAndRoute(target: "/api/activity-recorder/sessions/feed1234").statusCode, 200, "6+ char session prefix resolves")
+        }
+
+        try await runCheck("46. SwitchClassifier: jitter merge, transient dwell, same-task cross-app affinity & working-set gate") {
+            let t0 = baseDate()
+
+            // A. Volatile title jitter merges in EventMerger and does not inflate switches
+            var jitterSpans: [EnrichedSpan] = []
+            for i in 0..<12 {
+                let s = ActivitySample(
+                    timestamp: t0.addingTimeInterval(Double(i) * 10),
+                    appName: "Google Chrome",
+                    bundleId: "com.google.Chrome",
+                    windowTitle: "Inbox (\(i + 1)) — Mail",
+                    url: "https://mail.example.com/inbox",
+                    idleSeconds: 0,
+                    screenLocked: false,
+                    inputActive: true
+                )
+                EventMerger.append(sample: s, declaredTaskId: nil, to: &jitterSpans, pulsetime: 60)
+            }
+            try checkEqual(jitterSpans.count, 1, "Volatile counter jitter merges into 1 span")
+
+            // B. Transient <4s pass-through spans (e.g. Spotlight flash) are debounced and coalesce surrounding context
+            let transientSpans: [EnrichedSpan] = [
+                EnrichedSpan(startedAt: t0, endedAt: t0.addingTimeInterval(20), appName: "Mail", bundleId: "com.apple.mail", windowTitle: "Quarterly Report", url: nil, declaredTaskId: nil, redacted: false),
+                EnrichedSpan(startedAt: t0.addingTimeInterval(21), endedAt: t0.addingTimeInterval(22), appName: "Notes", bundleId: "com.apple.Notes", windowTitle: "Quick Glance", url: nil, declaredTaskId: nil, redacted: false),
+                EnrichedSpan(startedAt: t0.addingTimeInterval(23), endedAt: t0.addingTimeInterval(50), appName: "Mail", bundleId: "com.apple.mail", windowTitle: "Quarterly Report", url: nil, declaredTaskId: nil, redacted: false)
+            ]
+            let preparedTransient = SwitchClassifier.prepareSequence(spans: transientSpans)
+            try checkEqual(preparedTransient.count, 1, "Transient <4s middle span drops and coalesces identical surrounding context")
+
+            // C. Cross-app collaboration sharing project token / workflow cluster / auxiliary tools does NOT trigger thrashing
+            let collabEngine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+            let collabSamples: [(String, String, String, String?)] = [
+                ("T3 Code", "com.t3code.app", "T3 Code (Beta) - focus-guard", nil),
+                ("Terminal", "com.apple.Terminal", "focus-guard — zsh", nil),
+                ("Google Chrome", "com.google.Chrome", "Pull Request #12 — focus-guard", "https://github.com/org/focus-guard/pull/12"),
+                ("Finder", "com.apple.finder", "focus-guard", nil),
+                ("Google Chrome", "com.google.Chrome", "Local Preview", "http://localhost:3000/dashboard")
+            ]
+            for i in 0..<15 {
+                let item = collabSamples[i % collabSamples.count]
+                let alerts = collabEngine.ingest(ActivitySample(
+                    timestamp: t0.addingTimeInterval(Double(i) * 18),
+                    appName: item.0,
+                    bundleId: item.1,
+                    windowTitle: item.2,
+                    url: item.3,
+                    idleSeconds: 0,
+                    screenLocked: false,
+                    inputActive: true
+                ))
+                try check(!alerts.contains { if case .highFrequencySwitch = $0.kind { return true }; return false }, "Same-project engineering workflow must not trigger thrashing")
+            }
+
+            // D. Unconfigured 3-context closed-loop ping-pong (Numbers <-> Mail <-> internal ERP) stays exempt
+            let loopSpans: [EnrichedSpan] = (0..<14).map { i in
+                let start = t0.addingTimeInterval(Double(i) * 20)
+                switch i % 3 {
+                case 0:
+                    return EnrichedSpan(startedAt: start, endedAt: start.addingTimeInterval(18), appName: "Numbers", bundleId: "com.apple.iWork.Numbers", windowTitle: "Budget.numbers", url: nil, declaredTaskId: nil, redacted: false)
+                case 1:
+                    return EnrichedSpan(startedAt: start, endedAt: start.addingTimeInterval(18), appName: "Mail", bundleId: "com.apple.mail", windowTitle: "Vendor Invoice", url: nil, declaredTaskId: nil, redacted: false)
+                default:
+                    return EnrichedSpan(startedAt: start, endedAt: start.addingTimeInterval(18), appName: "Safari", bundleId: "com.apple.Safari", windowTitle: "ERP Orders", url: "https://erp.internal.example/orders", declaredTaskId: nil, redacted: false)
+                }
+            }
+            let loopWindows = SpectrumBuilder.detectThrashingWindows(spans: loopSpans, budgets: sampleBudgets())
+            try check(loopWindows.isEmpty, "Closed-loop <=3 non-interrupt contexts must not trigger thrashing")
+
+            // E. Real distraction involving interrupt apps / 4+ unrelated contexts DOES trigger thrashing
+            let distractEngine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
+            let distractSamples: [(String, String, String, String?)] = [
+                ("WeChat", "com.tencent.xinWeChat", "Chat", nil),
+                ("Google Chrome", "com.google.Chrome", "Bilibili Video", "https://www.bilibili.com/video/BV1xx"),
+                ("Slack", "com.tinyspeck.slackmacgap", "general", nil),
+                ("Google Chrome", "com.google.Chrome", "Weibo Hot", "https://weibo.com/hot")
+            ]
+            var fired = false
+            for i in 0..<14 {
+                let item = distractSamples[i % distractSamples.count]
+                let alerts = distractEngine.ingest(ActivitySample(
+                    timestamp: t0.addingTimeInterval(Double(i) * 18),
+                    appName: item.0,
+                    bundleId: item.1,
+                    windowTitle: item.2,
+                    url: item.3,
+                    idleSeconds: 0,
+                    screenLocked: false,
+                    inputActive: true
+                ))
+                if alerts.contains(where: { if case .highFrequencySwitch = $0.kind { return true }; return false }) {
+                    fired = true
+                }
+            }
+            try check(fired, "Distracted switching across interrupt apps and 4+ contexts must trigger thrashing")
+
+            // F. TaskBudget appBundleIds / domains matching + smoothed recentSwitchStats floor (600s)
+            let customBudget = TaskBudget(taskId: "design", displayName: "Design", colorHex: "#EC4899", appBundleIds: ["com.figma.Desktop"], domains: ["figma.com"])
+            let figmaSpan = EnrichedSpan(startedAt: t0, endedAt: t0.addingTimeInterval(30), appName: "Figma", bundleId: "com.figma.Desktop", windowTitle: "Untitled", url: nil, declaredTaskId: nil, redacted: false)
+            try checkEqual(SwitchClassifier.inferredTaskId(for: figmaSpan, budgets: [customBudget]), "design", "appBundleIds matches TaskBudget")
+        }
+
+        try await runCheck("47. SQLite hot queries use indexes without plain table scans") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-47-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let dbURL = tmpDir.appendingPathComponent("activity.sqlite")
+            let db = try ActivityDatabase(databaseURL: dbURL)
+            let nowMs: Int64 = 1_763_430_000_000
+            let session = try db.startSession(startedAtMs: nowMs, triggerKind: "manual", declaredTaskId: "dev")
+            let snap = try db.insertSnapshot(
+                timestampMs: nowMs + 1_000,
+                filePath: "2026-11-18/test.jpg",
+                width: 1280,
+                height: 720,
+                sizeBytes: 42_000,
+                trigger: "app_focus",
+                appName: "Xcode",
+                windowTitle: "Main.swift",
+                hashHex: "abcd",
+                histogram: Array(repeating: 0.03125, count: 32),
+                diffPct: 0.1
+            )
+            _ = try db.insertOCRFrame(snapshotId: snap.id, sessionId: session.id, text: "Example OCR", createdAtMs: nowMs + 1_500)
+
+            var rawDB: OpaquePointer?
+            guard sqlite3_open_v2(dbURL.path, &rawDB, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let rawDB else {
+                throw CheckFailure(description: "Failed to open SQLite DB for EXPLAIN QUERY PLAN")
+            }
+            defer { sqlite3_close(rawDB) }
+
+            let queries = [
+                "SELECT id FROM activity_sessions WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1;",
+                "SELECT COUNT(*) FROM activity_snapshots WHERE timestamp >= 0 AND timestamp <= 9999999999999;",
+                "SELECT COUNT(*) FROM activity_ocr_frames WHERE created_at >= 0 AND created_at <= 9999999999999;",
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM activity_snapshots WHERE storage_tier != 'pruned';"
+            ]
+            for sql in queries {
+                var stmt: OpaquePointer?
+                guard sqlite3_prepare_v2(rawDB, "EXPLAIN QUERY PLAN " + sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+                    throw CheckFailure(description: "Failed to prepare EXPLAIN QUERY PLAN for: \(sql)")
+                }
+                defer { sqlite3_finalize(stmt) }
+                var details: [String] = []
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    if let cStr = sqlite3_column_text(stmt, 3) {
+                        details.append(String(cString: cStr))
+                    }
+                }
+                for detail in details {
+                    if detail.contains("SCAN ") && !detail.contains("INDEX") {
+                        throw CheckFailure(description: "Plain table scan detected for query [\(sql)]: \(detail)")
+                    }
+                }
+            }
+        }
+
+        try await runCheck("48. SwitchClassifier memoization, eviction & 1500-span SpectrumBuilder 50-tick perf") {
+            let t0 = baseDate()
+            let clock = ManualClock(now: t0)
+            let budgets = sampleBudgets()
+            let engine = DayHelmEngine(budgets: budgets, clock: clock)
+            engine.startFocus(taskId: "ecommerce", at: t0)
+
+            let apps: [(String, String, String, String?)] = [
+                ("Google Chrome", "com.google.Chrome", "example-shop Admin - (2) Orders 45%", "https://example-shop.local/orders"),
+                ("Terminal", "com.apple.Terminal", "zsh — swift build 12:01:02", nil),
+                ("Preview", "com.apple.Preview", "product-listing.png", nil),
+                ("WeChat", "com.tencent.xinWeChat", "WeChat (5)", nil),
+                ("Xcode", "com.apple.dt.Xcode", "hermes-core.swift", nil)
+            ]
+            for i in 0..<1500 {
+                let item = apps[i % apps.count]
+                clock.advance(by: 10)
+                engine.ingest(ActivitySample(
+                    timestamp: clock.now(),
+                    appName: item.0,
+                    bundleId: item.1,
+                    windowTitle: "\(item.2) #\(i % 12)",
+                    url: item.3,
+                    idleSeconds: 0,
+                    screenLocked: false,
+                    inputActive: true
+                ))
+            }
+
+            let perfStart = CFAbsoluteTimeGetCurrent()
+            var lastSpectrum = engine.currentSpectrumAndMetrics(at: clock.now())
+            for tick in 0..<50 {
+                clock.advance(by: 2)
+                let item = apps[tick % apps.count]
+                engine.ingest(ActivitySample(
+                    timestamp: clock.now(),
+                    appName: item.0,
+                    bundleId: item.1,
+                    windowTitle: item.2,
+                    url: item.3,
+                    idleSeconds: 0,
+                    screenLocked: false,
+                    inputActive: true
+                ))
+                lastSpectrum = engine.currentSpectrumAndMetrics(at: clock.now())
+            }
+            let elapsed = CFAbsoluteTimeGetCurrent() - perfStart
+            try check(!lastSpectrum.segments.isEmpty, "Spectrum segments should not be empty")
+            try check(lastSpectrum.metrics.activeMinutes > 0, "Active minutes should be positive")
+            try check(elapsed < 0.25, "50 heartbeat ticks on 1500 spans took \(String(format: "%.3f", elapsed))s (expected < 0.25s)")
+
+            // Verify SwitchClassifier bounded cache handles > 4096 distinct keys cleanly
+            for k in 0..<4500 {
+                let span = EnrichedSpan(
+                    startedAt: t0,
+                    endedAt: t0.addingTimeInterval(10),
+                    appName: "Xcode",
+                    bundleId: "com.apple.dt.Xcode",
+                    windowTitle: "File-\(k).swift",
+                    url: nil,
+                    declaredTaskId: nil,
+                    redacted: false
+                )
+                _ = SwitchClassifier.role(for: span)
+                _ = SwitchClassifier.canonicalContextKey(for: span)
+                _ = SwitchClassifier.projectTokens(for: span)
+            }
+            let wechatSpan = EnrichedSpan(startedAt: t0, endedAt: t0.addingTimeInterval(15), appName: "WeChat", bundleId: "com.tencent.xinWeChat", windowTitle: "Chat", url: nil, declaredTaskId: nil, redacted: false)
+            try checkEqual(SwitchClassifier.role(for: wechatSpan), .interrupt, "SwitchClassifier role remains accurate after >4096 cache insertions")
+        }
+
+        try await runCheck("49. ActivityDatabase grouped session summary synthesis parity") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-49-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let db = try ActivityDatabase(databaseURL: tmpDir.appendingPathComponent("activity.sqlite"))
+            let t0Ms: Int64 = 1_763_430_000_000
+            let session = try db.startSession(startedAtMs: t0Ms, triggerKind: "manual", declaredTaskId: "dev")
+            for i in 0..<500 {
+                let ts = t0Ms + Int64(i * 100)
+                switch i % 4 {
+                case 0:
+                    try db.insertEvent(timestampMs: ts, kind: "browser_visit", appName: "Google Chrome", windowTitle: "Fix perf PR #42", url: "https://github.com/acme/dayhelm/pull/42", data: [:])
+                case 1:
+                    try db.insertEvent(timestampMs: ts, kind: "browser_visit", appName: "Google Chrome", windowTitle: "Local Preview", url: "http://localhost:3000/dashboard", data: [:])
+                case 2:
+                    try db.insertEvent(timestampMs: ts, kind: "keypress", appName: "Zoom", windowTitle: "Zoom Meeting", url: "https://zoom.us/j/12345", data: ["count": "2"])
+                default:
+                    try db.insertEvent(timestampMs: ts, kind: "click", appName: "Xcode", windowTitle: "DayHelmEngine.swift", url: nil, data: ["count": "3"])
+                }
+            }
+            try db.closeSession(sessionId: session.id, endedAtMs: t0Ms + 60_000)
+            let detail = try db.getSessionDetail(sessionId: session.id)!
+            try checkEqual(detail.session.clickCount, 125 * 3, "Grouped summary clickCount parity")
+            try checkEqual(detail.session.keypressCount, 125 * 2, "Grouped summary keypressCount parity")
+            try checkEqual(detail.session.isMeeting, true, "Grouped summary detects meeting signal")
+            try check(detail.session.analysisTitle != nil && !(detail.session.analysisTitle?.isEmpty ?? true), "analysisTitle populated")
+            try check(detail.session.analysisDescription != nil && !(detail.session.analysisDescription?.isEmpty ?? true), "analysisDescription populated")
+            try check(!detail.session.topics.isEmpty, "topics populated")
+            let entityTypes = Set(detail.session.entities.keys)
+            for expected in ["repo", "pr", "local_port", "domain", "app", "task"] {
+                try check(entityTypes.contains(expected), "entities missing expected type '\(expected)'")
+            }
+        }
+
+        try await runCheck("50. ActivityTextNormalizer & PrivacyRedactor precompiled regex and fast-path parity") {
+            try checkEqual(ActivityTextNormalizer.normalizedTitleKey("(3) Inbox - 45% 12:34:56 Loading..."), "inbox - loading", "Normalizer strips volatile counters, pct, clock, ellipsis")
+            try checkEqual(ActivityTextNormalizer.normalizedTitleKey("v2 Release Q4"), "v2 release q4", "Normalizer preserves alphanumeric tokens")
+
+            let now = baseDate()
+            try check(PrivacyRedactor.shouldRedact(ActivitySample(timestamp: now, appName: "Chrome", bundleId: "com.google.Chrome", windowTitle: "Invoice Payment Portal", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)), "Payment boundary redacts")
+            try check(!PrivacyRedactor.shouldRedact(ActivitySample(timestamp: now, appName: "Xcode", bundleId: "com.apple.dt.Xcode", windowTitle: "payload.json", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)), "payload does not false-positive")
+            try check(!PrivacyRedactor.shouldRedact(ActivitySample(timestamp: now, appName: "System Settings", bundleId: "com.apple.systemsettings", windowTitle: "Display Settings", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)), "display does not false-positive")
+
+            let secretInputs: [(String, String)] = [
+                ("-----BEGIN " + "RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----", "PEM"),
+                ("token=sk-" + "1234567890abcdefghijklmnop", "sk-"),
+                ("ghp_" + "1234567890abcdefghijklmnopqrstuvwxyz", "ghp_"),
+                ("xoxb-" + "123456789012-1234567890123-abcdefghijklmnopqrstuvwx", "xoxb-"),
+                ("AKIA" + "IOSFODNN7EXAMPLE", "AKIA"),
+                ("AIza" + "SyDaGmWKa4JsXZ-HjGw7ISLn_3namBGewQe", "AIza"),
+                ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U", "JWT"),
+                ("ssn: 123-45-6789", "SSN"),
+                ("Authorization: Bearer super_secret_token_value_12345", "Bearer"),
+                ("Authorization: Basic dXNlcjpwYXNzMTIzNDU=", "Basic"),
+                ("api_key=my_super_secret_value_999", "api_key"),
+                ("card: 4111 1111 1111 1111", "Luhn card")
+            ]
+            for (raw, label) in secretInputs {
+                let redacted = PrivacyRedactor.redactSecrets(in: raw)
+                try check(redacted != raw && redacted.contains("***"), "Secret redaction failed for \(label)")
+            }
+
+            let cleanOCR = String(repeating: "SwiftPM DayHelmCore ActivityDatabase SQLite WAL benchmark line 12345.\n", count: 80)
+            try checkEqual(PrivacyRedactor.redactSecrets(in: cleanOCR), cleanOCR, "Clean multi-KB OCR text remains untouched")
+        }
+
+        try await runCheck("51. VisionOCRService 1600px downscaling & ImageHistogram visual signature") {
+            let largeImg = try makeSyntheticTextImage(text: "DAYHELM_OCR_2560", backgroundWhite: true, width: 2560, height: 1600)
+            let scaled = VisionOCRService.prepareOCRImage(from: largeImg, maxDimension: 1600)
+            try checkEqual(scaled.width, 1600, "2560x1600 should scale width to 1600")
+            try checkEqual(scaled.height, 1000, "2560x1600 should scale height proportionally to 1000")
+
+            let smallImg = try makeSyntheticTextImage(text: "SMALL_960", backgroundWhite: true, width: 960, height: 240)
+            let untouched = VisionOCRService.prepareOCRImage(from: smallImg, maxDimension: 1600)
+            try checkEqual(untouched.width, 960, "960x240 should remain 960px wide")
+            try checkEqual(untouched.height, 240, "960x240 should remain 240px tall")
+
+            let ocrResult = try await VisionOCRService.recognizeText(from: scaled)
+            try check(ocrResult.text.uppercased().contains("DAYHELM"), "OCR should still recognize text after 1600px downscale, got: \(ocrResult.text)")
+
+            let sig = ImageHistogram.computeVisualSignature(from: largeImg, bins: 32)
+            try checkEqual(sig.histogram.count, 32, "Visual signature histogram should have 32 bins")
+            try checkEqual(sig.thumbnailRGB.count, 160 * 90 * 3, "Visual signature thumbnailRGB should be 160x90x3")
+            try checkEqual(sig.hashHex.count, 16, "Visual signature hashHex should be 16 hex chars")
+        }
+
+        try await runCheck("52. NativeScreenRecorder bounded OCR session dedup cache (<= 4)") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-52-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let t0 = baseDate()
+            let clock = ManualClock(now: t0)
+            let db = try ActivityDatabase(databaseURL: tmpDir.appendingPathComponent("activity.sqlite"))
+            let capturer = MockScreenCapturer(image: try makeSyntheticTextImage(text: "BOUNDED_OCR_TEST", backgroundWhite: true))
+            let recorder = NativeScreenRecorder(
+                database: db,
+                snapshotsRootDir: tmpDir.appendingPathComponent("snapshots"),
+                capturer: capturer,
+                clock: clock
+            )
+            for i in 0..<20 {
+                let session = try db.startSession(startedAtMs: Int64(clock.now().timeIntervalSince1970 * 1000), triggerKind: "manual")
+                let img = try makeSyntheticTextImage(text: "SESSION_OCR_\(i)", backgroundWhite: (i % 2 == 0))
+                let sample = ActivitySample(
+                    timestamp: clock.now(),
+                    appName: "Xcode",
+                    bundleId: "com.apple.dt.Xcode",
+                    windowTitle: "File\(i).swift",
+                    url: nil,
+                    idleSeconds: 0,
+                    screenLocked: false,
+                    inputActive: true
+                )
+                _ = try await recorder.processCapturedImage(
+                    img,
+                    sample: sample,
+                    sessionId: session.id,
+                    trigger: "app_focus"
+                )
+                try db.closeSession(sessionId: session.id, endedAtMs: Int64(clock.now().timeIntervalSince1970 * 1000) + 1000)
+                clock.advance(by: 2)
+            }
+            try check(recorder.cachedOCRSessionCount <= 4, "cachedOCRSessionCount should be capped <= 4, got \(recorder.cachedOCRSessionCount)")
+            recorder.resetDeduplicationBaseline()
+            try checkEqual(recorder.cachedOCRSessionCount, 0, "resetDeduplicationBaseline should clear cachedOCRSessionCount")
+        }
+
+        try await runCheck("53. AXWindowInspector 15s unchanged-title browser TTL cache & invalidation") {
+            final class CounterBox: @unchecked Sendable {
+                private let lock = NSLock()
+                private var _value = 0
+                var value: Int { lock.withLock { _value } }
+                func increment() { lock.withLock { _value += 1 } }
+            }
+            let t0 = baseDate()
+            let clock = ManualClock(now: t0)
+            let callCounter = CounterBox()
+            let inspector = AXWindowInspector(
+                clock: clock,
+                observeScreenLock: false,
+                browserCacheTTLSeconds: 15.0,
+                browserTabProvider: { appName, _ in
+                    callCounter.increment()
+                    return (url: "https://example.com/\(appName)/\(callCounter.value)", title: "Page \(callCounter.value)")
+                }
+            )
+            // Poll every 2s for 14s on same (app, title): should invoke provider only once.
+            for step in 0..<7 {
+                let res = inspector.resolveBrowserFallbackWithCache(
+                    appName: "Google Chrome",
+                    bundleId: "com.google.Chrome",
+                    existingTitle: "Same Tab Title",
+                    existingURL: nil,
+                    screenLocked: false
+                )
+                try checkEqual(res.url, "https://example.com/Google Chrome/1", "Step \(step) should reuse cached URL")
+                clock.advance(by: 2)
+            }
+            try checkEqual(callCounter.value, 1, "Provider should be called once within 15s TTL")
+
+            // Advance past 15s (>= 15s total elapsed): should re-query.
+            clock.advance(by: 2)
+            let refreshed = inspector.resolveBrowserFallbackWithCache(
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                existingTitle: "Same Tab Title",
+                existingURL: nil,
+                screenLocked: false
+            )
+            try checkEqual(callCounter.value, 2, "Provider should be called again once >= 15s elapsed")
+            try checkEqual(refreshed.url, "https://example.com/Google Chrome/2", "Refreshed URL should reflect 2nd call")
+
+            // Title change within TTL: should invalidate immediately.
+            clock.advance(by: 2)
+            _ = inspector.resolveBrowserFallbackWithCache(
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                existingTitle: "New Tab Title",
+                existingURL: nil,
+                screenLocked: false
+            )
+            try checkEqual(callCounter.value, 3, "Title change should invoke provider immediately")
+
+            // App change within TTL: should invalidate immediately.
+            clock.advance(by: 2)
+            _ = inspector.resolveBrowserFallbackWithCache(
+                appName: "Safari",
+                bundleId: "com.apple.Safari",
+                existingTitle: "New Tab Title",
+                existingURL: nil,
+                screenLocked: false
+            )
+            try checkEqual(callCounter.value, 4, "App change should invoke provider immediately")
+        }
+
+        try await runCheck("54. Coordinator lazy daySnapshot, popover timer gating & MenuBarPillModel") {
+            let t0 = baseDate()
+            let clock = ManualClock(now: t0)
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-54-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let store = DayHelmStore(directory: tmpDir)
+            let engine = DayHelmEngine(budgets: sampleBudgets(), clock: clock)
+            let coordinator = await MainActor.run {
+                HybridActivityCoordinator(
+                    engine: engine,
+                    store: store,
+                    almaClient: AlmaActivityClient(baseURL: URL(string: "http://127.0.0.1:1")!, transport: MockAlmaTransport { _ in throw URLError(.cannotConnectToHost) }),
+                    inspector: MockInspector(currentSample: ActivitySample(
+                        timestamp: t0,
+                        appName: "Xcode",
+                        bundleId: "com.apple.dt.Xcode",
+                        windowTitle: "Main.swift",
+                        url: nil,
+                        idleSeconds: 0,
+                        screenLocked: false,
+                        inputActive: true
+                    )),
+                    clock: clock
+                )
+            }
+            try await MainActor.run {
+                try checkEqual(coordinator.pillModel.text, "○ DayHelm · 待命", "Initial pill text should be standby")
+                coordinator.selectTask("ecommerce")
+                try check(coordinator.pillModel.text.contains("电商"), "Pill text should reflect focused task")
+                let initialPill = coordinator.pillModel.text
+
+                // Popover closed: elapsedFocusSeconds should not advance on pollOnce/tick.
+                try checkEqual(coordinator.isPopoverVisible, false, "Popover should start hidden")
+                let beforeElapsed = coordinator.elapsedFocusSeconds
+                clock.advance(by: 2)
+                coordinator.pollOnce()
+                try checkEqual(coordinator.elapsedFocusSeconds, beforeElapsed, "Closed popover should suppress elapsedFocusSeconds updates")
+                try checkEqual(coordinator.pillModel.text, initialPill, "Same rounded minute should not mutate pillModel.text")
+
+                coordinator.setPopoverVisible(true)
+                try check(coordinator.elapsedFocusSeconds >= 2.0, "Opening popover should immediately update elapsedFocusSeconds")
+            }
+
+            let runtimeSnapshot = coordinator.currentRuntimeState().daySnapshot
+            try check(runtimeSnapshot != nil, "currentRuntimeState().daySnapshot should be populated lazily on demand")
+            try checkEqual(runtimeSnapshot?.activeFocus?.taskId, "ecommerce", "Lazy daySnapshot should reflect active focus")
+        }
+
+        try await runCheck("55. ScreenSnapshotCapturer.decodeThumbnailCGImage downsamples 2560x1440 to 368px") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-55-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let large = try makeSyntheticTextImage(text: "THUMB_TEST", backgroundWhite: false, width: 2560, height: 1440)
+            let jpgURL = tmpDir.appendingPathComponent("frame.jpg")
+            _ = try ScreenSnapshotCapturer.encodeJPEG(image: large, to: jpgURL, quality: 0.6)
+
+            let thumb = ScreenSnapshotCapturer.decodeThumbnailCGImage(at: jpgURL, maxPixelSize: 368)
+            try check(thumb != nil, "decodeThumbnailCGImage should return a CGImage")
+            if let thumb {
+                try checkEqual(max(thumb.width, thumb.height), 368, "Thumbnail longest side should be 368px, got \(thumb.width)x\(thumb.height)")
+            }
+        }
+
+        try await runCheck("56. VisionOCRWorker JSON round-trip and missing file error") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-56-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let img = try makeSyntheticTextImage(text: "CHECK56_OCR", backgroundWhite: true, width: 1280, height: 720)
+            let jpgURL = tmpDir.appendingPathComponent("sample.jpg")
+            _ = try ScreenSnapshotCapturer.encodeJPEG(image: img, to: jpgURL, quality: 0.8)
+
+            let reqData = try JSONSerialization.data(withJSONObject: [
+                "imagePath": jpgURL.path,
+                "maxDimension": 1280,
+                "languages": ["en-US"]
+            ])
+            let respData = VisionOCRWorker.processRequestJSONData(reqData)
+            let resp = try JSONSerialization.jsonObject(with: respData) as? [String: Any]
+            try checkEqual(resp?["ok"] as? Bool, true, "VisionOCRWorker should return ok: true")
+            let text = (resp?["text"] as? String ?? "").uppercased()
+            try check(text.contains("CHECK56"), "VisionOCRWorker should recognize CHECK56, got '\(text)'")
+
+            let missingReq = try JSONSerialization.data(withJSONObject: [
+                "imagePath": tmpDir.appendingPathComponent("nope.jpg").path,
+                "maxDimension": 1280,
+                "languages": ["en-US"]
+            ])
+            let missingResp = try JSONSerialization.jsonObject(with: VisionOCRWorker.processRequestJSONData(missingReq)) as? [String: Any]
+            try checkEqual(missingResp?["ok"] as? Bool, false, "Missing file should return ok: false")
+        }
+
+        try await runCheck("57. NativeScreenRecorder non-focus OCR cooldown (25s)") {
+            let t0 = Date(timeIntervalSince1970: 1_760_300_000)
+            let clock = ManualClock(now: t0)
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-57-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let store = DayHelmStore(directory: tmpDir)
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+            let recorder = NativeScreenRecorder(database: db, snapshotsRootDir: store.snapshotsDirectory, clock: clock)
+
+            let dayStartMs = Int64(t0.timeIntervalSince1970 * 1000) - 1000
+            let dayEndMs = dayStartMs + 86_400_000
+            let sample1 = ActivitySample(timestamp: t0, appName: "Notes", bundleId: "com.apple.Notes", windowTitle: "Note", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)
+            let s1 = try await recorder.processCapturedImage(
+                try makeSyntheticTextImage(text: "FOCUS_FIRST", backgroundWhite: true, width: 1280, height: 720),
+                sample: sample1,
+                trigger: ActivityEventKind.appFocus.rawValue,
+                runOCR: true
+            )
+            try check(s1, "First app_focus snapshot should be saved")
+            try checkEqual(try db.todayCounts(dayStartMs: dayStartMs, dayEndMs: dayEndMs).ocrFrames, 1, "First app_focus should run OCR")
+
+            clock.advance(by: 6)
+            let sample2 = ActivitySample(timestamp: clock.now(), appName: "Notes", bundleId: "com.apple.Notes", windowTitle: "Note", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)
+            let s2 = try await recorder.processCapturedImage(
+                try makeSyntheticTextImage(text: "SECONDARY_SKIPPED", backgroundWhite: false, width: 1280, height: 720),
+                sample: sample2,
+                trigger: "visual_change",
+                runOCR: true
+            )
+            try check(s2, "Visual change snapshot should still be saved")
+            try checkEqual(try db.todayCounts(dayStartMs: dayStartMs, dayEndMs: dayEndMs).ocrFrames, 1, "Secondary OCR within 25s should be skipped")
+        }
+
+        try await runCheck("58. HybridActivityCoordinator background UI gating and window hydration") {
+            let t0 = Date(timeIntervalSince1970: 1_760_301_000)
+            let clock = ManualClock(now: t0)
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-58-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let store = DayHelmStore(directory: tmpDir)
+            let engine = DayHelmEngine(budgets: [TaskBudget(taskId: "dev", displayName: "Dev", colorHex: "#3B82F6", targetMinutes: 90, capMinutes: 120, keywords: ["xcode"])], clock: clock)
+            let inspector = MockInspector(currentSample: ActivitySample(timestamp: t0, appName: "Xcode", bundleId: "com.apple.dt.Xcode", windowTitle: "A.swift", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true))
+            let coordinator = await MainActor.run {
+                HybridActivityCoordinator(
+                    engine: engine,
+                    store: store,
+                    almaClient: AlmaActivityClient(baseURL: URL(string: "http://127.0.0.1:1")!, transport: MockAlmaTransport { _ in throw URLError(.cannotConnectToHost) }),
+                    inspector: inspector,
+                    clock: clock
+                )
+            }
+            try await MainActor.run {
+                coordinator.start()
+                defer { coordinator.stop() }
+                try checkEqual(coordinator.isRecorderWindowVisible, false, "Recorder window should start hidden")
+                inspector.currentSample = ActivitySample(timestamp: t0.addingTimeInterval(4), appName: "Xcode", bundleId: "com.apple.dt.Xcode", windowTitle: "B.swift", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)
+                clock.advance(by: 4)
+                coordinator.pollOnce()
+                try check(coordinator.latestSample?.windowTitle != "B.swift", "Hidden started coordinator should gate latestSample")
+                coordinator.setRecorderWindowVisible(true)
+                try checkEqual(coordinator.latestSample?.windowTitle, "B.swift", "Opening recorder window should hydrate latestSample")
+            }
         }
     }
 

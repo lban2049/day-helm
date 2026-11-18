@@ -23,11 +23,14 @@ public enum ActivityClassifier {
     /// Bundle-id prefixes (case-insensitive) of known web browsers.
     public static let knownBrowserBundlePrefixes: [String] = [
         "com.apple.safari",
+        "com.apple.safaritechnologypreview",
         "com.google.chrome",
         "com.microsoft.edgemac",
         "org.mozilla.firefox",
         "com.brave.browser",
         "company.thebrowser.browser", // Arc
+        "company.thebrowser.dia",     // Dia
+        "com.thebrowser.dia",         // Dia (alternate bundle id)
         "com.operasoftware.opera",
         "com.vivaldi.vivaldi",
         "com.duckduckgo.macos.browser",
@@ -43,8 +46,12 @@ public enum ActivityClassifier {
     ]
 
     public static func isWebURL(_ rawURL: String?) -> Bool {
-        guard let trimmed = nonEmpty(rawURL),
-              let components = URLComponents(string: trimmed),
+        guard let trimmed = nonEmpty(rawURL) else { return false }
+        let lower = trimmed.lowercased()
+        guard lower.hasPrefix("http://") || lower.hasPrefix("https://") else {
+            return false
+        }
+        guard let components = URLComponents(string: trimmed),
               let scheme = components.scheme?.lowercased() else {
             return false
         }
@@ -57,8 +64,11 @@ public enum ActivityClassifier {
                 return true
             }
         }
-        let name = appName?.lowercased() ?? ""
+        let name = appName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         guard !name.isEmpty else { return false }
+        if name == "dia" || name == "dia browser" {
+            return true
+        }
         return browserAppNameKeywords.contains { name.contains($0) }
     }
 
@@ -106,6 +116,13 @@ public enum ActivityClassifier {
 ///
 /// The original title is still persisted verbatim; only change detection uses the key.
 public enum ActivityTextNormalizer {
+    private static let asciiBracketCounterRegex = try! NSRegularExpression(pattern: #"[\(\[]\s*\d{1,4}\s*\+?\s*[\)\]]"#, options: [.caseInsensitive])
+    private static let cjkBracketCounterRegex = try! NSRegularExpression(pattern: #"[（【]\s*\d{1,4}\s*\+?\s*[）】]"#, options: [.caseInsensitive])
+    private static let clockRegex = try! NSRegularExpression(pattern: #"\b\d{1,2}:\d{2}(?::\d{2})?\b"#, options: [.caseInsensitive])
+    private static let percentageRegex = try! NSRegularExpression(pattern: #"\b\d{1,3}(?:\.\d+)?\s*%"#, options: [.caseInsensitive])
+    private static let bareNumberRegex = try! NSRegularExpression(pattern: #"(?<![A-Za-z0-9])\d+(?![A-Za-z0-9])"#, options: [.caseInsensitive])
+    private static let decorativeSeparatorRegex = try! NSRegularExpression(pattern: #"[•·|–—]+"#, options: [.caseInsensitive])
+
     /// Returns a comparison key, or `nil` for an empty title.
     public static func normalizedTitleKey(_ title: String?) -> String? {
         guard let raw = title?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
@@ -115,20 +132,20 @@ public enum ActivityTextNormalizer {
         var text = raw.replacingOccurrences(of: "\u{00A0}", with: " ")
 
         // Bracketed counters: "(3)", "[12+]", "（5）"
-        text = replace(#"[\(\[]\s*\d{1,4}\s*\+?\s*[\)\]]"#, in: text)
-        text = replace(#"[（【]\s*\d{1,4}\s*\+?\s*[）】]"#, in: text)
+        text = replace(asciiBracketCounterRegex, in: text)
+        text = replace(cjkBracketCounterRegex, in: text)
         // Clocks: 14:52, 09:03:11
-        text = replace(#"\b\d{1,2}:\d{2}(?::\d{2})?\b"#, in: text)
+        text = replace(clockRegex, in: text)
         // Percentages: 87%, 12.5 %
-        text = replace(#"\b\d{1,3}(?:\.\d+)?\s*%"#, in: text)
+        text = replace(percentageRegex, in: text)
         // Loading / progress ellipses
         text = text
             .replacingOccurrences(of: "…", with: " ")
             .replacingOccurrences(of: "...", with: " ")
         // Bare numbers (year, unread badge, step count). Keep digits glued to letters (v2, Q4).
-        text = replace(#"(?<![A-Za-z0-9])\d+(?![A-Za-z0-9])"#, in: text)
+        text = replace(bareNumberRegex, in: text)
         // Decorative separators
-        text = replace(#"[•·|–—]+"#, in: text)
+        text = replace(decorativeSeparatorRegex, in: text)
 
         text = text.lowercased()
         let collapsed = text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
@@ -154,10 +171,7 @@ public enum ActivityTextNormalizer {
         return "\(app)|\(bundle)|\(titleKey)|\(urlKey)"
     }
 
-    private static func replace(_ pattern: String, in text: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
-            return text
-        }
+    private static func replace(_ regex: NSRegularExpression, in text: String) -> String {
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return regex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: " ")
     }

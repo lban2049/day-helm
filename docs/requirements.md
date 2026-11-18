@@ -85,9 +85,11 @@
 
 验收：
 - 屏幕录制权限可选可开关；未授权或关闭时无痛降级为 AX 标题 + URL + 事件录制
-- 命中 `PrivacyRedactor` 脱敏规则或锁屏时绝不截屏、绝不运行 OCR
-- 支持 `dayhelm query` / `dayhelm search` / `dayhelm sessions` / `dayhelm status --json`（`json` 与 `md` 输出）以及 Alma 形状的 `/api/activity-recorder/status`、`/sessions`、`/sessions/<id>`、`/sessions/<id>/events`、`/search/keyword`、`/snapshot-file`、`/summary/daily|weekly` 与 DayHelm 自有的 `/api/dayhelm/context`、`/api/dayhelm/search`
-- 会话级暴露敲击密度（`clickCount` / `keypressCount` / `inputEventsPerMinute`），只计次、不读按键内容
+- 命中 `PrivacyRedactor` 脱敏规则或锁屏时绝不截屏、不运行 OCR、不调用浏览器 AppleScript
+- 浏览器支持 Chrome / Safari / Safari Technology Preview / Arc / Dia 等，支持 `AXDocument` + 隐私受控的 AppleScript 标签页 URL/标题兜底
+- 支持 `dayhelm query` / `dayhelm search` / `dayhelm sessions` / `dayhelm status --json`（`json` 与 `md` 输出）以及 Alma 形状的 `/api/activity-recorder/status`、`/permissions`、`/config`、`/sessions`（含 `offset`/`analysisStatus`）、`/sessions/<id>`（含 6 位以上前缀匹配）、`/sessions/<id>/events`、`/search/keyword`（FTS5 trigram）、`/snapshot-file`、`/summary/daily|weekly`、`/digest`、`/report/<dateKey>` 与 DayHelm 自有的 `/api/dayhelm/context`、`/api/dayhelm/search`
+- 会话级暴露聚合敲击密度（`clickCount` / `keypressCount` / `inputEventsPerMinute`），只计次、不读按键内容与坐标；支持分级降采样与磁盘总上限保护
+- 在独立原生窗口（从菜单栏面板入口打开，保持主 Popover `330pt` 免滚动）中提供符合 DayHelm Precision Telemetry 风格的 **Activity Recorder 配置与历史会话检视器**：支持总开关与存储配额进度条、macOS 权限检测与跳转、采集防抖/心跳/空闲阈值/输入停顿/画面轮询/JPEG 质量调节、Vision OCR 开关与语言/采样间隔、全局键鼠监听开关、敏感应用 Bundle ID 列表配置，以及可检索的采集历史会话列表与事件/快照/OCR 详情检视
 
 ### 不做（明确排除）
 

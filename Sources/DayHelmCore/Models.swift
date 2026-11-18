@@ -94,6 +94,8 @@ public struct TaskBudget: Sendable, Equatable, Codable, Identifiable {
     public let targetMinutes: Int?
     public let capMinutes: Int?
     public let keywords: [String]
+    public let appBundleIds: [String]
+    public let domains: [String]
 
     public init(
         taskId: String,
@@ -101,7 +103,9 @@ public struct TaskBudget: Sendable, Equatable, Codable, Identifiable {
         colorHex: String,
         targetMinutes: Int? = nil,
         capMinutes: Int? = nil,
-        keywords: [String] = []
+        keywords: [String] = [],
+        appBundleIds: [String] = [],
+        domains: [String] = []
     ) {
         self.taskId = taskId
         self.displayName = displayName
@@ -109,6 +113,24 @@ public struct TaskBudget: Sendable, Equatable, Codable, Identifiable {
         self.targetMinutes = targetMinutes
         self.capMinutes = capMinutes
         self.keywords = keywords
+        self.appBundleIds = appBundleIds
+        self.domains = domains
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case taskId, displayName, colorHex, targetMinutes, capMinutes, keywords, appBundleIds, domains
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.taskId = try container.decode(String.self, forKey: .taskId)
+        self.displayName = try container.decode(String.self, forKey: .displayName)
+        self.colorHex = try container.decode(String.self, forKey: .colorHex)
+        self.targetMinutes = try container.decodeIfPresent(Int.self, forKey: .targetMinutes)
+        self.capMinutes = try container.decodeIfPresent(Int.self, forKey: .capMinutes)
+        self.keywords = try container.decodeIfPresent([String].self, forKey: .keywords) ?? []
+        self.appBundleIds = try container.decodeIfPresent([String].self, forKey: .appBundleIds) ?? []
+        self.domains = try container.decodeIfPresent([String].self, forKey: .domains) ?? []
     }
 }
 

@@ -140,6 +140,12 @@ private struct DayHelmSearchAPIResponse: Codable {
     let hits: [ActivitySearchHit]
 }
 
+private struct PermissionsAPIResponse: Codable {
+    let axTrusted: Bool
+    let screenCaptureTrusted: Bool
+    let keypressMonitoringEffective: Bool
+}
+
 private struct RoutedResponse {
     let statusCode: Int
     let body: Data
@@ -164,19 +170,28 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
     public struct RuntimeState: Sendable {
         public var axTrusted: Bool
         public var screenCaptureTrusted: Bool
+        public var keypressMonitoringEffective: Bool
+        public var activityRecorderEnabled: Bool
         public var deepRecordingEnabled: Bool
         public var daySnapshot: DayHelmDaySnapshot?
+        public var settings: DayHelmSettings
 
         public init(
             axTrusted: Bool = false,
             screenCaptureTrusted: Bool = false,
+            keypressMonitoringEffective: Bool = false,
+            activityRecorderEnabled: Bool = true,
             deepRecordingEnabled: Bool = true,
-            daySnapshot: DayHelmDaySnapshot? = nil
+            daySnapshot: DayHelmDaySnapshot? = nil,
+            settings: DayHelmSettings = .default
         ) {
             self.axTrusted = axTrusted
             self.screenCaptureTrusted = screenCaptureTrusted
+            self.keypressMonitoringEffective = keypressMonitoringEffective
+            self.activityRecorderEnabled = activityRecorderEnabled
             self.deepRecordingEnabled = deepRecordingEnabled
             self.daySnapshot = daySnapshot
+            self.settings = settings
         }
     }
 
@@ -401,6 +416,23 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
             return json(handleStatus())
         }
 
+        if path == "/api/activity-recorder/permissions" {
+            return json(handlePermissions())
+        }
+
+        if path == "/api/activity-recorder/config" {
+            return json(handleConfig())
+        }
+
+        if path == "/api/activity-recorder/digest" {
+            return json(handleDigest(queryItems: queryItems))
+        }
+
+        if path.hasPrefix("/api/activity-recorder/report/") {
+            let dateKey = String(path.dropFirst("/api/activity-recorder/report/".count)).removingPercentEncoding ?? ""
+            return json(handleDailyReport(dateKey: dateKey))
+        }
+
         if path == "/api/activity-recorder/sessions" {
             return json(handleListSessions(queryItems: queryItems))
         }
@@ -501,7 +533,7 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
 
         let payload = LocalRecorderStatusSnapshot(
             running: true,
-            recording: true,
+            recording: runtime.activityRecorderEnabled,
             source: "dayhelm",
             version: "0.1.0",
             ports: activePorts,
@@ -517,14 +549,86 @@ public final class LocalActivityHTTPServer: @unchecked Sendable {
         return (200, encodeJSON(payload))
     }
 
+    private func handlePermissions() -> (Int, Data) {
+        let runtime = stateProvider()
+        let payload = PermissionsAPIResponse(
+            axTrusted: runtime.axTrusted,
+            screenCaptureTrusted: runtime.screenCaptureTrusted,
+            keypressMonitoringEffective: runtime.keypressMonitoringEffective
+        )
+        return (200, encodeJSON(payload))
+    }
+
+    private func handleConfig() -> (Int, Data) {
+        let runtime = stateProvider()
+        let effective: DayHelmSettings
+        if let store, FileManager.default.fileExists(atPath: store.configURL.path) {
+            effective = store.loadSettings()
+        } else {
+            effective = runtime.settings
+        }
+        return (200, encodeJSON(effective))
+    }
+
+    private func handleDigest(queryItems: [URLQueryItem]) -> (Int, Data) {
+        let rawHours = queryItems.first(where: { $0.name == "hours" })?.value.flatMap(Int.init) ?? 24
+        let hours = max(1, min(rawHours, 24 * 30))
+        let nowMs = Int64(clock.now().timeIntervalSince1970 * 1000)
+        let sinceMs = nowMs - Int64(hours) * 3_600_000
+        do {
+            let digest = try database.queryDigest(sinceMs: sinceMs, untilMs: nowMs, hours: hours)
+            return (200, encodeJSON(digest))
+        } catch {
+            return (500, encodeJSON(APIErrorResponse(error: "\(error)")))
+        }
+    }
+
+    private func handleDailyReport(dateKey: String) -> (Int, Data) {
+        let trimmed = dateKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard DayHelmDateFormatting.parseDayString(trimmed) != nil else {
+            return (400, encodeJSON(APIErrorResponse(error: "Invalid date key '\(dateKey)'. Expected YYYY-MM-DD.")))
+        }
+        do {
+            let stats = try database.dailySummaryStats(dateKey: trimmed)
+            let markdown = ActivityDailyReport.renderMarkdown(dateKey: trimmed, stats: stats)
+            let report = ActivityDailyReport(
+                dateKey: trimmed,
+                skeletonOnly: true,
+                markdown: markdown,
+                stats: stats
+            )
+            return (200, encodeJSON(report))
+        } catch {
+            return (500, encodeJSON(APIErrorResponse(error: "\(error)")))
+        }
+    }
+
     private func handleListSessions(queryItems: [URLQueryItem]) -> (Int, Data) {
         let limit = queryItems.first(where: { $0.name == "limit" })?.value.flatMap(Int.init) ?? 200
+        let offset = queryItems.first(where: { $0.name == "offset" })?.value.flatMap(Int.init) ?? 0
         let sinceMs = queryItems.first(where: { $0.name == "since" })?.value.flatMap { parseTimestampMs($0) }
         let untilMs = queryItems.first(where: { $0.name == "until" })?.value.flatMap { parseTimestampMs($0) }
+        let analysisStatus = queryItems.first(where: { $0.name == "analysisStatus" })?.value.flatMap { raw -> String? in
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
 
         do {
-            let sessions = try database.listSessions(sinceMs: sinceMs, untilMs: untilMs, limit: max(1, min(limit, 5000)))
-            return (200, encodeJSON(SessionsListAPIResponse(sessions: sessions, total: sessions.count)))
+            let clampedLimit = max(1, min(limit, 5000))
+            let clampedOffset = max(0, offset)
+            let sessions = try database.listSessions(
+                sinceMs: sinceMs,
+                untilMs: untilMs,
+                limit: clampedLimit,
+                offset: clampedOffset,
+                analysisStatus: analysisStatus
+            )
+            let total = try database.countSessions(
+                sinceMs: sinceMs,
+                untilMs: untilMs,
+                analysisStatus: analysisStatus
+            )
+            return (200, encodeJSON(SessionsListAPIResponse(sessions: sessions, total: total)))
         } catch {
             return (500, encodeJSON(APIErrorResponse(error: "\(error)")))
         }

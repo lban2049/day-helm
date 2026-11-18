@@ -39,15 +39,15 @@
 系统要求：macOS 14.0+，Swift 5.10+。
 
 ```bash
-# 1. 运行全量确定性自检断言（无需 GUI、无需网络、不读写用户真实数据）
-swift run DayHelmChecks
+# 1. 运行四阶段全量确定性自检与单元测试（无需 GUI、无需网络、不读写用户真实数据）
+./scripts/run-tests.sh
 
 # 2. 打包生成 build/DayHelm.app 或安装至 /Applications/DayHelm.app
 ./scripts/build-app.sh
 ./scripts/install-app.sh --launch
 
 # 3. 以合成演示模式预览 UI（不读写 ~/.config/alma/dayhelm/）
-./build/DayHelm.app/Contents/MacOS/DayHelmApp --synthetic-demo
+./build/DayHelm.app/Contents/MacOS/DayHelm --synthetic-demo
 
 # 4. Agent CLI：查询今日上下文、检索窗口/OCR 关键词、查看会话或彻底清理数据
 /Applications/DayHelm.app/Contents/MacOS/DayHelm query --today --format md

@@ -8,6 +8,9 @@ public struct DayHelmEngineConfig: Sendable, Equatable, Codable {
     public var thrashingWindowSeconds: TimeInterval
     public var thrashingMinSwitches: Int
     public var thrashingMaxAvgDwellSeconds: TimeInterval
+    public var thrashingMinDistinctContexts: Int
+    public var thrashingMinInterruptSwitches: Int
+    public var thrashingMinEffectiveDwellSeconds: TimeInterval
     public var thrashingCooldownSeconds: TimeInterval
     public var privacyConfig: PrivacyRedactorConfig
 
@@ -21,6 +24,9 @@ public struct DayHelmEngineConfig: Sendable, Equatable, Codable {
         thrashingWindowSeconds: TimeInterval = 600,
         thrashingMinSwitches: Int = 10,
         thrashingMaxAvgDwellSeconds: TimeInterval = 45,
+        thrashingMinDistinctContexts: Int = 4,
+        thrashingMinInterruptSwitches: Int = 4,
+        thrashingMinEffectiveDwellSeconds: TimeInterval = 4.0,
         thrashingCooldownSeconds: TimeInterval = 1800,
         privacyConfig: PrivacyRedactorConfig = .default
     ) {
@@ -31,6 +37,9 @@ public struct DayHelmEngineConfig: Sendable, Equatable, Codable {
         self.thrashingWindowSeconds = thrashingWindowSeconds
         self.thrashingMinSwitches = thrashingMinSwitches
         self.thrashingMaxAvgDwellSeconds = thrashingMaxAvgDwellSeconds
+        self.thrashingMinDistinctContexts = thrashingMinDistinctContexts
+        self.thrashingMinInterruptSwitches = thrashingMinInterruptSwitches
+        self.thrashingMinEffectiveDwellSeconds = thrashingMinEffectiveDwellSeconds
         self.thrashingCooldownSeconds = thrashingCooldownSeconds
         self.privacyConfig = privacyConfig
     }
@@ -46,6 +55,7 @@ public final class DayHelmEngine: @unchecked Sendable {
     private let lock = NSLock()
     private let clock: any DayHelmClock
     public let config: DayHelmEngineConfig
+    private var _privacyConfig: PrivacyRedactorConfig
 
     private var _currentDateString: String
     private var _focusState: FocusSessionState = .unassigned
@@ -72,6 +82,17 @@ public final class DayHelmEngine: @unchecked Sendable {
 
     private var driftCandidate: DriftCandidate?
     private var lastThrashingAlertAt: Date?
+
+    private var _normalizedBudgets: [SwitchClassifier.NormalizedBudget]
+    private var _budgetsVersion: Int = 0
+    private var _stateVersion: UInt64 = 0
+    private var _cachedSpectrum: (version: UInt64, tsMs: Int64, segments: [SpectrumSegment], metrics: DayMetrics)?
+    private var _incrementalSpectrumCache: SpectrumBuilder.IncrementalCache?
+
+    public var effectivePrivacyConfig: PrivacyRedactorConfig {
+        lock.lock(); defer { lock.unlock() }
+        return _privacyConfig
+    }
 
     public var currentDateString: String {
         lock.lock(); defer { lock.unlock() }
@@ -115,7 +136,9 @@ public final class DayHelmEngine: @unchecked Sendable {
     ) {
         self.clock = clock
         self.config = config
+        self._privacyConfig = config.privacyConfig
         self._budgets = budgets
+        self._normalizedBudgets = budgets.map(SwitchClassifier.NormalizedBudget.init)
         self._currentDateString = DayHelmDateFormatting.dayString(from: clock.now())
     }
 
@@ -147,12 +170,26 @@ public final class DayHelmEngine: @unchecked Sendable {
                 self.lastProgressTimestamp = self._focusSessions[openIdx].startedAt.addingTimeInterval(self._focusSessions[openIdx].minutes * 60.0)
             }
         }
+        self._incrementalSpectrumCache = nil
+        self._cachedSpectrum = nil
+        self._budgetsVersion &+= 1
+        self._stateVersion &+= 1
     }
 
     public func updateBudgets(_ newBudgets: [TaskBudget]) {
         lock.lock()
         defer { lock.unlock() }
         _budgets = newBudgets
+        _normalizedBudgets = newBudgets.map(SwitchClassifier.NormalizedBudget.init)
+        _budgetsVersion &+= 1
+        _incrementalSpectrumCache = nil
+        _stateVersion &+= 1
+    }
+
+    public func updatePrivacyConfig(_ newPrivacyConfig: PrivacyRedactorConfig) {
+        lock.lock()
+        defer { lock.unlock() }
+        _privacyConfig = newPrivacyConfig
     }
 
     @discardableResult
@@ -162,7 +199,9 @@ public final class DayHelmEngine: @unchecked Sendable {
         colorHex: String,
         targetMinutes: Int?,
         capMinutes: Int?,
-        keywords: [String]
+        keywords: [String],
+        appBundleIds: [String] = [],
+        domains: [String] = []
     ) -> TaskBudget {
         lock.lock()
         defer { lock.unlock() }
@@ -172,6 +211,8 @@ public final class DayHelmEngine: @unchecked Sendable {
         let trimmedColor = colorHex.trimmingCharacters(in: .whitespacesAndNewlines)
         let finalColor = trimmedColor.isEmpty ? "#3B82F6" : trimmedColor
         let cleanedKeywords = Self.cleanKeywords(keywords)
+        let cleanedBundleIds = Self.cleanKeywords(appBundleIds)
+        let cleanedDomains = Self.cleanKeywords(domains)
 
         let existingIds = Set(_budgets.map(\.taskId))
         let finalId = Self.makeUniqueTaskId(preferredId: taskId, displayName: finalName, existingIds: existingIds)
@@ -182,9 +223,15 @@ public final class DayHelmEngine: @unchecked Sendable {
             colorHex: finalColor,
             targetMinutes: targetMinutes,
             capMinutes: capMinutes,
-            keywords: cleanedKeywords
+            keywords: cleanedKeywords,
+            appBundleIds: cleanedBundleIds,
+            domains: cleanedDomains
         )
         _budgets.append(created)
+        _normalizedBudgets.append(SwitchClassifier.NormalizedBudget(budget: created))
+        _budgetsVersion &+= 1
+        _incrementalSpectrumCache = nil
+        _stateVersion &+= 1
         return created
     }
 
@@ -208,9 +255,15 @@ public final class DayHelmEngine: @unchecked Sendable {
             colorHex: finalColor,
             targetMinutes: updatedBudget.targetMinutes,
             capMinutes: updatedBudget.capMinutes,
-            keywords: cleanedKeywords
+            keywords: cleanedKeywords,
+            appBundleIds: Self.cleanKeywords(updatedBudget.appBundleIds),
+            domains: Self.cleanKeywords(updatedBudget.domains)
         )
         _budgets[idx] = normalized
+        _normalizedBudgets[idx] = SwitchClassifier.NormalizedBudget(budget: normalized)
+        _budgetsVersion &+= 1
+        _incrementalSpectrumCache = nil
+        _stateVersion &+= 1
 
         let focused = focusedMinutesLocked(for: normalized.taskId)
         if let cap = normalized.capMinutes, focused < Double(cap) {
@@ -232,6 +285,10 @@ public final class DayHelmEngine: @unchecked Sendable {
         guard _budgets.count != originalCount else {
             return false
         }
+        _normalizedBudgets.removeAll { $0.taskId == taskId }
+        _budgetsVersion &+= 1
+        _incrementalSpectrumCache = nil
+        _stateVersion &+= 1
 
         let ts = date ?? clock.now()
         switch _focusState {
@@ -285,6 +342,10 @@ public final class DayHelmEngine: @unchecked Sendable {
         let removedBeforeDestination = validOffsets.filter { $0 < toOffset }.count
         let destination = min(max(0, toOffset - removedBeforeDestination), _budgets.count)
         _budgets.insert(contentsOf: moving, at: destination)
+        _normalizedBudgets = _budgets.map(SwitchClassifier.NormalizedBudget.init)
+        _budgetsVersion &+= 1
+        _incrementalSpectrumCache = nil
+        _stateVersion &+= 1
     }
 
     public func startFocus(taskId: String, note: String? = nil, at date: Date? = nil) {
@@ -302,6 +363,7 @@ public final class DayHelmEngine: @unchecked Sendable {
         if case .focusing(let currentTaskId, _) = _focusState, currentTaskId == taskId {
             if let idx = activeSessionIndex, let note {
                 _focusSessions[idx].note = note
+                _stateVersion &+= 1
             }
             return
         }
@@ -318,6 +380,7 @@ public final class DayHelmEngine: @unchecked Sendable {
         }
         closeActiveSessionLocked(at: ts, closingNote: note)
         _focusState = .paused(taskId: taskId, pausedAt: ts)
+        _stateVersion &+= 1
         driftCandidate = nil
     }
 
@@ -327,6 +390,7 @@ public final class DayHelmEngine: @unchecked Sendable {
         let ts = date ?? clock.now()
         closeActiveSessionLocked(at: ts, closingNote: note)
         _focusState = .unassigned
+        _stateVersion &+= 1
         driftCandidate = nil
         unassignedActiveStart = nil
         unassignedPromptEmitted = false
@@ -367,8 +431,18 @@ public final class DayHelmEngine: @unchecked Sendable {
     public func ingest(_ sample: ActivitySample) -> [SupervisorAlert] {
         lock.lock()
         defer { lock.unlock() }
+        let cleanSample = PrivacyRedactor.redact(sample, config: _privacyConfig)
+        return ingestRedactedLocked(cleanSample)
+    }
 
-        let cleanSample = PrivacyRedactor.redact(sample, config: config.privacyConfig)
+    @discardableResult
+    public func ingestAlreadyRedacted(_ cleanSample: ActivitySample) -> [SupervisorAlert] {
+        lock.lock()
+        defer { lock.unlock() }
+        return ingestRedactedLocked(cleanSample)
+    }
+
+    private func ingestRedactedLocked(_ cleanSample: ActivitySample) -> [SupervisorAlert] {
         _lastSample = cleanSample
 
         let isAbsent = cleanSample.screenLocked || cleanSample.idleSeconds >= config.idleThresholdSeconds
@@ -380,6 +454,7 @@ public final class DayHelmEngine: @unchecked Sendable {
                 let endTimestamp = lastProgressTimestamp ?? cleanSample.timestamp
                 closeActiveSessionLocked(at: max(endTimestamp, sessionStart), closingNote: nil)
                 _focusState = .paused(taskId: taskId, pausedAt: cleanSample.timestamp)
+                _stateVersion &+= 1
             }
             unassignedActiveStart = nil
             driftCandidate = nil
@@ -410,6 +485,7 @@ public final class DayHelmEngine: @unchecked Sendable {
             to: &_enrichedSpans,
             pulsetime: config.pulsetimeSeconds
         )
+        _stateVersion &+= 1
 
         // 3. Quota checks for active focused task
         if let taskId = activeTaskId, let budget = _budgets.first(where: { $0.taskId == taskId }) {
@@ -479,8 +555,9 @@ public final class DayHelmEngine: @unchecked Sendable {
     public func taskProgress() -> [TaskProgress] {
         lock.lock()
         defer { lock.unlock() }
+        let minutesByTask = focusedMinutesByTaskLocked()
         return _budgets.map { budget in
-            let minutes = focusedMinutesLocked(for: budget.taskId)
+            let minutes = minutesByTask[budget.taskId, default: 0.0]
             let status = BudgetStatus.compute(
                 focusedMinutes: minutes,
                 targetMinutes: budget.targetMinutes,
@@ -492,28 +569,38 @@ public final class DayHelmEngine: @unchecked Sendable {
 
     public func currentSpectrumAndMetrics(at date: Date? = nil) -> (segments: [SpectrumSegment], metrics: DayMetrics) {
         lock.lock()
+        defer { lock.unlock() }
         let ts = date ?? clock.now()
-        let spans = _enrichedSpans
-        let sessions = _focusSessions
-        let budgets = _budgets
-        let cfg = config
-        lock.unlock()
-
-        return SpectrumBuilder.build(
-            spans: spans,
-            focusSessions: sessions,
-            budgets: budgets,
+        let tsMs = Int64((ts.timeIntervalSince1970 * 1000.0).rounded())
+        let version = _stateVersion
+        if let cached = _cachedSpectrum, cached.version == version, cached.tsMs == tsMs {
+            return (cached.segments, cached.metrics)
+        }
+        let built = SpectrumBuilder.buildIncremental(
+            spans: _enrichedSpans,
+            focusSessions: _focusSessions,
+            budgets: _budgets,
+            budgetsVersion: _budgetsVersion,
             now: ts,
-            thrashingWindowSeconds: cfg.thrashingWindowSeconds,
-            thrashingMinSwitches: cfg.thrashingMinSwitches,
-            thrashingMaxAvgDwellSeconds: cfg.thrashingMaxAvgDwellSeconds
+            cache: _incrementalSpectrumCache,
+            thrashingWindowSeconds: config.thrashingWindowSeconds,
+            thrashingMinSwitches: config.thrashingMinSwitches,
+            thrashingMaxAvgDwellSeconds: config.thrashingMaxAvgDwellSeconds,
+            thrashingMinDistinctContexts: config.thrashingMinDistinctContexts,
+            thrashingMinInterruptSwitches: config.thrashingMinInterruptSwitches,
+            thrashingMinEffectiveDwellSeconds: config.thrashingMinEffectiveDwellSeconds
         )
+        _cachedSpectrum = (version: version, tsMs: tsMs, segments: built.segments, metrics: built.metrics)
+        _incrementalSpectrumCache = built.nextCache
+        return (built.segments, built.metrics)
     }
 
-    public func snapshot(at date: Date? = nil) -> DayHelmDaySnapshot {
+    public func snapshot(at date: Date? = nil, precomputedMetrics: DayMetrics? = nil) -> DayHelmDaySnapshot {
         lock.lock()
         defer { lock.unlock() }
         let ts = date ?? clock.now()
+        let tsMs = Int64((ts.timeIntervalSince1970 * 1000.0).rounded())
+        let version = _stateVersion
 
         let activeFocus: ActiveFocusSnapshot?
         if case .focusing(let taskId, let startedAt) = _focusState {
@@ -522,8 +609,9 @@ public final class DayHelmEngine: @unchecked Sendable {
             activeFocus = nil
         }
 
+        let minutesByTask = focusedMinutesByTaskLocked()
         let budgetSnapshots = _budgets.map { budget in
-            let minutes = focusedMinutesLocked(for: budget.taskId)
+            let minutes = minutesByTask[budget.taskId, default: 0.0]
             let status = BudgetStatus.compute(
                 focusedMinutes: minutes,
                 targetMinutes: budget.targetMinutes,
@@ -539,15 +627,30 @@ public final class DayHelmEngine: @unchecked Sendable {
             )
         }
 
-        let (_, metrics) = SpectrumBuilder.build(
-            spans: _enrichedSpans,
-            focusSessions: _focusSessions,
-            budgets: _budgets,
-            now: ts,
-            thrashingWindowSeconds: config.thrashingWindowSeconds,
-            thrashingMinSwitches: config.thrashingMinSwitches,
-            thrashingMaxAvgDwellSeconds: config.thrashingMaxAvgDwellSeconds
-        )
+        let metrics: DayMetrics
+        if let precomputedMetrics {
+            metrics = precomputedMetrics
+        } else if let cached = _cachedSpectrum, cached.version == version, cached.tsMs == tsMs {
+            metrics = cached.metrics
+        } else {
+            let built = SpectrumBuilder.buildIncremental(
+                spans: _enrichedSpans,
+                focusSessions: _focusSessions,
+                budgets: _budgets,
+                budgetsVersion: _budgetsVersion,
+                now: ts,
+                cache: _incrementalSpectrumCache,
+                thrashingWindowSeconds: config.thrashingWindowSeconds,
+                thrashingMinSwitches: config.thrashingMinSwitches,
+                thrashingMaxAvgDwellSeconds: config.thrashingMaxAvgDwellSeconds,
+                thrashingMinDistinctContexts: config.thrashingMinDistinctContexts,
+                thrashingMinInterruptSwitches: config.thrashingMinInterruptSwitches,
+                thrashingMinEffectiveDwellSeconds: config.thrashingMinEffectiveDwellSeconds
+            )
+            _cachedSpectrum = (version: version, tsMs: tsMs, segments: built.segments, metrics: built.metrics)
+            _incrementalSpectrumCache = built.nextCache
+            metrics = built.metrics
+        }
 
         return DayHelmDaySnapshot(
             schemaVersion: 1,
@@ -582,14 +685,28 @@ public final class DayHelmEngine: @unchecked Sendable {
         unassignedSnoozeUntil = nil
         driftCandidate = nil
         lastThrashingAlertAt = nil
+        _cachedSpectrum = nil
+        _incrementalSpectrumCache = nil
+        _stateVersion &+= 1
     }
 
     // MARK: - Private Helpers (must hold lock)
 
     private func focusedMinutesLocked(for taskId: String) -> Double {
-        _focusSessions
-            .filter { $0.taskId == taskId }
-            .reduce(0.0) { $0 + $1.minutes }
+        var total = 0.0
+        for session in _focusSessions where session.taskId == taskId {
+            total += session.minutes
+        }
+        return total
+    }
+
+    private func focusedMinutesByTaskLocked() -> [String: Double] {
+        var totals: [String: Double] = [:]
+        totals.reserveCapacity(_budgets.count)
+        for session in _focusSessions {
+            totals[session.taskId, default: 0.0] += session.minutes
+        }
+        return totals
     }
 
     private func openNewSessionLocked(taskId: String, note: String?, at ts: Date) {
@@ -607,6 +724,7 @@ public final class DayHelmEngine: @unchecked Sendable {
         activeSessionIndex = _focusSessions.count - 1
         lastProgressTimestamp = ts
         _focusState = .focusing(taskId: taskId, startedAt: ts)
+        _stateVersion &+= 1
         driftCandidate = nil
         unassignedActiveStart = nil
         unassignedPromptEmitted = false
@@ -626,31 +744,40 @@ public final class DayHelmEngine: @unchecked Sendable {
         }
         activeSessionIndex = nil
         lastProgressTimestamp = nil
+        _stateVersion &+= 1
     }
 
     private func evaluateDriftLocked(declaredTaskId: String, sample: ActivitySample) -> SupervisorAlert? {
-        let searchable = [sample.windowTitle, sample.url, sample.appName]
-            .compactMap { $0 }
-            .joined(separator: " ")
-            .lowercased()
-
-        guard !searchable.isEmpty else {
-            driftCandidate = nil
-            return nil
-        }
-
         let declaredBudget = _budgets.first { $0.taskId == declaredTaskId }
-        if let declaredBudget, matchesKeywords(searchable: searchable, budget: declaredBudget) {
+        if let declaredNorm = _normalizedBudgets.first(where: { $0.taskId == declaredTaskId }),
+           SwitchClassifier.matchesBudget(
+               appName: sample.appName,
+               bundleId: sample.bundleId,
+               windowTitle: sample.windowTitle,
+               url: sample.url,
+               redacted: sample.redacted,
+               normalizedBudget: declaredNorm
+           ) {
             driftCandidate = nil
             return nil
         }
 
-        let otherMatches = _budgets.filter { $0.taskId != declaredTaskId && matchesKeywords(searchable: searchable, budget: $0) }
-        guard let matchedOther = otherMatches.first else {
+        let matchedOtherIndex = _normalizedBudgets.firstIndex {
+            $0.taskId != declaredTaskId && SwitchClassifier.matchesBudget(
+                appName: sample.appName,
+                bundleId: sample.bundleId,
+                windowTitle: sample.windowTitle,
+                url: sample.url,
+                redacted: sample.redacted,
+                normalizedBudget: $0
+            )
+        }
+        guard let matchedOtherIndex, matchedOtherIndex < _budgets.count else {
             // Neutral auxiliary tool (Finder, Preview, generic editor, etc.)
             driftCandidate = nil
             return nil
         }
+        let matchedOther = _budgets[matchedOtherIndex]
 
         if let current = driftCandidate, current.taskId == matchedOther.taskId {
             let elapsed = sample.timestamp.timeIntervalSince(current.startedAt)
@@ -683,12 +810,32 @@ public final class DayHelmEngine: @unchecked Sendable {
         }
 
         let recentWindowStart = ts.addingTimeInterval(-config.thrashingWindowSeconds)
-        let recentSpans = _enrichedSpans.filter { $0.endedAt >= recentWindowStart && $0.startedAt <= ts }
+        var tailStart = _enrichedSpans.count
+        for i in stride(from: _enrichedSpans.count - 1, through: 0, by: -1) {
+            if _enrichedSpans[i].endedAt < recentWindowStart {
+                break
+            }
+            tailStart = i
+        }
+        var recentSpans: [EnrichedSpan] = []
+        if tailStart < _enrichedSpans.count {
+            recentSpans.reserveCapacity(_enrichedSpans.count - tailStart)
+            for i in tailStart..<_enrichedSpans.count {
+                let span = _enrichedSpans[i]
+                if span.endedAt >= recentWindowStart && span.startedAt <= ts {
+                    recentSpans.append(span)
+                }
+            }
+        }
         let windows = SpectrumBuilder.detectThrashingWindows(
             spans: recentSpans,
+            budgets: _budgets,
             windowSeconds: config.thrashingWindowSeconds,
             minSwitches: config.thrashingMinSwitches,
-            maxAverageDwellSeconds: config.thrashingMaxAvgDwellSeconds
+            maxAverageDwellSeconds: config.thrashingMaxAvgDwellSeconds,
+            minDistinctContexts: config.thrashingMinDistinctContexts,
+            minInterruptSwitches: config.thrashingMinInterruptSwitches,
+            minEffectiveDwellSeconds: config.thrashingMinEffectiveDwellSeconds
         )
         guard let latest = windows.last else {
             return nil
@@ -697,27 +844,23 @@ public final class DayHelmEngine: @unchecked Sendable {
         lastThrashingAlertAt = ts
         alertCounter += 1
         let windowMins = max(1, Int(config.thrashingWindowSeconds / 60.0))
+        let message: String
+        if latest.distinctContextCount > 0 {
+            message = "过去 \(windowMins) 分钟内在 \(latest.distinctContextCount) 个不同上下文间频繁切换，连续专注被打散，建议稳住当前任务或先休息 3 分钟。"
+        } else {
+            message = "过去 \(windowMins) 分钟内应用切换频繁，连续专注被打散，建议稳住当前任务或先休息 3 分钟。"
+        }
         return SupervisorAlert(
             id: "alert_\(alertCounter)",
             timestamp: ts,
             kind: .highFrequencySwitch(switchesInWindow: latest.switchCount, windowMinutes: windowMins),
             title: "检测到高频切换（\(latest.switchCount) 次 / \(windowMins)m）",
-            message: "过去 \(windowMins) 分钟内应用切换频繁，连续专注被打散，建议稳住当前任务或先休息 3 分钟。",
+            message: message,
             actions: [
                 .snooze(minutes: 15, label: "15m 后再说"),
                 .dismiss(label: "知道了")
             ]
         )
-    }
-
-    private func matchesKeywords(searchable: String, budget: TaskBudget) -> Bool {
-        for keyword in budget.keywords {
-            let trimmed = keyword.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if !trimmed.isEmpty && searchable.contains(trimmed) {
-                return true
-            }
-        }
-        return false
     }
 
     private func makeCapAlertLocked(budget: TaskBudget, focusedMinutes: Double, cap: Int, at ts: Date) -> SupervisorAlert {

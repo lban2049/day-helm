@@ -6,6 +6,10 @@ import SwiftUI
 @main
 struct DayHelmEntry {
     static func main() {
+        if VisionOCRWorker.runIfRequested(arguments: CommandLine.arguments) {
+            Foundation.exit(0)
+        }
+
         if let result = DayHelmCLI.run(arguments: CommandLine.arguments) {
             if !result.stdout.isEmpty {
                 FileHandle.standardOutput.write(Data(result.stdout.utf8))
@@ -52,10 +56,33 @@ struct DayHelmMenuBarApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarPopoverView(coordinator: coordinator)
+            MenuBarPopoverHostView(coordinator: coordinator)
         } label: {
-            MenuBarLabelView(coordinator: coordinator)
+            MenuBarLabelView(pillModel: coordinator.pillModel)
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+struct MenuBarPopoverHostView: View {
+    let coordinator: HybridActivityCoordinator
+    @State private var isMounted = false
+
+    var body: some View {
+        Group {
+            if isMounted {
+                MenuBarPopoverView(coordinator: coordinator)
+            } else {
+                Color.clear.frame(width: 330, height: 1)
+            }
+        }
+        .onAppear {
+            isMounted = true
+            coordinator.setPopoverVisible(true)
+        }
+        .onDisappear {
+            isMounted = false
+            coordinator.setPopoverVisible(false)
+        }
     }
 }

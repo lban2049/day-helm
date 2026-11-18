@@ -74,11 +74,16 @@ public enum EventMerger {
         sample: ActivitySample,
         declaredTaskId: String?
     ) -> Bool {
-        span.appName == sample.appName
+        guard span.appName == sample.appName
             && span.bundleId == sample.bundleId
-            && span.windowTitle == sample.windowTitle
             && span.url == sample.url
             && span.declaredTaskId == declaredTaskId
-            && span.redacted == sample.redacted
+            && span.redacted == sample.redacted else {
+            return false
+        }
+        if span.windowTitle == sample.windowTitle {
+            return true
+        }
+        return SwitchClassifier.isVolatileJitterOnly(previous: span.windowTitle, current: sample.windowTitle)
     }
 }

@@ -25,8 +25,7 @@ struct DaySpectrumRibbonView: View {
                 }
             }
 
-            GeometryReader { geo in
-                let totalWidth = max(1, geo.size.width)
+            Group {
                 if segments.isEmpty {
                     RoundedRectangle(cornerRadius: 4, style: .continuous)
                         .fill(Color.secondary.opacity(0.16))
@@ -36,21 +35,47 @@ struct DaySpectrumRibbonView: View {
                                 .foregroundStyle(.tertiary)
                         )
                 } else {
-                    HStack(spacing: 1) {
-                        ForEach(segments) { segment in
-                            let fraction = max(0.0, segment.durationMinutes) / totalDurationMinutes
-                            let segWidth = max(2.0, totalWidth * fraction - 1.0)
-                            segmentView(for: segment)
-                                .frame(width: segWidth, height: 22)
-                                .help(tooltipText(for: segment))
+                    Canvas { context, size in
+                        let totalWidth = max(1.0, size.width)
+                        let gap: CGFloat = 1.0
+                        var x: CGFloat = 0.0
+                        let totalMinutes = totalDurationMinutes
+
+                        for segment in segments {
+                            let fraction = max(0.0, segment.durationMinutes) / totalMinutes
+                            let segWidth = max(2.0, totalWidth * fraction - gap)
+                            let rect = CGRect(x: x, y: 0, width: segWidth, height: size.height)
+
+                            switch segment.kind {
+                            case .task(_, _, let colorHex):
+                                context.fill(Path(rect), with: .color(Color(hex: colorHex)))
+                            case .thrashing:
+                                context.fill(Path(rect), with: .color(Color(hex: "#EF4444").opacity(0.28)))
+                                context.drawLayer { layerCtx in
+                                    layerCtx.clip(to: Path(rect))
+                                    var hatch = Path()
+                                    var hx = rect.minX - rect.height
+                                    while hx < rect.maxX + rect.height {
+                                        hatch.move(to: CGPoint(x: hx, y: rect.maxY))
+                                        hatch.addLine(to: CGPoint(x: hx + rect.height, y: rect.minY))
+                                        hx += 6.0
+                                    }
+                                    layerCtx.stroke(hatch, with: .color(Color(hex: "#EF4444").opacity(0.85)), lineWidth: 1.5)
+                                }
+                            case .idle:
+                                context.fill(Path(rect), with: .color(Color.secondary.opacity(0.22)))
+                            case .unassigned:
+                                context.fill(Path(rect), with: .color(Color.secondary.opacity(0.45)))
+                            }
+                            x += segWidth + gap
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                     .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: 4, style: .continuous)
                             .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
                     )
+                    .help(summaryTooltipText)
                 }
             }
             .frame(height: 22)
@@ -59,21 +84,15 @@ struct DaySpectrumRibbonView: View {
         }
     }
 
-    @ViewBuilder
-    private func segmentView(for segment: SpectrumSegment) -> some View {
-        switch segment.kind {
-        case .task(_, _, let colorHex):
-            Rectangle()
-                .fill(Color(hex: colorHex))
-        case .thrashing:
-            ThrashingHatchView()
-        case .idle:
-            Rectangle()
-                .fill(Color.secondary.opacity(0.22))
-        case .unassigned:
-            Rectangle()
-                .fill(Color.secondary.opacity(0.45))
-        }
+    private var summaryTooltipText: String {
+        guard let first = segments.first, let last = segments.last else { return "" }
+        let thrashCount = segments.filter {
+            if case .thrashing = $0.kind { return true }
+            return false
+        }.count
+        let totalMins = Int(totalDurationMinutes.rounded())
+        return "\(formatHHMM(first.startedAt))–\(formatHHMM(last.endedAt)) · \(segments.count) 段 · \(totalMins)m"
+            + (thrashCount > 0 ? " · 乱切 \(thrashCount) 段" : "")
     }
 
     private var legendRow: some View {
@@ -117,11 +136,15 @@ struct DaySpectrumRibbonView: View {
         return String(name.prefix(4))
     }
 
-    private func formatHHMM(_ date: Date) -> String {
+    private static let hhmmFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.timeZone = DayHelmDateFormatting.shanghaiTimeZone
         formatter.dateFormat = "HH:mm"
-        return formatter.string(from: date)
+        return formatter
+    }()
+
+    private func formatHHMM(_ date: Date) -> String {
+        Self.hhmmFormatter.string(from: date)
     }
 
     private func tooltipText(for segment: SpectrumSegment) -> String {
