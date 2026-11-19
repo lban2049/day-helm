@@ -162,12 +162,12 @@ public enum SpectrumBuilder {
             }
 
             for right in prevStableCount..<stableCount {
-                let rightKey = stablePrepared[right].contextKey
+                let rightKey = SwitchClassifier.thrashingContextKey(for: stablePrepared[right])
                 cache.contextCounts[rightKey, default: 0] += 1
 
                 let windowEnd = max(stablePrepared[right].span.endedAt, stablePrepared[right].span.startedAt)
                 while cache.left < right && windowEnd.timeIntervalSince(stablePrepared[cache.left].span.startedAt) > windowSeconds {
-                    let leftKey = stablePrepared[cache.left].contextKey
+                    let leftKey = SwitchClassifier.thrashingContextKey(for: stablePrepared[cache.left])
                     if let existing = cache.contextCounts[leftKey] {
                         if existing <= 1 {
                             cache.contextCounts.removeValue(forKey: leftKey)
@@ -263,12 +263,12 @@ public enum SpectrumBuilder {
             for k in 0..<tailPrepared.count {
                 let right = stableCount + k
                 let rightSpan = tailPrepared[k]
-                let rightKey = rightSpan.contextKey
+                let rightKey = SwitchClassifier.thrashingContextKey(for: rightSpan)
                 localContextCounts[rightKey, default: 0] += 1
 
                 let windowEnd = max(rightSpan.span.endedAt, rightSpan.span.startedAt)
                 while localLeft < right && windowEnd.timeIntervalSince(preparedAt(localLeft).span.startedAt) > windowSeconds {
-                    let leftKey = preparedAt(localLeft).contextKey
+                    let leftKey = SwitchClassifier.thrashingContextKey(for: preparedAt(localLeft))
                     if let existing = localContextCounts[leftKey] {
                         if existing <= 1 {
                             localContextCounts.removeValue(forKey: leftKey)

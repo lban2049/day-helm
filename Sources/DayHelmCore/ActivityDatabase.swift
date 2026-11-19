@@ -1103,6 +1103,73 @@ public final class ActivityDatabase: @unchecked Sendable {
             .map { $0 }
     }
 
+    public func latestOCRText(
+        withinSeconds: TimeInterval = 180,
+        appName: String? = nil,
+        windowTitle: String? = nil,
+        nowMs: Int64
+    ) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        let cutoffMs = nowMs - Int64(max(1.0, withinSeconds) * 1000.0)
+
+        let trimmedApp = appName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedTitle = windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasApp = (trimmedApp?.isEmpty == false)
+        let hasTitle = (trimmedTitle?.isEmpty == false)
+
+        let sql: String
+        if hasApp && hasTitle {
+            sql = """
+            SELECT f.text
+            FROM activity_ocr_frames f
+            JOIN activity_snapshots s ON f.snapshot_id = s.id
+            WHERE f.created_at >= ? AND f.created_at <= ?
+              AND s.app_name = ?
+              AND s.window_title = ?
+            ORDER BY f.created_at DESC
+            LIMIT 1;
+            """
+        } else if hasApp {
+            sql = """
+            SELECT f.text
+            FROM activity_ocr_frames f
+            LEFT JOIN activity_snapshots s ON f.snapshot_id = s.id
+            WHERE f.created_at >= ? AND f.created_at <= ?
+              AND (s.app_name IS NULL OR s.app_name = ?)
+            ORDER BY f.created_at DESC
+            LIMIT 1;
+            """
+        } else {
+            sql = """
+            SELECT text
+            FROM activity_ocr_frames
+            WHERE created_at >= ? AND created_at <= ?
+            ORDER BY created_at DESC
+            LIMIT 1;
+            """
+        }
+
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else {
+            return nil
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, cutoffMs)
+        sqlite3_bind_int64(stmt, 2, nowMs)
+        if hasApp && hasTitle {
+            bindText(stmt, index: 3, value: trimmedApp!)
+            bindText(stmt, index: 4, value: trimmedTitle!)
+        } else if hasApp {
+            bindText(stmt, index: 3, value: trimmedApp!)
+        }
+        guard sqlite3_step(stmt) == SQLITE_ROW else {
+            return nil
+        }
+        let text = readText(stmt, 0)
+        return text?.isEmpty == false ? text : nil
+    }
+
     public func queryAgentContext(
         sinceMs: Int64,
         untilMs: Int64,

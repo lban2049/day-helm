@@ -1217,6 +1217,7 @@ public final class NativeScreenRecorder: @unchecked Sendable {
     public let minHistogramDiffPct: Double = 0.04
     public let minPixelDiffPct: Double = 0.02
     public var minNonFocusOCRIntervalSeconds: TimeInterval = 25.0
+    public var minWindowChangeOCRIntervalSeconds: TimeInterval = 3.0
 
     /// Snapshots older than this are re-encoded to a smaller tier before final retention pruning.
     public let downsampleAfterDays: Int = 1
@@ -1241,10 +1242,12 @@ public final class NativeScreenRecorder: @unchecked Sendable {
     private var lastOCRSessionOrder: [String] = []
     private let maxCachedOCRSessions = 4
     private var lastAppFocusCaptureAt: Date?
+    private var lastWindowChangeCaptureAt: Date?
     private var lastClickCaptureAt: Date?
     private var lastTypingPauseCaptureAt: Date?
     private var lastVisualCheckAt: Date?
     private var lastOCRRunAt: Date?
+    private var lastOCRWindowKey: String?
     private var lastPruneAt: Date?
     private var isCaptureInFlight: Bool = false
     private var pendingCapture: PendingCaptureRequest?
@@ -1297,6 +1300,7 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         lastSavedAt = nil
         lastVisualCheckAt = nil
         lastOCRRunAt = nil
+        lastOCRWindowKey = nil
         lastOCRTextBySession.removeAll(keepingCapacity: false)
         lastOCRSessionOrder.removeAll(keepingCapacity: false)
         lock.unlock()
@@ -1304,7 +1308,7 @@ public final class NativeScreenRecorder: @unchecked Sendable {
     }
 
     public static func shouldRunOCR(savedCount: Int, trigger: String, ocrEveryN: Int) -> Bool {
-        if trigger == ActivityEventKind.appFocus.rawValue {
+        if trigger == ActivityEventKind.appFocus.rawValue || trigger == "window_change" {
             return true
         }
         let n = max(1, ocrEveryN)
@@ -1316,7 +1320,7 @@ public final class NativeScreenRecorder: @unchecked Sendable {
 
     private static func priority(for trigger: String) -> Int {
         switch trigger {
-        case ActivityEventKind.appFocus.rawValue:
+        case ActivityEventKind.appFocus.rawValue, "window_change":
             return 3
         case ActivityEventKind.click.rawValue:
             return 2
@@ -1331,7 +1335,7 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         sample: ActivitySample,
         deepRecordingEnabled: Bool,
         declaredTaskId: String?,
-        idleThresholdSeconds: TimeInterval = 300.0,
+        idleThresholdSeconds: TimeInterval = 180.0,
         retentionDays: Int = 7,
         maxStorageBytes: Int64 = DayHelmSettings.defaultMaxStorageBytes,
         ocrEveryN: Int = 1,
@@ -1397,7 +1401,7 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         sample: ActivitySample,
         deepRecordingEnabled: Bool,
         declaredTaskId: String?,
-        idleThresholdSeconds: TimeInterval = 300.0,
+        idleThresholdSeconds: TimeInterval = 180.0,
         ocrEveryN: Int = 1,
         onCompleted: (@Sendable () -> Void)? = nil
     ) {
@@ -1442,12 +1446,35 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         )
     }
 
+    /// Captures on-demand when switching to a weak-title / multi-purpose page that needs body OCR for semantic classification.
+    /// Throttled by `minWindowChangeOCRIntervalSeconds` (3s) and protected by visual de-duplication + single-flight gate.
+    public func triggerWindowContextCaptureIfNeeded(
+        sample: ActivitySample,
+        deepRecordingEnabled: Bool,
+        declaredTaskId: String?,
+        idleThresholdSeconds: TimeInterval = 180.0,
+        ocrEveryN: Int = 1,
+        onCompleted: (@Sendable () -> Void)? = nil
+    ) {
+        triggerSecondaryCaptureIfNeeded(
+            sample: sample,
+            trigger: "window_change",
+            minInterval: minWindowChangeOCRIntervalSeconds,
+            lastCaptureAt: \.lastWindowChangeCaptureAt,
+            deepRecordingEnabled: deepRecordingEnabled,
+            declaredTaskId: declaredTaskId,
+            idleThresholdSeconds: idleThresholdSeconds,
+            ocrEveryN: ocrEveryN,
+            onCompleted: onCompleted
+        )
+    }
+
     /// Captures shortly after a click, with its own debounce and dual visual de-duplication.
     public func triggerClickCaptureIfNeeded(
         sample: ActivitySample,
         deepRecordingEnabled: Bool,
         declaredTaskId: String?,
-        idleThresholdSeconds: TimeInterval = 300.0,
+        idleThresholdSeconds: TimeInterval = 180.0,
         ocrEveryN: Int = 1,
         onCompleted: (@Sendable () -> Void)? = nil
     ) {
@@ -1469,7 +1496,7 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         sample: ActivitySample,
         deepRecordingEnabled: Bool,
         declaredTaskId: String?,
-        idleThresholdSeconds: TimeInterval = 300.0,
+        idleThresholdSeconds: TimeInterval = 180.0,
         ocrEveryN: Int = 1,
         onCompleted: (@Sendable () -> Void)? = nil
     ) {
@@ -1629,16 +1656,20 @@ public final class NativeScreenRecorder: @unchecked Sendable {
         let ocrLanguages: [String]
     }
 
-    private func claimOCRCoolDownSlot(trigger: String, timestamp: Date) -> Bool {
+    private func claimOCRCoolDownSlot(trigger: String, windowKey: String, timestamp: Date) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         if trigger != ActivityEventKind.appFocus.rawValue,
            let lastOCRRunAt,
-           timestamp >= lastOCRRunAt,
-           timestamp.timeIntervalSince(lastOCRRunAt) < minNonFocusOCRIntervalSeconds {
-            return false
+           timestamp >= lastOCRRunAt {
+            let isDifferentWindow = (lastOCRWindowKey != nil && lastOCRWindowKey != windowKey)
+            let requiredInterval = isDifferentWindow ? minWindowChangeOCRIntervalSeconds : minNonFocusOCRIntervalSeconds
+            if timestamp.timeIntervalSince(lastOCRRunAt) < requiredInterval {
+                return false
+            }
         }
         lastOCRRunAt = timestamp
+        lastOCRWindowKey = windowKey
         return true
     }
 
@@ -1740,9 +1771,10 @@ public final class NativeScreenRecorder: @unchecked Sendable {
 
             let effectiveRunOCR = runOCR && runtime.visionOCREnabled
             let effectiveLanguages = ocrLanguages ?? runtime.ocrLanguages
+            let ocrWindowKey = "\(sample.appName)|\(sample.windowTitle ?? "")"
             let shouldRunOCRNow = effectiveRunOCR
                 && Self.shouldRunOCR(savedCount: currentSavedCount, trigger: trigger, ocrEveryN: ocrEveryN)
-                && claimOCRCoolDownSlot(trigger: trigger, timestamp: sample.timestamp)
+                && claimOCRCoolDownSlot(trigger: trigger, windowKey: ocrWindowKey, timestamp: sample.timestamp)
 
             return SavedSnapshotContext(
                 fileURL: fileURL,

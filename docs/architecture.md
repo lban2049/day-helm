@@ -65,7 +65,7 @@ DayHelm 内置完整的 macOS 原生活动采集、视觉去重、设备端 Visi
 | **设备端 OCR** | `text` / `charCount` / `tokenCount` | 短命无头子进程 `DayHelm __ocr-worker`（空闲 `15s` 或满 `10` 帧退出；测试环境透明回退同进程）：从落盘 JPEG 按 `1280px` 缩略解码后运行 `VNRecognizeTextRequest`（`.accurate`、`usesLanguageCorrection = false`）+ 会话内连续帧去重 + `ocrEveryN` 间隔 | 同上（本机离线） | `app_focus` 与首帧立即执行；非 `app_focus` 触发最短间隔 `25s`（`minNonFocusOCRIntervalSeconds`），均在释放 `CGImage` 后异步执行 |
 | **本机 HID** | 全局空闲秒数 `idleSeconds` | `CGEventSource.secondsSinceLastEventType(.combinedSessionState, 0xFFFFFFFF)` + `HIDIdleTime` | 无 | 2s 轮询 |
 
-> **分类与抖动抑制**（见 `docs/decisions/006-activity-classification-and-retention.md` 与 `docs/decisions/008-alma-parity-capture-retention-and-perf.md`）：`browser_visit` 仅当 URL 为 `http(s)` 且当前应用是已知浏览器（含 Chrome / Safari / Safari Technology Preview / Arc / Dia 等）；Preview/TextEdit/Finder 等 `file://` 文档记 `app_focus`。事件变更检测使用归一化标题与归一化 URL，应用切换不受 5s 最小变化间隔限制。30s 周期心跳事件仅在 `idleSeconds < 30s` 时写入，避免长空闲尾巴污染 `duration_ms`；`idleSeconds >= 300s`、系统休眠或锁屏时在最后活动时间闭合会话，启动时自动收口残留未关闭会话。
+> **分类与抖动抑制**（见 `docs/decisions/006-activity-classification-and-retention.md` 与 `docs/decisions/008-alma-parity-capture-retention-and-perf.md`）：`browser_visit` 仅当 URL 为 `http(s)` 且当前应用是已知浏览器（含 Chrome / Safari / Safari Technology Preview / Arc / Dia 等）；Preview/TextEdit/Finder 等 `file://` 文档记 `app_focus`。事件变更检测使用归一化标题与归一化 URL，应用切换不受 5s 最小变化间隔限制。30s 周期心跳事件仅在 `idleSeconds < 30s` 时写入，避免长空闲尾巴污染 `duration_ms`；`idleSeconds >= 180s`（3 分钟）、系统休眠或锁屏时在最后活动时间闭合会话，启动时自动收口残留未关闭会话。
 
 > **视觉去重与分层留存**：同时检查 32-bin 直方图总变差距离（`>= 4%`）与 `160×90` 缩略图 RGB 像素差（通道差 `>= 30` 且占比 `>= 2%`）。自动维护执行两级降采样：`hot -> warm`（超过 1 天，最长边 `1280px`、质量 `0.4`）与 `warm -> cold`（留存 > 7 天且超过 7 天，`640px`、质量 `0.3`）；缺图或损坏文件直接标 `pruned` 防死循环；超过总容量封顶（默认 `10 GB`）按时间清理最旧快照至配额 `75%`（`7.5 GB`）。
 
@@ -98,12 +98,30 @@ public struct TaskBudget: Sendable, Equatable, Codable, Identifiable {
     public var id: String { taskId }
     public let taskId: String           // 如 "ecommerce", "ecommerce-ops", "hermes" 或自动生成的唯一 slug
     public let displayName: String      // 如 "电商做深", "电商日常运营", "Hermes 投研"
+    public let shortName: String?       // 菜单栏短名（可选）
+    public let description: String?     // 一句话自然语言说明（可选，供 Jev 语义归类）
     public let colorHex: String         // 用于光谱条与标签颜色
     public let targetMinutes: Int?      // 保底目标时长（如 90 分钟）
     public let capMinutes: Int?         // 封顶上限时长（如运营最多 30 分钟）
-    public let keywords: [String]       // 窗口标题 / URL 关键词（用于跑偏识别）
+    public let keywords: [String]       // 高级可选：窗口标题 / URL 关键词（用于离线兜底）
+    public let appBundleIds: [String]   // 高级可选：关联应用 Bundle ID
+    public let domains: [String]        // 高级可选：关联域名
 }
 ```
+
+### 1.5 可选 Jev 两层语义自动归属引擎（`SemanticAutoTracker` + `JevActivityClient`）
+
+详见 [ADR 012](decisions/012-jev-semantic-auto-tracking.md)：
+- **配置与密钥隔离**：`DayHelmSettings` 新增 `jevAutoTrackingEnabled`（默认 `false`）、`jevModel`（默认 `jev-latest`）与 `jevSendOCRSnippet`（默认 `true`）；API Key 独立保存在 `~/.config/alma/dayhelm/jev.key`（`0600`），亦支持 `JEV_API_KEY` 环境变量 / 本地 `.env`。开启开关但缺少 Key 时，设置页与菜单栏面板均提示配置 API Key。
+- **两层正交模型（优先支持零项目开箱即用）**：
+  - **第 1 层（`ActivityMode`，内置 6 大类，无需配置）**：`开发构建 (build)`、`内容创作 (create)`、`业务运营 (operate)`、`研究规划 (research)`、`沟通杂务 (comms_admin)`、`休息分心 (break)`，自动按类累计今日时长。
+  - **第 2 层（`TaskBudget` 焦点项目，完全可选）**：用户配置了焦点项目时并行判定所属项目（或 `none`），命中项目优先展示项目名与配额进度，未命中或未配置项目时直接展示第 1 层活动大类与今日时长。
+- **零手工确认闭环与语义切换联动**：
+  1. 通过 `NSWorkspace.didActivateApplicationNotification`（跨应用）与前台单 PID `AXWindowChangeObserver`（同应用切窗/浏览器切 Tab，`60ms` 标题合并防抖）在 `< 80ms` 内事件驱动感知上下文变化（2 秒 `pollOnce()` 退居兜底，稳态零额外轮询 CPU）；随后以一次性精确防抖计时器过滤 `< 0.65s` 瞬时路过与加载中间态（缓存回切过滤 `< 0.45s` 防闪烁），并跳过 DayHelm 自身、辅助浮层与空白新标签页，按细粒度 `semanticContextKey`（浏览器包含归一化窗口标题，区分同域不同频道/看板/发帖页）缓存 5 分钟（`contextCacheTTLSeconds = 300s`）；弱标题/多用途页面无 180s 内 OCR 时在 `0.35s` 后触发受 `3s` 冷却保护的按需截屏 OCR，就绪后自动升级重判一次。
+  2. `SemanticPayloadSanitizer` 对外发上下文执行锁屏阻断、`PrivacyRedactor` 脱敏阻断、URL 敏感参数剥离、凭据掩码，并对弱标题及多用途工作台/看板/聊天/AI/本地页面附带同窗口标题匹配且通过地址栏/菜单栏锚点剥离顶部噪声后的 OCR 正文摘要（≤ 600 字符），只附带最近 3 条原始客观窗口历史（不回传模型历史标签）。
+  3. `JevActivityClient`（`DayHelmCapture`）通过单次 `POST /v1/systemone` 并行返回 `activity_mode`、可选 `focus_project` 与 `same_task`。
+  4. `SemanticAutoTracker`（`DayHelmCore`，纯逻辑可注入时钟）在窗口稳定 `>= 0.65s` 后由精确计时器准时调用 Jev：高置信度（`>= 0.80` 且 `same_task <= 0.60`）**立即自动切换**（热连接端到端 ~0.9–1.0s，冷 TLS 重连仍 `<= 2.0s`，命中缓存 ~0.5–0.6s）；中置信度（`0.70–0.80`）或高 `same_task` 通过精确计时器进入全自动短暂**防抖观察**（`1.2s–2.5s`，绝不弹窗打扰，同一目标跨窗口延续时不重置计时），自动提交切换并更新计划事项时长、配额提醒与 6 大活动模式累计时长，同时将语义组写回 `EnrichedSpan.semanticGroup` 供高频切换检测去噪。
+  5. 手工点击任一事项立即覆写当前归属并记入当日该 `contextKey` 的纠偏缓存，切至新窗口后自动追踪继续生效。
 
 - **配置真源与冷启动初始化**：
   - 用户在 UI 中对事项的增删改查、排序与配额调整，全量持久化至 `~/.config/alma/dayhelm/config.json`。
@@ -125,8 +143,12 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 }
 ```
 
-- **跨应用包容原则**：当用户声明处于 `.focusing(taskId: "ecommerce")` 时，只要人在场（未锁屏、且未超过 `idleThreshold` 5 分钟长空闲），期间切换到预览、Finder、表格、终端或通用网页等辅助工具，**时长持续累计入当前声明的 `taskId`**，不会因为切换应用而打断连续块。
-- **在场判定（Presence）**：结合 `screenLocked == false` 且（`idleSeconds < 300s` 或 Alma 当前 session 处于活跃态），避免阅读思考时被误判离开。
+- **跨应用包容原则**：当用户声明处于 `.focusing(taskId: "ecommerce")` 时，只要人在场（未锁屏、且未超过 `idleThreshold` 3 分钟长空闲），期间切换到预览、Finder、表格、终端或通用网页等辅助工具，**时长持续累计入当前声明的 `taskId`**，不会因为切换应用而打断连续块。
+- **在场判定（Presence）、空闲回扣与休眠断档保护**：
+  - 结合 `screenLocked == false` 且 `idleSeconds < 180s`（3 分钟）。
+  - **空闲自动回扣**：离开电脑未锁屏时，轮询在 `0–179s` 间累计的时长会在首次达到 `180s` 空闲时按 `lastActiveAt = timestamp - idleSeconds` 精确回扣（仅扣当前连续段，绝不倒扣历史时段），确保离座前的 3 分钟不会虚增今日投入时长。
+  - **休眠与断档保护**：系统触发 `will_sleep` 时立即调用 `engine.handleSystemSleep(at:)` 封口当前会话并清空计时基线；同时实机模式下启用单次 tick 步长硬上限（`maxTickGapSeconds = 60s`），任何超过 60 秒的时钟跳跃/休眠断档只重置基线、绝不计入活跃时长。
+  - **自动暂停 vs 手动暂停**：因离座/锁屏/休眠触发的自动暂停在用户回到电脑重新活跃后自动恢复计时；用户手动点击的暂停保持暂停直到手动继续或切换任务。
 
 ### 3. 今日时间光谱条（Day Spectrum Ribbon）与连续度计算
 
@@ -164,10 +186,24 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 ### 2. 三个核心界面载体（无笨重主窗口）
 
 #### 载体 A：macOS 顶部菜单栏实时胶囊（MenuBar Live Pill）
-- 常驻系统菜单栏，左侧带自定义矢量日舵（Helm）模板图标，无需点击即可用余光瞥见当前状态：
-  - **专注推进中**：`● 电商做深 · 52/90m`
-  - **触达封顶上限**：`▲ 日常运营 · 31/30m (已到点)`
-  - **未指定专注**：`○ DayHelm · 待命`
+- 常驻系统菜单栏，左侧带自定义矢量日舵（Helm）模板图标，并通过图标明暗与右下角 `5pt` 语义状态点区分状态（在**仅图标模式**下同样一眼可辨）：
+  - **待命（`standby`）**：日舵图标呈半透明（`0.48`），无状态圆点；
+  - **专注推进中（`focusing`）**：日舵图标全亮 + 右下角**推进蓝**圆点；
+  - **已达保底（`targetMet`）**：日舵图标全亮 + 右下角**达标绿**圆点；
+  - **触达封顶（`capReached`）**：日舵图标全亮 + 右下角**封顶琥珀**圆点；
+  - **其他事务（`otherWork`）**：日舵图标全亮 + 右下角**中性灰蓝**圆点；
+  - **分心/休息（`distraction`）**：日舵图标全亮 + 右下角**警示红**圆点。
+- 文本采用系统比例字体 `11.5pt` + `.monospacedDigit()`（仅数字等宽防抖动），去掉冗余 `"DayHelm"` 品牌文字与前置状态符号，悬停（`.help()`）展示完整事项名称与进度；支持在设置中切换 3 档显示密度（`DayHelmSettings.menuBarDisplayMode`，默认 **`standard`**）：
+  - **标准模式（`standard`，默认）**：始终以文字标签表明当前事务类型 + 进度/已用时长；命中焦点项目时优先展示项目名（优先 `TaskBudget.shortName`，未设置时按视觉宽度 CJK=2/ASCII=1 保留至多 16 单位），未配置或未命中项目时展示第 1 层活动模式与今日累计时长：
+    - 命中焦点项目推进中：`电商运营 52/90m`、`独立产品开发 25/60m`
+    - 触达封顶上限：`电商运营 31/30m▲`
+    - 未命中项目（或零项目模式）：`开发构建 32m`、`内容创作 18m`、`业务运营 45m`、`研究规划 14m`、`沟通杂务 8m`、`休息分心 6m`
+    - 未指定专注（待命）：`待命`
+  - **极简模式（`compact`）**：兼顾刘海屏与多图标环境：
+    - 专注推进中：`52/90m`（触达上限 `31/30m!`）
+    - 自动识别为其他事务/分心：`杂务 12m` / `分心 6m`
+    - 未指定专注（待命）：仅显示日舵图标（无额外文字）
+  - **仅图标模式（`iconOnly`）**：始终仅显示日舵图标，通过悬停提示或点击 Popover 查看详情。
 
 #### 载体 B：菜单栏下拉高密度仪表盘（Popover，固定宽 `330pt`，一屏免滚动）
 由 `MenuBarPopoverHostView` 托管，闭合时彻底从 SwiftUI `AttributeGraph` 卸载，后台运行态同步门控非可见 `@Published` UI 计算与 `refreshRecorderCountsAsync()`，打开时立即全量刷新。由上至下分为 5 个紧凑模块（内边距 `14pt`，模块间距 `11pt`）：
@@ -196,9 +232,12 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
   - 底部 2–3 个快捷动作按钮（如 `[ 切到「电商做深」 ]`、`[ +15m 收尾 ]`、`[ 转入休息 ]`）。
 
 #### 载体 D：独立设置与活动记录窗口（`ActivityRecorderWindow`）
-- **定位与触发**：从菜单栏 Popover 顶栏设置图标或底部 `设置` / `历史会话`（或引擎状态条）打开，并在打开时自动收起菜单栏 Popover；集中承载所有低频/复杂配置，避免破坏 `330pt` 菜单栏面板一屏免滚动体验；遵循 Precision Telemetry 卡片网格与 `.monospacedDigit()` 规范。
-- **一体化透明标题栏导航（Unified Titlebar）**：窗口采用 `.fullSizeContentView` + `titlebarAppearsTransparent = true` + `.unified` 工具栏，红黄绿窗口控制钮右侧依次排列会话侧栏折叠按钮（仅「历史会话」显示）、DayHelm Logo 与名称、平级导航项（`事项与配额` ｜ `活动采集` ｜ `隐私与存储` ｜ `历史会话`），右侧展示采集状态胶囊与刷新按钮：
-  - **「事项与配额」**：事项新增/编辑弹窗（名称、6 色语义色点、保底目标与封顶上限滑块/直输联动控件、匹配关键词、关联应用 `appBundleIds` 与关联域名 `domains`）、上下排序、删除确认，修改立即生效并同步至悬浮窗。
+- **定位与触发**：从菜单栏 Popover 顶栏设置图标或底部 `设置` / `历史会话`（或引擎状态条）打开，并在打开时自动收起菜单栏 Popover；打开独立窗口期间自动将应用激活策略切为 `.regular`（在底部 Dock 与 `Cmd+Tab` 展示应用图标，点击 Dock 图标可一键唤回），窗口关闭后恢复 `.accessory` 静默菜单栏模式。集中承载所有低频/复杂配置，避免破坏 `330pt` 菜单栏面板一屏免滚动体验；遵循 Precision Telemetry 卡片网格与 `.monospacedDigit()` 规范。
+- **一体化工具栏导航（Unified Toolbar）**：窗口采用标准非重叠标题栏（不使用 `.fullSizeContentView` 透明穿透，确保内容区向上滚动严格裁切在工具栏下方、绝不与导航栏重叠）+ `titleVisibility = .hidden` + `.unified` 工具栏，红黄绿窗口控制钮右侧依次排列会话侧栏折叠按钮（仅「历史会话」显示）、DayHelm Logo 与名称、平级导航项（`事项与配额` ｜ `Jev 识别` ｜ `活动采集` ｜ `隐私与存储` ｜ `历史会话`），右侧展示采集状态胶囊与刷新按钮：
+  - **「事项与配额」**：专注管理今日可选焦点项目与菜单栏显示密度——包含事项新增/编辑弹窗（名称、短名、一句话说明、6 色语义色点、保底目标与封顶上限滑块/直输联动控件、折叠式高级离线匹配规则）、上下排序、删除确认，修改立即生效并同步至悬浮窗；不配置项目时亦可完全依赖 Jev Layer-1 活动大类运行。
+  - **「Jev 识别」**：独立承载所有 Jev System One 智能自动识别配置与判断历史：
+    1. **智能自动识别配置卡片**：开关、API Key 状态/录入/连通性测试、发送脱敏本机 OCR 摘要开关（弱标题门控）。未配置 API Key 且已开启时，标题栏该 Tab 显示琥珀色提醒圆点，菜单栏悬浮窗横幅亦直达此页。
+    2. **Jev 判断记录卡片**：今日调用统计摘要（总次数、自动切换次数、平均耗时、累计输入 Token）、按状态过滤（全部/已切换/待确认或忽略/异常）、清空按钮与完整记录列表（每条展示时间、决策结果、`[活动大类]`、`→ 焦点项目`、置信度/同任务概率/分心概率、耗时与输入 Token、脱敏后窗口上下文与 OCR 预览）。
   - **「活动采集」**：
     1. **活动记录器总览卡片**：总开关（`activityRecorderEnabled`）、4 格实时遥测胶囊（总会话数 / 已用快照存储与张数 / 当前会话状态 / 前台应用）及存储上限进度条。
     2. **macOS 权限卡片**：屏幕录制、辅助功能（AX 标题与全局键鼠监听）实时状态检测、刷新与一键授权/跳转。

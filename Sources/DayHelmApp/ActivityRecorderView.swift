@@ -43,16 +43,24 @@ struct ActivityRecorderTitlebarNavView: View {
                     Button {
                         navState.activeSection = section
                     } label: {
-                        Text(section.rawValue)
-                            .font(.system(size: 12.5, weight: isSelected ? .semibold : .regular))
-                            .foregroundStyle(isSelected ? .primary : .secondary)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(
-                                Color.primary.opacity(isSelected ? 0.08 : (isHovered ? 0.045 : 0.0)),
-                                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            )
-                            .contentShape(Rectangle())
+                        HStack(spacing: 4) {
+                            Text(section.rawValue)
+                                .font(.system(size: 12.5, weight: isSelected ? .semibold : .regular))
+                                .foregroundStyle(isSelected ? .primary : .secondary)
+
+                            if section == .jev && coordinator.jevNeedsAPIKey {
+                                Circle()
+                                    .fill(DayHelmColors.warningAmber)
+                                    .frame(width: 5.5, height: 5.5)
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(
+                            Color.primary.opacity(isSelected ? 0.08 : (isHovered ? 0.045 : 0.0)),
+                            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        )
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .onHover { hovering in
@@ -230,6 +238,10 @@ private struct RecorderDraftSettings: Equatable {
     var sensitiveBundleIdsText: String
     var maxStorageMBText: String
     var retentionDaysText: String
+    var menuBarDisplayMode: MenuBarDisplayMode
+    var jevAutoTrackingEnabled: Bool
+    var jevModelText: String
+    var jevSendOCRSnippet: Bool
 
     init(from settings: DayHelmSettings) {
         self.activityRecorderEnabled = settings.activityRecorderEnabled
@@ -247,6 +259,10 @@ private struct RecorderDraftSettings: Equatable {
         self.sensitiveBundleIdsText = settings.sensitiveBundleIds.joined(separator: "\n")
         self.maxStorageMBText = "\(max(0, settings.snapshotMaxStorageBytes / (1024 * 1024)))"
         self.retentionDaysText = "\(settings.snapshotRetentionDays)"
+        self.menuBarDisplayMode = settings.menuBarDisplayMode
+        self.jevAutoTrackingEnabled = settings.jevAutoTrackingEnabled
+        self.jevModelText = settings.jevModel
+        self.jevSendOCRSnippet = settings.jevSendOCRSnippet
     }
 
     func buildSettings(fallback: DayHelmSettings) -> DayHelmSettings {
@@ -272,6 +288,8 @@ private struct RecorderDraftSettings: Equatable {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
+        let trimmedModel = jevModelText.trimmingCharacters(in: .whitespacesAndNewlines)
+
         return DayHelmSettings(
             activityRecorderEnabled: activityRecorderEnabled,
             deepRecordingEnabled: deepRecordingEnabled,
@@ -287,7 +305,11 @@ private struct RecorderDraftSettings: Equatable {
             sensitiveBundleIds: bundles,
             snapshotRetentionDays: retention,
             snapshotMaxStorageBytes: max(0, maxMB) * 1024 * 1024,
-            ocrEveryN: ocrEvery
+            ocrEveryN: ocrEvery,
+            menuBarDisplayMode: menuBarDisplayMode,
+            jevAutoTrackingEnabled: jevAutoTrackingEnabled,
+            jevModel: trimmedModel.isEmpty ? DayHelmSettings.defaultJevModel : trimmedModel,
+            jevSendOCRSnippet: jevSendOCRSnippet
         )
     }
 }
@@ -314,6 +336,19 @@ private struct ActivityRecorderSettingsTab: View {
     @State private var justSavedFeedback: Bool = false
     @State private var taskEditorMode: TaskEditorSheetMode?
     @State private var pendingDeleteTask: TaskBudget?
+    @State private var jevAPIKeyInput: String = ""
+    @State private var isEditingJevKey: Bool = false
+    @State private var isTestingJevConnection: Bool = false
+    @State private var jevTestStatusMessage: String?
+    @State private var jevTestStatusIsError: Bool = false
+    @State private var jevLogFilter: JevLogFilter = .all
+
+    private enum JevLogFilter: String, CaseIterable {
+        case all = "全部"
+        case switched = "已切换"
+        case pendingOrIgnored = "观察/忽略"
+        case errors = "异常"
+    }
 
     init(
         coordinator: HybridActivityCoordinator,
@@ -339,6 +374,8 @@ private struct ActivityRecorderSettingsTab: View {
                     switch selectedSection {
                     case .tasks:
                         tasksManagementSection
+                    case .jev:
+                        jevManagementSection
                     case .capture:
                         overviewCard
                         permissionsCard
@@ -356,7 +393,7 @@ private struct ActivityRecorderSettingsTab: View {
                 .padding(.vertical, 16)
             }
 
-            if selectedSection != .tasks || hasUnsavedChanges {
+            if (selectedSection != .tasks && selectedSection != .jev) || hasUnsavedChanges {
                 Divider()
                 saveFooterBar
             }
@@ -365,11 +402,13 @@ private struct ActivityRecorderSettingsTab: View {
             TaskBudgetEditorSheet(
                 mode: mode,
                 suggestedColorHex: nextSuggestedColorHex(),
-                onSave: { displayName, colorHex, targetMinutes, capMinutes, keywords, appBundleIds, domains in
+                onSave: { displayName, shortName, description, colorHex, targetMinutes, capMinutes, keywords, appBundleIds, domains in
                     switch mode {
                     case .create:
                         coordinator.addTask(
                             displayName: displayName,
+                            shortName: shortName,
+                            description: description,
                             colorHex: colorHex,
                             targetMinutes: targetMinutes,
                             capMinutes: capMinutes,
@@ -382,6 +421,8 @@ private struct ActivityRecorderSettingsTab: View {
                             TaskBudget(
                                 taskId: existing.taskId,
                                 displayName: displayName,
+                                shortName: shortName,
+                                description: description,
                                 colorHex: colorHex,
                                 targetMinutes: targetMinutes,
                                 capMinutes: capMinutes,
@@ -429,7 +470,21 @@ private struct ActivityRecorderSettingsTab: View {
                 draft.deepRecordingEnabled = newSettings.deepRecordingEnabled
                 draft.visionOCREnabled = newSettings.visionOCREnabled
                 draft.inputMonitoringEnabled = newSettings.inputMonitoringEnabled
+                draft.menuBarDisplayMode = newSettings.menuBarDisplayMode
+                draft.jevAutoTrackingEnabled = newSettings.jevAutoTrackingEnabled
+                draft.jevSendOCRSnippet = newSettings.jevSendOCRSnippet
             }
+        }
+    }
+
+    private func menuBarModeDescription(_ mode: MenuBarDisplayMode) -> String {
+        switch mode {
+        case .standard:
+            return "标准（推荐）：命中焦点项目时显示项目名与配额（如 电商运营 52/90m），未命中时显示活动大类（如 开发构建 18m、休息分心 6m）"
+        case .compact:
+            return "极简：专注中仅显示进度数字（如 52/90m），活动大类显示短标签，悬停查看详情"
+        case .iconOnly:
+            return "仅图标：始终只保留日舵图标与语义状态点，最省顶部空间，悬停查看当前任务"
         }
     }
 
@@ -694,7 +749,7 @@ private struct ActivityRecorderSettingsTab: View {
                         numericField(
                             title: "空闲阈值（毫秒）",
                             text: $draft.recorderIdleThresholdMsText,
-                            hint: "无输入达到该时长后关闭会话（默认 300000）"
+                            hint: "无输入达到该时长后关闭会话并回扣空闲（默认 180000 = 3 分钟）"
                         )
                         numericField(
                             title: "输入停顿（毫秒）",
@@ -1113,6 +1168,33 @@ private struct ActivityRecorderSettingsTab: View {
                 }
             }
 
+            RecorderSectionCard {
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("菜单栏显示密度")
+                            .font(.system(size: 12.5, weight: .semibold))
+                        Text(menuBarModeDescription(draft.menuBarDisplayMode))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Picker("菜单栏显示密度", selection: Binding(
+                        get: { draft.menuBarDisplayMode },
+                        set: { newMode in
+                            draft.menuBarDisplayMode = newMode
+                            commitDraft()
+                        }
+                    )) {
+                        ForEach(MenuBarDisplayMode.allCases, id: \.self) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 210)
+                }
+            }
+
             if coordinator.taskProgressList.isEmpty {
                 RecorderSectionCard {
                     VStack(spacing: 10) {
@@ -1162,6 +1244,469 @@ private struct ActivityRecorderSettingsTab: View {
                             }
                         )
                     }
+                }
+            }
+        }
+    }
+
+    // MARK: 0.5 Jev Semantic Recognition Section
+
+    private var jevManagementSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            jevAutoTrackingCard
+            jevDecisionLogsCard
+        }
+    }
+
+    private var jevAutoTrackingCard: some View {
+        RecorderSectionCard {
+            VStack(alignment: .leading, spacing: 11) {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "sparkles")
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(DayHelmColors.primaryBlue)
+                            Text("智能自动识别（Jev System One）")
+                                .font(.system(size: 13.5, weight: .bold))
+
+                            if draft.jevAutoTrackingEnabled {
+                                if coordinator.jevAPIKeyConfigured {
+                                    Text("已启用")
+                                        .font(.system(size: 9.5, weight: .semibold))
+                                        .foregroundStyle(DayHelmColors.successEmerald)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(DayHelmColors.successEmerald.opacity(0.14), in: Capsule())
+                                } else {
+                                    Text("待配置 API Key")
+                                        .font(.system(size: 9.5, weight: .semibold))
+                                        .foregroundStyle(DayHelmColors.warningAmber)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(DayHelmColors.warningAmber.opacity(0.15), in: Capsule())
+                                }
+                            }
+                        }
+                        Text("即使不配置焦点事项，开启后也会自动识别 6 类活动大类（开发构建、内容创作、业务运营等）；配置事项后自动匹配并累计配额，实时展示在顶部菜单栏。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    Toggle("", isOn: Binding(
+                        get: { draft.jevAutoTrackingEnabled },
+                        set: { newVal in
+                            draft.jevAutoTrackingEnabled = newVal
+                            commitDraft()
+                            coordinator.refreshJevAPIKeyStatus()
+                            if newVal && !coordinator.jevAPIKeyConfigured {
+                                isEditingJevKey = true
+                            }
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .tint(DayHelmColors.primaryBlue)
+                }
+
+                if draft.jevAutoTrackingEnabled {
+                    Divider()
+
+                    if !coordinator.jevAPIKeyConfigured || isEditingJevKey {
+                        VStack(alignment: .leading, spacing: 8) {
+                            if !coordinator.jevAPIKeyConfigured {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(DayHelmColors.warningAmber)
+                                    Text("已开启 Jev 自动识别，但尚未检测到 API Key。请粘贴你的 JEV_API_KEY（独立保存在本机 ~/.config/alma/dayhelm/jev.key，权限 0600）。")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(DayHelmColors.warningAmber)
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 7)
+                                .background(DayHelmColors.warningAmber.opacity(0.10), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            }
+
+                            HStack(spacing: 8) {
+                                SecureField("粘贴 JEV_API_KEY（来自 typesafe.ai）", text: $jevAPIKeyInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .font(.system(size: 11.5, design: .monospaced))
+
+                                Button("保存 Key") {
+                                    let trimmed = jevAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    guard !trimmed.isEmpty else { return }
+                                    do {
+                                        try coordinator.saveJevAPIKey(trimmed)
+                                        jevAPIKeyInput = ""
+                                        isEditingJevKey = false
+                                        jevTestStatusMessage = "已安全保存至本机 jev.key（0600）"
+                                        jevTestStatusIsError = false
+                                    } catch {
+                                        jevTestStatusMessage = "保存失败：\(error.localizedDescription)"
+                                        jevTestStatusIsError = true
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .tint(DayHelmColors.primaryBlue)
+                                .disabled(jevAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                                Button(isTestingJevConnection ? "测试中…" : "测试连接") {
+                                    runJevConnectionTest(keyOverride: jevAPIKeyInput)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(isTestingJevConnection || (jevAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !coordinator.jevAPIKeyConfigured))
+
+                                if coordinator.jevAPIKeyConfigured && isEditingJevKey {
+                                    Button("取消") {
+                                        jevAPIKeyInput = ""
+                                        isEditingJevKey = false
+                                    }
+                                    .buttonStyle(.plain)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    } else {
+                        HStack(spacing: 8) {
+                            Image(systemName: "key.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(DayHelmColors.successEmerald)
+                            Text("API Key 已配置（来源：\(coordinator.jevAPIKeySource?.displayName ?? "本机")）")
+                                .font(.system(size: 11.5, weight: .medium))
+
+                            Spacer()
+
+                            Button(isTestingJevConnection ? "测试中…" : "测试连接") {
+                                runJevConnectionTest(keyOverride: nil)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(isTestingJevConnection)
+
+                            Button("更换 Key") {
+                                isEditingJevKey = true
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+
+                            if coordinator.jevAPIKeySource == .localKeyFile {
+                                Button("清除") {
+                                    try? coordinator.clearJevAPIKey()
+                                    jevTestStatusMessage = "已移除本地 jev.key"
+                                    jevTestStatusIsError = false
+                                }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 11))
+                                .foregroundStyle(DayHelmColors.destructiveRed)
+                            }
+                        }
+                    }
+
+                    if let statusMsg = jevTestStatusMessage {
+                        Text(statusMsg)
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(jevTestStatusIsError ? DayHelmColors.destructiveRed : DayHelmColors.successEmerald)
+                    } else if let lastErr = coordinator.jevLastError, !lastErr.isEmpty {
+                        Text("最近一次识别异常：\(lastErr)")
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundStyle(DayHelmColors.warningAmber)
+                    }
+
+                    toggleSettingRow(
+                        title: "允许发送脱敏后的本机 OCR 正文摘要（≤ 600 字，推荐）",
+                        subtitle: "自动剔除菜单栏与浏览器标签栏噪声，提取 Hermes 看板、Discord、飞书、终端等页面正文；发送前自动清洗凭据与敏感参数，命中隐私应用或锁屏时绝不外发，永不上传截图。",
+                        isOn: Binding(
+                            get: { draft.jevSendOCRSnippet },
+                            set: { newVal in
+                                draft.jevSendOCRSnippet = newVal
+                                commitDraft()
+                            }
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private var filteredJevDecisionLogs: [JevDecisionLogEntry] {
+        switch jevLogFilter {
+        case .all:
+            return coordinator.jevDecisionLogs
+        case .switched:
+            return coordinator.jevDecisionLogs.filter { $0.outcome == .committedSwitch || $0.outcome == .manualOverride }
+        case .pendingOrIgnored:
+            return coordinator.jevDecisionLogs.filter { $0.outcome == .pendingConfirmation || $0.outcome == .ignoredLowConfidence || $0.outcome == .manualPinned }
+        case .errors:
+            return coordinator.jevDecisionLogs.filter { $0.outcome == .error }
+        }
+    }
+
+    private var jevDecisionLogsCard: some View {
+        let allLogs = coordinator.jevDecisionLogs
+        let entries = filteredJevDecisionLogs
+        let switchedCount = allLogs.filter { $0.outcome == .committedSwitch }.count
+        let latencies = allLogs.compactMap(\.latencyMs)
+        let avgLatencyText = latencies.isEmpty ? "—" : "\(latencies.reduce(0, +) / latencies.count)ms"
+        let totalTokens = allLogs.compactMap(\.inputTokens).reduce(0, +)
+        let tokensText = totalTokens >= 1000
+            ? String(format: "%.1fk", Double(totalTokens) / 1000.0)
+            : "\(totalTokens)"
+
+        return RecorderSectionCard {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .center, spacing: 8) {
+                    Image(systemName: "list.bullet.rectangle.portrait")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(DayHelmColors.primaryBlue)
+                    Text("Jev 判断记录")
+                        .font(.system(size: 13, weight: .bold))
+
+                    Text("今日 \(allLogs.count) 条")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6.5)
+                        .padding(.vertical, 2)
+                        .background(Color.primary.opacity(0.055), in: Capsule())
+
+                    Spacer()
+
+                    Picker("日志过滤", selection: $jevLogFilter) {
+                        ForEach(JevLogFilter.allCases, id: \.self) { filter in
+                            Text(filter.rawValue).tag(filter)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 245)
+
+                    if !allLogs.isEmpty {
+                        Button("清空") {
+                            coordinator.clearJevDecisionLogs()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
+
+                if !allLogs.isEmpty {
+                    HStack(spacing: 10) {
+                        metricPill(
+                            icon: "sparkles",
+                            title: "今日判定",
+                            value: "\(allLogs.count)"
+                        )
+                        metricPill(
+                            icon: "arrow.triangle.swap",
+                            title: "自动切换",
+                            value: "\(switchedCount)",
+                            valueColor: switchedCount > 0 ? DayHelmColors.successEmerald : .primary
+                        )
+                        metricPill(
+                            icon: "timer",
+                            title: "平均耗时",
+                            value: avgLatencyText
+                        )
+                        metricPill(
+                            icon: "text.word.spacing",
+                            title: "输入 Token",
+                            value: tokensText
+                        )
+                    }
+                }
+
+                if entries.isEmpty {
+                    Text(allLogs.isEmpty
+                         ? "暂无判断记录。切换窗口并停留 ≥ 3 秒后，Jev 的每次判定结果、活动大类、置信度与决策原因会实时显示在这里。"
+                         : "当前筛选条件下暂无记录。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.vertical, 24)
+                } else {
+                    LazyVStack(spacing: 6) {
+                        ForEach(entries) { entry in
+                            jevDecisionLogRow(entry)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func jevDecisionLogRow(_ entry: JevDecisionLogEntry) -> some View {
+        let outcomeColor: Color = switch entry.outcome {
+        case .committedSwitch: DayHelmColors.successEmerald
+        case .maintained: .secondary
+        case .pendingConfirmation: DayHelmColors.primaryBlue
+        case .ignoredLowConfidence: DayHelmColors.warningAmber
+        case .manualPinned, .manualOverride: DayHelmColors.violetAccent
+        case .error: DayHelmColors.destructiveRed
+        }
+
+        let sourceTag: String = switch entry.source {
+        case .jev: "Jev"
+        case .cache: "防抖提交"
+        case .localOverride: "手工"
+        case .localRule: "本机规则"
+        }
+
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .center, spacing: 6) {
+                Text(Self.jevTimeFormatter.string(from: entry.timestamp))
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+
+                Text(entry.outcome.displayName)
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .foregroundStyle(outcomeColor)
+                    .padding(.horizontal, 5.5)
+                    .padding(.vertical, 1.5)
+                    .background(outcomeColor.opacity(0.14), in: Capsule())
+
+                if let mode = entry.activityMode, entry.outcome != .error {
+                    Text(mode.displayName)
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(Color(hex: mode.colorHex))
+                        .padding(.horizontal, 5.5)
+                        .padding(.vertical, 1.5)
+                        .background(Color(hex: mode.colorHex).opacity(0.14), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                }
+
+                if let focusName = entry.focusProjectDisplayName, !focusName.isEmpty {
+                    Text("→ \(focusName)")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+                } else if entry.activityMode == nil || entry.outcome == .error {
+                    Text(entry.predictedDisplayName)
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(.primary)
+                }
+
+                if entry.outcome != .error {
+                    Text("置信 \(Int((entry.confidence * 100).rounded()))%")
+                        .font(.system(size: 10, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+
+                    if let same = entry.sameTaskAsPrevious {
+                        Text("· 同任务 \(Int((same * 100).rounded()))%")
+                            .font(.system(size: 10, design: .monospaced))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if entry.isDistraction >= 0.45 {
+                        Text("· 分心 \(Int((entry.isDistraction * 100).rounded()))%")
+                            .font(.system(size: 10, design: .monospaced))
+                            .monospacedDigit()
+                            .foregroundStyle(DayHelmColors.destructiveRed)
+                    }
+                }
+
+                Spacer(minLength: 4)
+
+                Text(sourceTag)
+                    .font(.system(size: 9.5, weight: .medium))
+                    .foregroundStyle(.tertiary)
+
+                if let ms = entry.latencyMs {
+                    Text("\(ms)ms")
+                        .font(.system(size: 10, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(.tertiary)
+                }
+
+                if let tok = entry.inputTokens, tok > 0 {
+                    Text("\(tok) tok")
+                        .font(.system(size: 10, design: .monospaced))
+                        .monospacedDigit()
+                        .foregroundStyle(.tertiary)
+                }
+            }
+
+            HStack(spacing: 6) {
+                Text(entry.appName)
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                if entry.redacted {
+                    Text("隐私已脱敏（仅传应用名）")
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.tertiary)
+                } else if let title = entry.windowTitle, !title.isEmpty {
+                    Text("· \(title)")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                } else if let domain = entry.domain, !domain.isEmpty {
+                    Text("· \(domain)")
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                if entry.usedOCRSnippet {
+                    Text("OCR")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(DayHelmColors.primaryBlue)
+                        .padding(.horizontal, 4.5)
+                        .padding(.vertical, 1)
+                        .background(DayHelmColors.primaryBlue.opacity(0.12), in: RoundedRectangle(cornerRadius: 3))
+                        .help(entry.ocrSnippetPreview ?? "本次判断附带了本机脱敏 OCR 摘要")
+                }
+            }
+
+            if let err = entry.errorMessage, !err.isEmpty {
+                Text(err)
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(DayHelmColors.destructiveRed)
+                    .lineLimit(2)
+            } else if let preview = entry.ocrSnippetPreview, !preview.isEmpty {
+                Text("OCR: \(preview)")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7.5)
+        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.5)
+        )
+    }
+
+    private static let jevTimeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
+    private func runJevConnectionTest(keyOverride: String?) {
+        isTestingJevConnection = true
+        jevTestStatusMessage = nil
+        Task {
+            let result = await coordinator.testJevConnection(apiKeyOverride: keyOverride)
+            await MainActor.run {
+                isTestingJevConnection = false
+                switch result {
+                case .success(let ping):
+                    jevTestStatusMessage = "✓ 连接成功 · \(ping.model) · \(ping.latencyMs)ms"
+                    jevTestStatusIsError = false
+                case .failure(let error):
+                    jevTestStatusMessage = "✗ 连接失败：\(error.localizedDescription)"
+                    jevTestStatusIsError = true
                 }
             }
         }
@@ -1345,6 +1890,14 @@ private struct TaskSettingsRowCard: View {
                 }
                 .frame(height: 5)
 
+                if let desc = progress.budget.description, !desc.isEmpty {
+                    Text(desc)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .padding(.top, 1)
+                }
+
                 if !progress.budget.keywords.isEmpty || !progress.budget.appBundleIds.isEmpty || !progress.budget.domains.isEmpty {
                     VStack(alignment: .leading, spacing: 4) {
                         if !progress.budget.keywords.isEmpty {
@@ -1381,15 +1934,18 @@ private struct TaskSettingsRowCard: View {
 private struct TaskBudgetEditorSheet: View {
     let mode: TaskEditorSheetMode
     let suggestedColorHex: String
-    let onSave: (String, String, Int?, Int?, [String], [String], [String]) -> Void
+    let onSave: (String, String?, String?, String, Int?, Int?, [String], [String], [String]) -> Void
     let onDelete: (TaskBudget) -> Void
     let onCancel: () -> Void
 
     @State private var displayName: String = ""
+    @State private var shortName: String = ""
+    @State private var descriptionText: String = ""
     @State private var selectedColorHex: String = "#3B82F6"
     @State private var keywordsText: String = ""
     @State private var appBundleIdsText: String = ""
     @State private var domainsText: String = ""
+    @State private var showAdvancedRules: Bool = false
     @State private var hasTarget: Bool = true
     @State private var targetMinutes: Int = 60
     @State private var hasCap: Bool = false
@@ -1428,6 +1984,20 @@ private struct TaskBudgetEditorSheet: View {
                 TextField("例如：电商做深 / 深度写作", text: $displayName)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 12.5))
+
+                TextField("菜单栏短名（可选，如：电商，留空自动截断）", text: $shortName)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("一句话说明（推荐，供 Jev 自动识别归属）")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    TextField("例如：选品、商品开发、主图与详情页设计、营销转化优化", text: $descriptionText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12))
+                }
+                .padding(.top, 2)
 
                 HStack(spacing: 10) {
                     Text("标识颜色")
@@ -1475,38 +2045,39 @@ private struct TaskBudgetEditorSheet: View {
                 )
             }
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("自动匹配与跨应用同任务识别规则（可选，逗号分隔）")
-                    .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(.secondary)
+            DisclosureGroup("高级：离线关键词 / 应用 / 域名规则（可选）", isExpanded: $showAdvancedRules) {
+                VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("匹配关键词（窗口标题 / URL / 实体）")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                        TextField("如：抖店, 1688, 主图", text: $keywordsText)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11.5))
+                    }
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("匹配关键词（窗口标题 / URL / 实体）")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
-                    TextField("如：抖店, 1688, 主图", text: $keywordsText)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11.5))
-                }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("关联应用 Bundle ID")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                        TextField("如：com.apple.dt.Xcode, com.todesktop.230313mzl4w4u92", text: $appBundleIdsText)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11.5, design: .monospaced))
+                    }
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("关联应用 Bundle ID")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
-                    TextField("如：com.apple.dt.Xcode, com.todesktop.230313mzl4w4u92", text: $appBundleIdsText)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11.5, design: .monospaced))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("关联域名 / Host")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                        TextField("如：github.com, jinritemai.com", text: $domainsText)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11.5, design: .monospaced))
+                    }
                 }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("关联域名 / Host")
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
-                    TextField("如：github.com, jinritemai.com", text: $domainsText)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(size: 11.5, design: .monospaced))
-                }
+                .padding(.top, 6)
             }
+            .font(.system(size: 11.5, weight: .medium))
+            .foregroundStyle(.secondary)
 
             Divider()
 
@@ -1531,8 +2102,12 @@ private struct TaskBudgetEditorSheet: View {
                 .controlSize(.small)
 
                 Button("保存") {
+                    let trimmedShort = shortName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let trimmedDesc = descriptionText.trimmingCharacters(in: .whitespacesAndNewlines)
                     onSave(
                         trimmedName,
+                        trimmedShort.isEmpty ? nil : trimmedShort,
+                        trimmedDesc.isEmpty ? nil : trimmedDesc,
                         selectedColorHex,
                         hasTarget ? targetMinutes : nil,
                         hasCap ? capMinutes : nil,
@@ -1553,20 +2128,26 @@ private struct TaskBudgetEditorSheet: View {
             switch mode {
             case .create:
                 displayName = ""
+                shortName = ""
+                descriptionText = ""
                 selectedColorHex = suggestedColorHex
                 keywordsText = ""
                 appBundleIdsText = ""
                 domainsText = ""
+                showAdvancedRules = false
                 hasTarget = true
                 targetMinutes = 60
                 hasCap = false
                 capMinutes = 90
             case .edit(let budget):
                 displayName = budget.displayName
+                shortName = budget.shortName ?? ""
+                descriptionText = budget.description ?? ""
                 selectedColorHex = budget.colorHex
                 keywordsText = budget.keywords.joined(separator: ", ")
                 appBundleIdsText = budget.appBundleIds.joined(separator: ", ")
                 domainsText = budget.domains.joined(separator: ", ")
+                showAdvancedRules = false
                 hasTarget = budget.targetMinutes != nil
                 targetMinutes = budget.targetMinutes ?? 60
                 hasCap = budget.capMinutes != nil

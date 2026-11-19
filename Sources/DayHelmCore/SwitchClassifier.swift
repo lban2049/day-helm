@@ -293,6 +293,23 @@ public enum SwitchClassifier {
         cachedFeatures(for: span).contextKey
     }
 
+    /// Coarse context key used for thrashing `distinctContexts` counting:
+    /// - When Jev semanticGroup is present, groups by semantic group (same project/mode = 1 context).
+    /// - For workflow-cluster apps (IDE, Terminal, Editor, Notes, Design), groups by appKey so intra-app file/pane switches don't inflate distinctContexts.
+    /// - For browsers and other apps, keeps the canonical contextKey (registrableDomain or normalized title).
+    public static func thrashingContextKey(for prepared: PreparedActivitySpan) -> String {
+        if let sem = prepared.span.semanticGroup, !sem.isEmpty {
+            return "sem|\(sem)"
+        }
+        if prepared.isBrowser {
+            return prepared.contextKey
+        }
+        if case .workflowCluster = prepared.role {
+            return "app|\(prepared.appKey)"
+        }
+        return prepared.contextKey
+    }
+
     private static func computeCanonicalContextKey(for span: EnrichedSpan) -> String {
         let appKey = normalizedAppKey(appName: span.appName, bundleId: span.bundleId)
         if span.redacted {
@@ -805,7 +822,8 @@ public enum SwitchClassifier {
                             windowTitle: prev.span.windowTitle,
                             url: prev.span.url,
                             declaredTaskId: prev.span.declaredTaskId,
-                            redacted: prev.span.redacted
+                            redacted: prev.span.redacted,
+                            semanticGroup: prev.span.semanticGroup
                         )
                         nonTransient[lastIdx] = PreparedActivitySpan(
                             span: bridgedSpan,
@@ -871,7 +889,8 @@ public enum SwitchClassifier {
                 windowTitle: last.span.windowTitle,
                 url: resolvedURL,
                 declaredTaskId: last.span.declaredTaskId,
-                redacted: last.span.redacted && item.span.redacted
+                redacted: last.span.redacted && item.span.redacted,
+                semanticGroup: last.span.semanticGroup ?? item.span.semanticGroup
             )
             coalesced[coalesced.count - 1] = PreparedActivitySpan(
                 span: mergedSpan,
@@ -919,6 +938,15 @@ public enum SwitchClassifier {
         // Identical canonical context is never a switch.
         if lhs.contextKey == rhs.contextKey {
             return false
+        }
+
+        // Level 0 (Semantic): When Jev semantic group is attached to both spans, trust semantic grouping.
+        if let g1 = lhs.span.semanticGroup, !g1.isEmpty,
+           let g2 = rhs.span.semanticGroup, !g2.isEmpty {
+            if g1 == "break" || g2 == "break" {
+                return true
+            }
+            return g1 != g2
         }
 
         // Any transition involving an interrupt app/site (IM, social, video) counts as a switch.
@@ -973,7 +1001,15 @@ public enum SwitchClassifier {
     }
 
     public static func isInterruptTransition(from lhs: PreparedActivitySpan, to rhs: PreparedActivitySpan) -> Bool {
-        lhs.role == .interrupt || rhs.role == .interrupt
+        if lhs.span.semanticGroup == "break" || rhs.span.semanticGroup == "break" {
+            return true
+        }
+        if let g1 = lhs.span.semanticGroup, !g1.isEmpty,
+           let g2 = rhs.span.semanticGroup, !g2.isEmpty,
+           g1 == g2 {
+            return false
+        }
+        return lhs.role == .interrupt || rhs.role == .interrupt
     }
 
     // MARK: - Private Helpers & Static Dictionaries
@@ -1074,6 +1110,9 @@ public enum SwitchClassifier {
         "com.lastpass",
         "com.apple.screenshot.launcher",
         "com.cleanshot",
+        "com.xnipapp",
+        "eu.exelban.stats",
+        "com.dayhelm",
         "org.p0deje.maccy",
         "com.pilotmoon.popclip",
         "com.apple.digitalcolormeter"
@@ -1081,7 +1120,7 @@ public enum SwitchClassifier {
 
     private static let auxiliaryAppNames: [String] = [
         "finder", "访达", "preview", "预览", "raycast", "alfred", "spotlight",
-        "1password", "keychain access", "cleanshot", "maccy"
+        "1password", "keychain access", "cleanshot", "xnip", "maccy", "dayhelm", "stats"
     ]
 
     private static let interruptBundlePrefixes: [String] = [
@@ -1155,7 +1194,8 @@ public enum SwitchClassifier {
         "github.com", "gitlab.com", "bitbucket.org", "stackoverflow.com",
         "developer.apple.com", "developer.mozilla.org", "swift.org",
         "npmjs.com", "pypi.org", "crates.io", "vercel.com", "cloudflare.com",
-        "aws.amazon.com", "linear.app", "sentry.io", "grafana.com"
+        "aws.amazon.com", "linear.app", "sentry.io", "grafana.com",
+        "claude.ai", "chatgpt.com", "openai.com", "typesafe.ai", "gemini.google.com"
     ]
 
     private static let engineeringTitleHints: [String] = [
@@ -1207,7 +1247,7 @@ public enum SwitchClassifier {
 
     private static let researchDomains: Set<String> = [
         "notion.so", "docs.google.com", "arxiv.org", "scholar.google.com",
-        "wikipedia.org", "ssrn.com"
+        "wikipedia.org", "ssrn.com", "google.com", "perplexity.ai", "doubao.com"
     ]
 
     private static let genericProjectNoise: Set<String> = [

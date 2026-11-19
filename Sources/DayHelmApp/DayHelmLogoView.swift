@@ -1,27 +1,44 @@
 import AppKit
+import DayHelmCapture
 import SwiftUI
 
 enum DayHelmMenuBarIcon {
-    static let templateImage: NSImage = {
-        let size = NSSize(width: 16, height: 16)
-        let image = NSImage(size: size, flipped: false) { rect in
+    private static var cache: [String: NSImage] = [:]
+
+    static func image(for state: MenuBarVisualState, isDark: Bool) -> NSImage {
+        let key = "\(state)-\(isDark ? "dark" : "light")"
+        if let cached = cache[key] {
+            return cached
+        }
+        let img = renderImage(for: state, isDark: isDark)
+        cache[key] = img
+        return img
+    }
+
+    private static func renderImage(for state: MenuBarVisualState, isDark: Bool) -> NSImage {
+        let size = NSSize(width: 18, height: 16)
+        let image = NSImage(size: size, flipped: false) { _ in
             guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
             ctx.setAllowsAntialiasing(true)
             ctx.setShouldAntialias(true)
 
-            let center = CGPoint(x: rect.midX, y: rect.midY)
+            let center = CGPoint(x: 8.0, y: 8.0)
+            let baseAlpha: CGFloat = (state == .standby) ? 0.45 : 1.0
+            let fgColor: NSColor = isDark
+                ? NSColor.white.withAlphaComponent(baseAlpha)
+                : NSColor.black.withAlphaComponent(baseAlpha)
 
             // Outer helm ring
-            ctx.setStrokeColor(NSColor.labelColor.cgColor)
+            ctx.setStrokeColor(fgColor.cgColor)
             ctx.setLineWidth(1.5)
-            ctx.addEllipse(in: CGRect(x: center.x - 5.2, y: center.y - 5.2, width: 10.4, height: 10.4))
+            ctx.addEllipse(in: CGRect(x: center.x - 5.0, y: center.y - 5.0, width: 10.0, height: 10.0))
             ctx.strokePath()
 
             // Four cardinal helm grips
             for angleDeg in [0.0, 90.0, 180.0, 270.0] {
                 let rad = CGFloat(angleDeg * .pi / 180.0)
-                let p1 = CGPoint(x: center.x + cos(rad) * 5.2, y: center.y + sin(rad) * 5.2)
-                let p2 = CGPoint(x: center.x + cos(rad) * 7.0, y: center.y + sin(rad) * 7.0)
+                let p1 = CGPoint(x: center.x + cos(rad) * 5.0, y: center.y + sin(rad) * 5.0)
+                let p2 = CGPoint(x: center.x + cos(rad) * 6.8, y: center.y + sin(rad) * 6.8)
                 ctx.setLineWidth(1.4)
                 ctx.setLineCap(.round)
                 ctx.move(to: p1)
@@ -35,21 +52,62 @@ enum DayHelmMenuBarIcon {
             ctx.rotate(by: -22.0 * .pi / 180.0)
 
             let needle = CGMutablePath()
-            needle.move(to: CGPoint(x: 0, y: 4.3))
+            needle.move(to: CGPoint(x: 0, y: 4.1))
             needle.addLine(to: CGPoint(x: 1.5, y: 0))
-            needle.addLine(to: CGPoint(x: 0, y: -4.0))
+            needle.addLine(to: CGPoint(x: 0, y: -3.8))
             needle.addLine(to: CGPoint(x: -1.5, y: 0))
             needle.closeSubpath()
             ctx.addPath(needle)
-            ctx.setFillColor(NSColor.labelColor.cgColor)
+            ctx.setFillColor(fgColor.cgColor)
             ctx.fillPath()
             ctx.restoreGState()
 
+            // Semantic status dot at bottom-right (in flipped=false coords, y=0 is bottom)
+            let dotColor: NSColor? = switch state {
+            case .standby:
+                nil
+            case .focusing:
+                NSColor(srgbRed: 0.231, green: 0.510, blue: 0.965, alpha: 1.0) // #3B82F6
+            case .targetMet:
+                NSColor(srgbRed: 0.063, green: 0.725, blue: 0.506, alpha: 1.0) // #10B981
+            case .capReached:
+                NSColor(srgbRed: 0.961, green: 0.620, blue: 0.043, alpha: 1.0) // #F59E0B
+            case .otherWork:
+                NSColor(srgbRed: 0.580, green: 0.639, blue: 0.722, alpha: 1.0) // #94A3B8
+            case .distraction:
+                NSColor(srgbRed: 0.937, green: 0.267, blue: 0.267, alpha: 1.0) // #EF4444
+            }
+
+            if let dotColor {
+                let dotCenter = CGPoint(x: 14.5, y: 3.5)
+                let cutoutR: CGFloat = 3.8
+                ctx.saveGState()
+                ctx.setBlendMode(.clear)
+                ctx.addEllipse(in: CGRect(
+                    x: dotCenter.x - cutoutR,
+                    y: dotCenter.y - cutoutR,
+                    width: cutoutR * 2,
+                    height: cutoutR * 2
+                ))
+                ctx.fillPath()
+                ctx.restoreGState()
+
+                let dotR: CGFloat = 2.7
+                ctx.setFillColor(dotColor.cgColor)
+                ctx.addEllipse(in: CGRect(
+                    x: dotCenter.x - dotR,
+                    y: dotCenter.y - dotR,
+                    width: dotR * 2,
+                    height: dotR * 2
+                ))
+                ctx.fillPath()
+            }
+
             return true
         }
-        image.isTemplate = true
+        image.isTemplate = false
         return image
-    }()
+    }
 }
 
 struct DayHelmHeaderLogoView: View {

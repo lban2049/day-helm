@@ -3,6 +3,7 @@ import Foundation
 public struct DayHelmEngineConfig: Sendable, Equatable, Codable {
     public var idleThresholdSeconds: TimeInterval
     public var pulsetimeSeconds: TimeInterval
+    public var maxTickGapSeconds: TimeInterval?
     public var driftWindowSeconds: TimeInterval
     public var unassignedPromptSeconds: TimeInterval
     public var thrashingWindowSeconds: TimeInterval
@@ -17,8 +18,9 @@ public struct DayHelmEngineConfig: Sendable, Equatable, Codable {
     public static let `default` = DayHelmEngineConfig()
 
     public init(
-        idleThresholdSeconds: TimeInterval = 300,
+        idleThresholdSeconds: TimeInterval = 180,
         pulsetimeSeconds: TimeInterval = 60,
+        maxTickGapSeconds: TimeInterval? = nil,
         driftWindowSeconds: TimeInterval = 240,
         unassignedPromptSeconds: TimeInterval = 600,
         thrashingWindowSeconds: TimeInterval = 600,
@@ -32,6 +34,7 @@ public struct DayHelmEngineConfig: Sendable, Equatable, Codable {
     ) {
         self.idleThresholdSeconds = idleThresholdSeconds
         self.pulsetimeSeconds = pulsetimeSeconds
+        self.maxTickGapSeconds = maxTickGapSeconds
         self.driftWindowSeconds = driftWindowSeconds
         self.unassignedPromptSeconds = unassignedPromptSeconds
         self.thrashingWindowSeconds = thrashingWindowSeconds
@@ -69,6 +72,19 @@ public final class DayHelmEngine: @unchecked Sendable {
     private var lastProgressTimestamp: Date?
     private var sessionCounter: Int = 0
     private var alertCounter: Int = 0
+
+    // Auto-tracking non-budget & Layer-1 ActivityMode state
+    private var _autoTrackingActive: Bool = false
+    private var _autoPausedByAbsence: Bool = false
+    private var _activeNonBudgetActivity: AutoNonBudgetActivity?
+    private var _activeActivityMode: ActivityMode?
+    private var _nonBudgetLastTimestamp: Date?
+    private var _nonBudgetSegmentStartedAt: Date?
+    private var _nonBudgetSegmentMinutes: Double = 0.0
+    private var _otherWorkMinutes: Double = 0.0
+    private var _nonWorkMinutes: Double = 0.0
+    private var _activityModeMinutes: [String: Double] = [:]
+    private var _currentSemanticGroup: String?
 
     // Alert tracking / hysteresis state
     private var capAlertEmittedForTask: Set<String> = []
@@ -129,6 +145,149 @@ public final class DayHelmEngine: @unchecked Sendable {
         return _pendingAlerts
     }
 
+    public var budgetsVersion: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _budgetsVersion
+    }
+
+    public var autoTrackingActive: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _autoTrackingActive
+    }
+
+    public var activeNonBudgetActivity: AutoNonBudgetActivity? {
+        lock.lock(); defer { lock.unlock() }
+        return _activeNonBudgetActivity
+    }
+
+    public var activeActivityMode: ActivityMode? {
+        lock.lock(); defer { lock.unlock() }
+        return _activeActivityMode
+    }
+
+    public var otherWorkMinutes: Double {
+        lock.lock(); defer { lock.unlock() }
+        return _otherWorkMinutes
+    }
+
+    public var nonWorkMinutes: Double {
+        lock.lock(); defer { lock.unlock() }
+        return _nonWorkMinutes
+    }
+
+    public var activityModeMinutes: [String: Double] {
+        lock.lock(); defer { lock.unlock() }
+        return _activityModeMinutes
+    }
+
+    public func minutes(for mode: ActivityMode) -> Double {
+        lock.lock(); defer { lock.unlock() }
+        return _activityModeMinutes[mode.rawValue, default: 0.0]
+    }
+
+    public func setAutoTrackingActive(_ enabled: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        _autoTrackingActive = enabled
+        if !enabled {
+            _activeNonBudgetActivity = nil
+            _activeActivityMode = nil
+            _nonBudgetLastTimestamp = nil
+            _currentSemanticGroup = nil
+        }
+    }
+
+    /// Stamps recent spans matching `contextKey` with a semanticGroup (used by SwitchClassifier).
+    public func stampSemanticGroup(_ semanticGroup: String, forContextKey contextKey: String, withinSeconds: TimeInterval = 60.0, at now: Date? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        let ts = now ?? clock.now()
+        _currentSemanticGroup = semanticGroup
+        var changed = false
+        for i in stride(from: _enrichedSpans.count - 1, through: 0, by: -1) {
+            if ts.timeIntervalSince(_enrichedSpans[i].endedAt) > withinSeconds {
+                break
+            }
+            if SwitchClassifier.canonicalContextKey(for: _enrichedSpans[i]) == contextKey {
+                if _enrichedSpans[i].semanticGroup != semanticGroup {
+                    _enrichedSpans[i].semanticGroup = semanticGroup
+                    changed = true
+                }
+            }
+        }
+        if changed {
+            _incrementalSpectrumCache = nil
+            _cachedSpectrum = nil
+            _stateVersion &+= 1
+        }
+    }
+
+    public func applyAutoCategory(_ categoryId: String, activityMode: ActivityMode? = nil, at date: Date? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        let ts = date ?? clock.now()
+        _autoPausedByAbsence = false
+        if categoryId == AutoActivityIds.otherWork {
+            closeActiveSessionLocked(at: ts, closingNote: nil)
+            _focusState = .unassigned
+            _activeNonBudgetActivity = .otherWork
+            _activeActivityMode = activityMode ?? .commsAdmin
+            _nonBudgetLastTimestamp = ts
+            _nonBudgetSegmentStartedAt = ts
+            _nonBudgetSegmentMinutes = 0.0
+            _currentSemanticGroup = "mode:\((_activeActivityMode ?? .commsAdmin).rawValue)"
+            driftCandidate = nil
+            unassignedActiveStart = nil
+            unassignedPromptEmitted = false
+            _stateVersion &+= 1
+            return
+        }
+        if categoryId == AutoActivityIds.nonWork {
+            closeActiveSessionLocked(at: ts, closingNote: nil)
+            _focusState = .unassigned
+            _activeNonBudgetActivity = .nonWork
+            _activeActivityMode = .breakTime
+            _nonBudgetLastTimestamp = ts
+            _nonBudgetSegmentStartedAt = ts
+            _nonBudgetSegmentMinutes = 0.0
+            _currentSemanticGroup = "break"
+            driftCandidate = nil
+            unassignedActiveStart = nil
+            unassignedPromptEmitted = false
+            _stateVersion &+= 1
+            return
+        }
+        if let mode = AutoActivityIds.activityMode(from: categoryId) {
+            closeActiveSessionLocked(at: ts, closingNote: nil)
+            _focusState = .unassigned
+            _activeActivityMode = mode
+            _activeNonBudgetActivity = mode.isDistraction ? .nonWork : .otherWork
+            _nonBudgetLastTimestamp = ts
+            _nonBudgetSegmentStartedAt = ts
+            _nonBudgetSegmentMinutes = 0.0
+            _currentSemanticGroup = mode.isDistraction ? "break" : "mode:\(mode.rawValue)"
+            driftCandidate = nil
+            unassignedActiveStart = nil
+            unassignedPromptEmitted = false
+            _stateVersion &+= 1
+            return
+        }
+        guard _budgets.contains(where: { $0.taskId == categoryId }) else {
+            return
+        }
+        _activeNonBudgetActivity = nil
+        _activeActivityMode = activityMode
+        _nonBudgetLastTimestamp = nil
+        _nonBudgetSegmentStartedAt = nil
+        _nonBudgetSegmentMinutes = 0.0
+        _currentSemanticGroup = (activityMode == .breakTime) ? "break" : "proj:\(categoryId)"
+        if case .focusing(let currentTaskId, _) = _focusState, currentTaskId == categoryId {
+            return
+        }
+        closeActiveSessionLocked(at: ts, closingNote: nil)
+        openNewSessionLocked(taskId: categoryId, note: nil, at: ts)
+    }
+
     public init(
         budgets: [TaskBudget] = TimeAuditConfigLoader.defaultBudgets,
         clock: any DayHelmClock = SystemClock(),
@@ -155,6 +314,15 @@ public final class DayHelmEngine: @unchecked Sendable {
         self._focusSessions = snapshot.focusSessions
         self._enrichedSpans = snapshot.enrichedSpans
         self.sessionCounter = snapshot.focusSessions.count
+        self._otherWorkMinutes = max(0, snapshot.otherWorkMinutes ?? 0)
+        self._nonWorkMinutes = max(0, snapshot.nonWorkMinutes ?? 0)
+        self._activityModeMinutes = snapshot.activityModeMinutes ?? [:]
+        // Startup grace period (120s) after restoring from today.json so restarting the app
+        // does not immediately fire a stale high-frequency switch alert from historical spans.
+        let startupGraceSeconds: TimeInterval = 120.0
+        if config.thrashingCooldownSeconds > startupGraceSeconds {
+            self.lastThrashingAlertAt = clock.now().addingTimeInterval(-(config.thrashingCooldownSeconds - startupGraceSeconds))
+        }
 
         if let restoredState = snapshot.focusState {
             self._focusState = restoredState
@@ -196,6 +364,8 @@ public final class DayHelmEngine: @unchecked Sendable {
     public func addTask(
         taskId: String? = nil,
         displayName: String,
+        shortName: String? = nil,
+        description: String? = nil,
         colorHex: String,
         targetMinutes: Int?,
         capMinutes: Int?,
@@ -220,6 +390,8 @@ public final class DayHelmEngine: @unchecked Sendable {
         let created = TaskBudget(
             taskId: finalId,
             displayName: finalName,
+            shortName: shortName,
+            description: description,
             colorHex: finalColor,
             targetMinutes: targetMinutes,
             capMinutes: capMinutes,
@@ -252,6 +424,8 @@ public final class DayHelmEngine: @unchecked Sendable {
         let normalized = TaskBudget(
             taskId: updatedBudget.taskId,
             displayName: finalName,
+            shortName: updatedBudget.shortName,
+            description: updatedBudget.description,
             colorHex: finalColor,
             targetMinutes: updatedBudget.targetMinutes,
             capMinutes: updatedBudget.capMinutes,
@@ -352,6 +526,11 @@ public final class DayHelmEngine: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let ts = date ?? clock.now()
+        _autoPausedByAbsence = false
+        _activeNonBudgetActivity = nil
+        _nonBudgetLastTimestamp = nil
+        _nonBudgetSegmentStartedAt = nil
+        _nonBudgetSegmentMinutes = 0.0
         closeActiveSessionLocked(at: ts, closingNote: nil)
         openNewSessionLocked(taskId: taskId, note: note, at: ts)
     }
@@ -360,6 +539,11 @@ public final class DayHelmEngine: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let ts = date ?? clock.now()
+        _autoPausedByAbsence = false
+        _activeNonBudgetActivity = nil
+        _nonBudgetLastTimestamp = nil
+        _nonBudgetSegmentStartedAt = nil
+        _nonBudgetSegmentMinutes = 0.0
         if case .focusing(let currentTaskId, _) = _focusState, currentTaskId == taskId {
             if let idx = activeSessionIndex, let note {
                 _focusSessions[idx].note = note
@@ -375,6 +559,12 @@ public final class DayHelmEngine: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let ts = date ?? clock.now()
+        // Explicit manual pause: never auto-resume when user returns/continues typing.
+        _autoPausedByAbsence = false
+        _activeNonBudgetActivity = nil
+        _nonBudgetLastTimestamp = nil
+        _nonBudgetSegmentStartedAt = nil
+        _nonBudgetSegmentMinutes = 0.0
         guard case .focusing(let taskId, _) = _focusState else {
             return
         }
@@ -388,12 +578,41 @@ public final class DayHelmEngine: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let ts = date ?? clock.now()
+        _autoPausedByAbsence = false
+        _activeNonBudgetActivity = nil
+        _nonBudgetLastTimestamp = nil
+        _nonBudgetSegmentStartedAt = nil
+        _nonBudgetSegmentMinutes = 0.0
         closeActiveSessionLocked(at: ts, closingNote: note)
         _focusState = .unassigned
         _stateVersion &+= 1
         driftCandidate = nil
         unassignedActiveStart = nil
         unassignedPromptEmitted = false
+    }
+
+    /// Seals active timing baselines immediately before macOS enters system sleep so wake-up
+    /// never attributes sleep duration to any focus task or activity mode.
+    public func handleSystemSleep(at date: Date? = nil) {
+        lock.lock()
+        defer { lock.unlock() }
+        let ts = date ?? clock.now()
+        if case .focusing(let taskId, _) = _focusState {
+            let sessionStart = activeSessionIndex.flatMap { idx in
+                idx < _focusSessions.count ? _focusSessions[idx].startedAt : nil
+            } ?? ts
+            let endTimestamp = lastProgressTimestamp ?? ts
+            closeActiveSessionLocked(at: max(endTimestamp, sessionStart), closingNote: nil)
+            _focusState = .paused(taskId: taskId, pausedAt: ts)
+            _autoPausedByAbsence = true
+            _stateVersion &+= 1
+        }
+        lastProgressTimestamp = nil
+        _nonBudgetLastTimestamp = nil
+        _nonBudgetSegmentStartedAt = nil
+        _nonBudgetSegmentMinutes = 0.0
+        unassignedActiveStart = nil
+        driftCandidate = nil
     }
 
     public func snoozeAlert(for taskId: String?, minutes: Int, at date: Date? = nil) {
@@ -445,17 +664,59 @@ public final class DayHelmEngine: @unchecked Sendable {
     private func ingestRedactedLocked(_ cleanSample: ActivitySample) -> [SupervisorAlert] {
         _lastSample = cleanSample
 
-        let isAbsent = cleanSample.screenLocked || cleanSample.idleSeconds >= config.idleThresholdSeconds
+        let isIdleTrigger = !cleanSample.screenLocked && cleanSample.idleSeconds >= config.idleThresholdSeconds
+        let isAbsent = cleanSample.screenLocked || isIdleTrigger
         if isAbsent {
+            let lastActiveAt = cleanSample.timestamp.addingTimeInterval(-max(0, cleanSample.idleSeconds))
             if case .focusing(let taskId, _) = _focusState {
-                let sessionStart = activeSessionIndex.flatMap { idx in
-                    idx < _focusSessions.count ? _focusSessions[idx].startedAt : nil
-                } ?? cleanSample.timestamp
-                let endTimestamp = lastProgressTimestamp ?? cleanSample.timestamp
-                closeActiveSessionLocked(at: max(endTimestamp, sessionStart), closingNote: nil)
+                var endTimestamp = lastProgressTimestamp ?? cleanSample.timestamp
+                if let idx = activeSessionIndex, idx < _focusSessions.count {
+                    let sessionStart = _focusSessions[idx].startedAt
+                    let trackedUpTo = lastProgressTimestamp ?? sessionStart
+                    if isIdleTrigger {
+                        let clampedLastActive = max(lastActiveAt, sessionStart)
+                        let overcountedSec = max(0, trackedUpTo.timeIntervalSince(clampedLastActive))
+                        let deductMin = min(_focusSessions[idx].minutes, overcountedSec / 60.0)
+                        if deductMin > 0 {
+                            _focusSessions[idx].minutes = max(0, _focusSessions[idx].minutes - deductMin)
+                            if let mode = _activeActivityMode {
+                                _activityModeMinutes[mode.rawValue] = max(0, (_activityModeMinutes[mode.rawValue] ?? 0.0) - deductMin)
+                            }
+                        }
+                        endTimestamp = clampedLastActive
+                    } else {
+                        endTimestamp = max(trackedUpTo, sessionStart)
+                    }
+                }
+                closeActiveSessionLocked(at: endTimestamp, closingNote: nil)
                 _focusState = .paused(taskId: taskId, pausedAt: cleanSample.timestamp)
+                _autoPausedByAbsence = true
                 _stateVersion &+= 1
+            } else if _activeNonBudgetActivity != nil || _activeActivityMode != nil {
+                if isIdleTrigger, let trackedUpTo = _nonBudgetLastTimestamp {
+                    let segStart = _nonBudgetSegmentStartedAt ?? trackedUpTo
+                    let clampedLastActive = max(lastActiveAt, segStart)
+                    let overcountedSec = max(0, trackedUpTo.timeIntervalSince(clampedLastActive))
+                    let deductMin = min(_nonBudgetSegmentMinutes, overcountedSec / 60.0)
+                    if deductMin > 0 {
+                        if let mode = _activeActivityMode {
+                            _activityModeMinutes[mode.rawValue] = max(0, (_activityModeMinutes[mode.rawValue] ?? 0.0) - deductMin)
+                        }
+                        if let nonBudget = _activeNonBudgetActivity {
+                            switch nonBudget {
+                            case .otherWork:
+                                _otherWorkMinutes = max(0, _otherWorkMinutes - deductMin)
+                            case .nonWork:
+                                _nonWorkMinutes = max(0, _nonWorkMinutes - deductMin)
+                            }
+                        }
+                        _stateVersion &+= 1
+                    }
+                }
             }
+            _nonBudgetLastTimestamp = nil
+            _nonBudgetSegmentStartedAt = nil
+            _nonBudgetSegmentMinutes = 0.0
             unassignedActiveStart = nil
             driftCandidate = nil
             return []
@@ -464,24 +725,66 @@ public final class DayHelmEngine: @unchecked Sendable {
         var emitted: [SupervisorAlert] = []
         let ts = cleanSample.timestamp
 
-        // 1. Accumulate focus time if currently focusing
+        // 0. Auto-resume focus if previously auto-paused by idle/lock/sleep (manual pause stays paused).
+        if _autoPausedByAbsence, case .paused(let pausedTaskId, _) = _focusState {
+            _autoPausedByAbsence = false
+            if _budgets.contains(where: { $0.taskId == pausedTaskId }) {
+                openNewSessionLocked(taskId: pausedTaskId, note: nil, at: ts)
+            }
+        }
+
+        // 1. Accumulate focus time if currently focusing, and Layer-1 activityMode / non-budget time
         var activeTaskId: String?
         if case .focusing(let taskId, let startedAt) = _focusState {
             activeTaskId = taskId
             let baseline = lastProgressTimestamp ?? startedAt
             let deltaSeconds = max(0, ts.timeIntervalSince(baseline))
-            if deltaSeconds > 0, let idx = activeSessionIndex {
-                _focusSessions[idx].minutes += deltaSeconds / 60.0
+            if let maxGap = config.maxTickGapSeconds, deltaSeconds > maxGap {
+                // Wall-clock jump (sleep / freeze): reset baseline without attributing ghost time.
+                lastProgressTimestamp = ts
+            } else if deltaSeconds > 0, let idx = activeSessionIndex {
+                let deltaMin = deltaSeconds / 60.0
+                _focusSessions[idx].minutes += deltaMin
+                if let mode = _activeActivityMode {
+                    _activityModeMinutes[mode.rawValue, default: 0.0] += deltaMin
+                }
                 lastProgressTimestamp = ts
             } else if lastProgressTimestamp == nil {
                 lastProgressTimestamp = ts
             }
+        } else if _activeNonBudgetActivity != nil || _activeActivityMode != nil {
+            if let lastTs = _nonBudgetLastTimestamp {
+                let deltaSeconds = max(0, ts.timeIntervalSince(lastTs))
+                if let maxGap = config.maxTickGapSeconds, deltaSeconds > maxGap {
+                    _nonBudgetSegmentStartedAt = ts
+                    _nonBudgetSegmentMinutes = 0.0
+                } else if deltaSeconds > 0 {
+                    let deltaMin = deltaSeconds / 60.0
+                    _nonBudgetSegmentMinutes += deltaMin
+                    if let mode = _activeActivityMode {
+                        _activityModeMinutes[mode.rawValue, default: 0.0] += deltaMin
+                    }
+                    if let nonBudget = _activeNonBudgetActivity {
+                        switch nonBudget {
+                        case .otherWork:
+                            _otherWorkMinutes += deltaMin
+                        case .nonWork:
+                            _nonWorkMinutes += deltaMin
+                        }
+                    }
+                }
+            } else {
+                _nonBudgetSegmentStartedAt = ts
+                _nonBudgetSegmentMinutes = 0.0
+            }
+            _nonBudgetLastTimestamp = ts
         }
 
         // 2. Append to enriched spans
         EventMerger.append(
             sample: cleanSample,
             declaredTaskId: activeTaskId,
+            semanticGroup: _currentSemanticGroup,
             to: &_enrichedSpans,
             pulsetime: config.pulsetimeSeconds
         )
@@ -509,12 +812,12 @@ public final class DayHelmEngine: @unchecked Sendable {
                 }
             }
 
-            // 4. Task drift check
-            if !cleanSample.redacted, let driftAlert = evaluateDriftLocked(declaredTaskId: taskId, sample: cleanSample) {
+            // 4. Task drift check (in manual mode; in auto-tracking mode Jev handles automatic switching)
+            if !_autoTrackingActive, !cleanSample.redacted, let driftAlert = evaluateDriftLocked(declaredTaskId: taskId, sample: cleanSample) {
                 emitted.append(driftAlert)
             }
-        } else if _focusState == .unassigned {
-            // 5. Unassigned continuous activity check
+        } else if _focusState == .unassigned && !_autoTrackingActive {
+            // 5. Unassigned continuous activity check (only when manual mode is active)
             if unassignedActiveStart == nil {
                 unassignedActiveStart = ts
             }
@@ -660,7 +963,10 @@ public final class DayHelmEngine: @unchecked Sendable {
             budgets: budgetSnapshots,
             focusSessions: _focusSessions,
             enrichedSpans: _enrichedSpans,
-            metrics: metrics
+            metrics: metrics,
+            otherWorkMinutes: _otherWorkMinutes > 0 ? _otherWorkMinutes : nil,
+            nonWorkMinutes: _nonWorkMinutes > 0 ? _nonWorkMinutes : nil,
+            activityModeMinutes: _activityModeMinutes.isEmpty ? nil : _activityModeMinutes
         )
     }
 
@@ -676,6 +982,16 @@ public final class DayHelmEngine: @unchecked Sendable {
         _pendingAlerts = []
         activeSessionIndex = nil
         lastProgressTimestamp = nil
+        _activeNonBudgetActivity = nil
+        _activeActivityMode = nil
+        _nonBudgetLastTimestamp = nil
+        _autoPausedByAbsence = false
+        _nonBudgetSegmentStartedAt = nil
+        _nonBudgetSegmentMinutes = 0.0
+        _otherWorkMinutes = 0.0
+        _nonWorkMinutes = 0.0
+        _activityModeMinutes = [:]
+        _currentSemanticGroup = nil
         capAlertEmittedForTask.removeAll()
         targetAlertEmittedForTask.removeAll()
         snoozeUntilByTask.removeAll()

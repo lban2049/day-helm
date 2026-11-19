@@ -60,6 +60,7 @@ public struct EnrichedSpan: Sendable, Equatable, Codable {
     public let url: String?
     public let declaredTaskId: String?
     public let redacted: Bool
+    public var semanticGroup: String?
 
     public var durationSeconds: TimeInterval {
         max(0, endedAt.timeIntervalSince(startedAt))
@@ -73,7 +74,8 @@ public struct EnrichedSpan: Sendable, Equatable, Codable {
         windowTitle: String? = nil,
         url: String? = nil,
         declaredTaskId: String? = nil,
-        redacted: Bool = false
+        redacted: Bool = false,
+        semanticGroup: String? = nil
     ) {
         self.startedAt = startedAt
         self.endedAt = endedAt
@@ -83,6 +85,24 @@ public struct EnrichedSpan: Sendable, Equatable, Codable {
         self.url = url
         self.declaredTaskId = declaredTaskId
         self.redacted = redacted
+        self.semanticGroup = semanticGroup
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case startedAt, endedAt, appName, bundleId, windowTitle, url, declaredTaskId, redacted, semanticGroup
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.startedAt = try c.decode(Date.self, forKey: .startedAt)
+        self.endedAt = try c.decode(Date.self, forKey: .endedAt)
+        self.appName = try c.decode(String.self, forKey: .appName)
+        self.bundleId = try c.decodeIfPresent(String.self, forKey: .bundleId)
+        self.windowTitle = try c.decodeIfPresent(String.self, forKey: .windowTitle)
+        self.url = try c.decodeIfPresent(String.self, forKey: .url)
+        self.declaredTaskId = try c.decodeIfPresent(String.self, forKey: .declaredTaskId)
+        self.redacted = try c.decodeIfPresent(Bool.self, forKey: .redacted) ?? false
+        self.semanticGroup = try c.decodeIfPresent(String.self, forKey: .semanticGroup)
     }
 }
 
@@ -90,6 +110,8 @@ public struct TaskBudget: Sendable, Equatable, Codable, Identifiable {
     public var id: String { taskId }
     public let taskId: String
     public let displayName: String
+    public let shortName: String?
+    public let description: String?
     public let colorHex: String
     public let targetMinutes: Int?
     public let capMinutes: Int?
@@ -100,6 +122,8 @@ public struct TaskBudget: Sendable, Equatable, Codable, Identifiable {
     public init(
         taskId: String,
         displayName: String,
+        shortName: String? = nil,
+        description: String? = nil,
         colorHex: String,
         targetMinutes: Int? = nil,
         capMinutes: Int? = nil,
@@ -109,6 +133,10 @@ public struct TaskBudget: Sendable, Equatable, Codable, Identifiable {
     ) {
         self.taskId = taskId
         self.displayName = displayName
+        let trimmedShort = shortName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.shortName = (trimmedShort?.isEmpty == false) ? trimmedShort : nil
+        let trimmedDesc = description?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.description = (trimmedDesc?.isEmpty == false) ? trimmedDesc : nil
         self.colorHex = colorHex
         self.targetMinutes = targetMinutes
         self.capMinutes = capMinutes
@@ -118,13 +146,19 @@ public struct TaskBudget: Sendable, Equatable, Codable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case taskId, displayName, colorHex, targetMinutes, capMinutes, keywords, appBundleIds, domains
+        case taskId, displayName, shortName, description, colorHex, targetMinutes, capMinutes, keywords, appBundleIds, domains
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.taskId = try container.decode(String.self, forKey: .taskId)
         self.displayName = try container.decode(String.self, forKey: .displayName)
+        let decodedShort = try container.decodeIfPresent(String.self, forKey: .shortName)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.shortName = (decodedShort?.isEmpty == false) ? decodedShort : nil
+        let decodedDesc = try container.decodeIfPresent(String.self, forKey: .description)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.description = (decodedDesc?.isEmpty == false) ? decodedDesc : nil
         self.colorHex = try container.decode(String.self, forKey: .colorHex)
         self.targetMinutes = try container.decodeIfPresent(Int.self, forKey: .targetMinutes)
         self.capMinutes = try container.decodeIfPresent(Int.self, forKey: .capMinutes)
@@ -132,6 +166,61 @@ public struct TaskBudget: Sendable, Equatable, Codable, Identifiable {
         self.appBundleIds = try container.decodeIfPresent([String].self, forKey: .appBundleIds) ?? []
         self.domains = try container.decodeIfPresent([String].self, forKey: .domains) ?? []
     }
+}
+
+public enum ActivityMode: String, Sendable, Equatable, Codable, CaseIterable {
+    case build = "build"
+    case create = "create"
+    case operate = "operate"
+    case research = "research"
+    case commsAdmin = "comms_admin"
+    case breakTime = "break"
+
+    public var displayName: String {
+        switch self {
+        case .build: return "开发构建"
+        case .create: return "内容创作"
+        case .operate: return "业务运营"
+        case .research: return "研究规划"
+        case .commsAdmin: return "沟通杂务"
+        case .breakTime: return "休息分心"
+        }
+    }
+
+    public var compactLabel: String {
+        switch self {
+        case .build: return "开发"
+        case .create: return "创作"
+        case .operate: return "运营"
+        case .research: return "研究"
+        case .commsAdmin: return "杂务"
+        case .breakTime: return "分心"
+        }
+    }
+
+    public var colorHex: String {
+        switch self {
+        case .build: return "#3B82F6"
+        case .create: return "#8B5CF6"
+        case .operate: return "#F59E0B"
+        case .research: return "#10B981"
+        case .commsAdmin: return "#64748B"
+        case .breakTime: return "#EF4444"
+        }
+    }
+
+    public var isDistraction: Bool {
+        self == .breakTime
+    }
+
+    public var categoryId: String {
+        "__mode_\(rawValue)__"
+    }
+}
+
+public enum AutoNonBudgetActivity: String, Sendable, Equatable, Codable {
+    case otherWork = "other_work"
+    case nonWork = "non_work"
 }
 
 public enum BudgetStatus: Sendable, Equatable, Codable {

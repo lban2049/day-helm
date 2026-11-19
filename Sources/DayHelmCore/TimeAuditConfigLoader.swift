@@ -5,6 +5,7 @@ public enum TimeAuditConfigLoader {
         TaskBudget(
             taskId: "ecommerce",
             displayName: "电商做深",
+            description: "选品、商品开发、主图与详情页设计、营销推广与转化优化",
             colorHex: "#3B82F6",
             targetMinutes: 90,
             capMinutes: 120,
@@ -13,6 +14,7 @@ public enum TimeAuditConfigLoader {
         TaskBudget(
             taskId: "ecommerce-ops",
             displayName: "电商日常运营",
+            description: "客服回复、退换货售后、订单打单发货与日常店铺杂务",
             colorHex: "#F59E0B",
             targetMinutes: nil,
             capMinutes: 30,
@@ -21,6 +23,7 @@ public enum TimeAuditConfigLoader {
         TaskBudget(
             taskId: "hermes",
             displayName: "Hermes 投研",
+            description: "行业研报、股票与公司财务分析、宏观研究与估值建模",
             colorHex: "#10B981",
             targetMinutes: 45,
             capMinutes: 60,
@@ -29,6 +32,7 @@ public enum TimeAuditConfigLoader {
         TaskBudget(
             taskId: "infra-billing",
             displayName: "Infra 维护",
+            description: "云服务器、AWS/Cloudflare、账单成本、部署运维与基础设施",
             colorHex: "#8B5CF6",
             targetMinutes: nil,
             capMinutes: 30,
@@ -109,6 +113,8 @@ public enum TimeAuditConfigLoader {
             return TaskBudget(
                 taskId: budget.taskId,
                 displayName: budget.displayName,
+                shortName: budget.shortName,
+                description: budget.description,
                 colorHex: budget.colorHex,
                 targetMinutes: budget.targetMinutes,
                 capMinutes: budget.capMinutes,

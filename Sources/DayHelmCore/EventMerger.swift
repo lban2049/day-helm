@@ -43,6 +43,7 @@ public enum EventMerger {
     public static func append(
         sample: ActivitySample,
         declaredTaskId: String?,
+        semanticGroup: String? = nil,
         to spans: inout [EnrichedSpan],
         pulsetime: TimeInterval = defaultPulsetime
     ) {
@@ -51,6 +52,9 @@ public enum EventMerger {
             let delta = sample.timestamp.timeIntervalSince(last.endedAt)
             if delta >= 0 && delta <= pulsetime && matchesIdentity(span: last, sample: sample, declaredTaskId: declaredTaskId) {
                 spans[lastIndex].endedAt = max(last.endedAt, sample.timestamp)
+                if let semanticGroup, spans[lastIndex].semanticGroup == nil {
+                    spans[lastIndex].semanticGroup = semanticGroup
+                }
                 return
             }
         }
@@ -64,7 +68,8 @@ public enum EventMerger {
                 windowTitle: sample.windowTitle,
                 url: sample.url,
                 declaredTaskId: declaredTaskId,
-                redacted: sample.redacted
+                redacted: sample.redacted,
+                semanticGroup: semanticGroup
             )
         )
     }

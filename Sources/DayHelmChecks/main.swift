@@ -33,7 +33,7 @@ struct DayHelmChecksMain {
     static func main() async {
         do {
             try await runAllChecks()
-            print("ALL DAYHELM CHECKS PASSED (50/50)")
+            print("ALL DAYHELM CHECKS PASSED (68/68)")
             exit(0)
         } catch {
             fputs("DAYHELM CHECK FAILED: \(error)\n", stderr)
@@ -68,6 +68,39 @@ struct DayHelmChecksMain {
 
         func data(from url: URL) async throws -> (Data, URLResponse) {
             try handler(url)
+        }
+    }
+
+    private final class MockJevTransport: JevHTTPTransport, @unchecked Sendable {
+        let handler: @Sendable (URLRequest) async throws -> (Data, URLResponse)
+
+        init(handler: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse)) {
+            self.handler = handler
+        }
+
+        func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+            try await handler(request)
+        }
+    }
+
+    private final class LockedBox<T>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: T
+
+        init(_ value: T) {
+            self.value = value
+        }
+
+        func get() -> T {
+            lock.withLock { value }
+        }
+
+        func set(_ newValue: T) {
+            lock.withLock { value = newValue }
+        }
+
+        func modify(_ block: (inout T) -> Void) {
+            lock.withLock { block(&value) }
         }
     }
 
@@ -2678,9 +2711,13 @@ struct DayHelmChecksMain {
                 )
             }
             try await MainActor.run {
-                try checkEqual(coordinator.pillModel.text, "○ DayHelm · 待命", "Initial pill text should be standby")
+                try checkEqual(coordinator.pillModel.text, "待命", "Initial standard standby pill text should show 待命")
+                try checkEqual(coordinator.pillModel.visualState, .standby, "Initial pill visualState should be standby")
+                try check(coordinator.pillModel.helpText.contains("待命"), "Standby helpText should describe standby state")
                 coordinator.selectTask("ecommerce")
-                try check(coordinator.pillModel.text.contains("电商"), "Pill text should reflect focused task")
+                try checkEqual(coordinator.pillModel.text, "电商做深 0/90m", "Standard focusing pill text should show task label + focused/target")
+                try checkEqual(coordinator.pillModel.visualState, .focusing, "Focusing pill visualState should be focusing")
+                try check(coordinator.pillModel.helpText.contains("电商"), "HelpText should reflect focused task")
                 let initialPill = coordinator.pillModel.text
 
                 // Popover closed: elapsedFocusSeconds should not advance on pollOnce/tick.
@@ -2777,7 +2814,19 @@ struct DayHelmChecksMain {
                 runOCR: true
             )
             try check(s2, "Visual change snapshot should still be saved")
-            try checkEqual(try db.todayCounts(dayStartMs: dayStartMs, dayEndMs: dayEndMs).ocrFrames, 1, "Secondary OCR within 25s should be skipped")
+            try checkEqual(try db.todayCounts(dayStartMs: dayStartMs, dayEndMs: dayEndMs).ocrFrames, 1, "Secondary OCR within 25s on SAME window should be skipped")
+
+            // Switching to a different tab/window title after >= 4s should run OCR without waiting 25s
+            clock.advance(by: 5)
+            let sample3 = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Hermes Agent - Dashboard", url: "http://127.0.0.1:9119/", idleSeconds: 0, screenLocked: false, inputActive: true)
+            let s3 = try await recorder.processCapturedImage(
+                try makeSyntheticTextImage(text: "DIFFERENT_TAB_OCR", backgroundWhite: true, width: 1280, height: 720),
+                sample: sample3,
+                trigger: ActivityEventKind.click.rawValue,
+                runOCR: true
+            )
+            try check(s3, "Different browser tab click snapshot should be saved")
+            try checkEqual(try db.todayCounts(dayStartMs: dayStartMs, dayEndMs: dayEndMs).ocrFrames, 2, "Switching to a different window/tab title after >= 4s should run OCR immediately")
         }
 
         try await runCheck("58. HybridActivityCoordinator background UI gating and window hydration") {
@@ -2810,6 +2859,1212 @@ struct DayHelmChecksMain {
                 coordinator.setRecorderWindowVisible(true)
                 try checkEqual(coordinator.latestSample?.windowTitle, "B.swift", "Opening recorder window should hydrate latestSample")
             }
+        }
+
+        try await runCheck("59. MenuBarDisplayMode formatting, TaskBudget shortName & settings compatibility") {
+            let legacyJSON = Data(#"{"activityRecorderEnabled":true}"#.utf8)
+            let decodedLegacy = try JSONDecoder().decode(DayHelmSettings.self, from: legacyJSON)
+            try checkEqual(decodedLegacy.menuBarDisplayMode, .standard, "Legacy settings JSON should default menuBarDisplayMode to .standard")
+
+            let t0 = baseDate()
+            let clock = ManualClock(now: t0)
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-59-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let store = DayHelmStore(directory: tmpDir)
+            let customBudgets = [
+                TaskBudget(
+                    taskId: "ops",
+                    displayName: "电商日常运营",
+                    shortName: "运营",
+                    colorHex: "#F59E0B",
+                    targetMinutes: nil,
+                    capMinutes: 30
+                ),
+                TaskBudget(
+                    taskId: "infra",
+                    displayName: "Infra 维护",
+                    colorHex: "#8B5CF6",
+                    targetMinutes: nil,
+                    capMinutes: 30
+                ),
+                TaskBudget(
+                    taskId: "long",
+                    displayName: "超长核心研发任务规划专项",
+                    colorHex: "#3B82F6",
+                    targetMinutes: 90,
+                    capMinutes: nil
+                )
+            ]
+            let engine = DayHelmEngine(budgets: customBudgets, clock: clock)
+            let inspector = MockInspector(currentSample: ActivitySample(
+                timestamp: t0,
+                appName: "Xcode",
+                bundleId: "com.apple.dt.Xcode",
+                windowTitle: "Main.swift",
+                url: nil,
+                idleSeconds: 0,
+                screenLocked: false,
+                inputActive: true
+            ))
+            let coordinator = await MainActor.run {
+                HybridActivityCoordinator(
+                    engine: engine,
+                    store: store,
+                    almaClient: AlmaActivityClient(baseURL: URL(string: "http://127.0.0.1:1")!, transport: MockAlmaTransport { _ in throw URLError(.cannotConnectToHost) }),
+                    inspector: inspector,
+                    clock: clock
+                )
+            }
+
+            try await MainActor.run {
+                // Standard mode: standby shows short "待命", focusing uses shortName or 4-char truncation
+                var standardSettings = coordinator.recorderSettings
+                standardSettings.menuBarDisplayMode = .standard
+                coordinator.updateRecorderSettings(standardSettings)
+                try checkEqual(coordinator.pillModel.text, "待命", "Standard standby should omit brand prefix")
+
+                coordinator.selectTask("infra")
+                try checkEqual(coordinator.pillModel.text, "Infra 维护 0/30m", "Standard mode must NOT truncate mixed ASCII+CJK labels like 'Infra 维护'")
+
+                coordinator.selectTask("long")
+                try checkEqual(coordinator.pillModel.text, "超长核心研发任务… 0/90m", "Standard mode should only truncate ultra-long names exceeding 16 visual units")
+
+                coordinator.selectTask("ops")
+                try checkEqual(coordinator.pillModel.text, "运营 0/30m", "Standard mode should prefer TaskBudget.shortName")
+
+                // Simulate 31 minutes of focus on ops to hit cap (30m)
+                for step in 1...31 {
+                    let nextTs = t0.addingTimeInterval(TimeInterval(step * 60))
+                    clock.advance(by: 60)
+                    inspector.currentSample = ActivitySample(
+                        timestamp: nextTs,
+                        appName: "Xcode",
+                        bundleId: "com.apple.dt.Xcode",
+                        windowTitle: "Main.swift",
+                        url: nil,
+                        idleSeconds: 0,
+                        screenLocked: false,
+                        inputActive: true
+                    )
+                    coordinator.pollOnce()
+                }
+                try checkEqual(coordinator.pillModel.text, "运营 31/30m▲", "Standard capReached should show compact ▲ suffix")
+
+                // Switch to compact mode: should immediately drop task name and show 31/30m!
+                var compactSettings = coordinator.recorderSettings
+                compactSettings.menuBarDisplayMode = .compact
+                coordinator.updateRecorderSettings(compactSettings)
+                try checkEqual(coordinator.pillModel.text, "31/30m!", "Compact capReached should show 31/30m!")
+
+                // Switch to iconOnly mode: text should be empty, but visualState should still distinguish capReached vs standby
+                var iconSettings = coordinator.recorderSettings
+                iconSettings.menuBarDisplayMode = .iconOnly
+                coordinator.updateRecorderSettings(iconSettings)
+                try checkEqual(coordinator.pillModel.text, "", "IconOnly mode should render empty pill text")
+                try checkEqual(coordinator.pillModel.visualState, .capReached, "IconOnly mode should still expose capReached visualState")
+                try check(coordinator.pillModel.helpText.contains("电商日常运营"), "IconOnly helpText should still contain full task name")
+
+                coordinator.pauseFocus()
+                try checkEqual(coordinator.pillModel.visualState, .standby, "Pausing focus should return iconOnly visualState to standby")
+            }
+        }
+
+        try await runCheck("60. TaskBudget description, Jev settings persistence & JevAPIKeyStore isolation") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-60-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let store = DayHelmStore(directory: tmpDir)
+            let budget = TaskBudget(
+                taskId: "ecom",
+                displayName: "电商做深",
+                shortName: "电商",
+                description: "选品、主图与详情页优化",
+                colorHex: "#3B82F6",
+                targetMinutes: 90,
+                capMinutes: 120
+            )
+            try store.saveBudgets([budget])
+            let loadedBudgets = TimeAuditConfigLoader.loadBudgets(dayhelmConfigURL: store.configURL)
+            try checkEqual(loadedBudgets.first?.description, "选品、主图与详情页优化", "TaskBudget.description should persist in config.json")
+
+            var settings = DayHelmSettings.default
+            try checkEqual(settings.jevAutoTrackingEnabled, false, "Jev auto-tracking should be opt-in (false by default)")
+            try checkEqual(settings.jevSendOCRSnippet, true, "jevSendOCRSnippet should default to true")
+            settings.jevAutoTrackingEnabled = true
+            settings.jevModel = "jev-1.14.0"
+            settings.jevSendOCRSnippet = false
+            settings.menuBarDisplayMode = .compact
+            try store.saveSettings(settings)
+
+            let reloaded = store.loadSettings()
+            try checkEqual(reloaded.jevAutoTrackingEnabled, true, "jevAutoTrackingEnabled should persist")
+            try checkEqual(reloaded.jevModel, "jev-1.14.0", "jevModel should persist")
+            try checkEqual(reloaded.jevSendOCRSnippet, false, "jevSendOCRSnippet should persist")
+            try checkEqual(reloaded.menuBarDisplayMode, .compact, "menuBarDisplayMode should persist in config.json")
+
+            // API key stored in jev.key (NOT config.json) with 0600 permissions
+            let keyStore = JevAPIKeyStore(directory: tmpDir, environment: [:], dotEnvSearchPaths: [])
+            try checkEqual(keyStore.resolveKey(), nil, "Empty JevAPIKeyStore should resolve nil")
+            try keyStore.saveKey("test_synthetic_jev_key_12345")
+            let resolved = keyStore.resolveKey()
+            try checkEqual(resolved?.key, "test_synthetic_jev_key_12345", "Saved key should resolve from local file")
+            try checkEqual(resolved?.source, .localKeyFile, "Saved key source should be .localKeyFile")
+
+            let configText = try String(contentsOf: store.configURL, encoding: .utf8)
+            try check(!configText.contains("test_synthetic_jev_key_12345"), "API key must never be written into config.json")
+
+            let envStore = JevAPIKeyStore(directory: tmpDir, environment: ["JEV_API_KEY": "env_key_999"], dotEnvSearchPaths: [])
+            try keyStore.deleteKey()
+            try checkEqual(envStore.resolveKey()?.key, "env_key_999", "Environment JEV_API_KEY should act as fallback")
+            try checkEqual(envStore.resolveKey()?.source, .environment, "Fallback source should be .environment")
+        }
+
+        try await runCheck("61. SemanticPayloadSanitizer hard privacy gates & OCR truncation") {
+            let t0 = baseDate()
+            let budgets = sampleBudgets()
+
+            // Locked screen -> nil (never classify)
+            let locked = ActivitySample(timestamp: t0, appName: "loginwindow", windowTitle: "Lock", idleSeconds: 0, screenLocked: true, inputActive: false)
+            try checkEqual(
+                SemanticPayloadSanitizer.buildInput(
+                    sample: locked,
+                    ocrText: "secret screen text",
+                    recentSpans: [],
+                    budgets: budgets,
+                    sendOCRSnippet: true,
+                    privacyConfig: .default
+                ),
+                nil,
+                "Locked screen must never build an outbound classification input"
+            )
+
+            // Redacted app (1Password) -> strips title, url, ocr completely
+            let pwSample = ActivitySample(
+                timestamp: t0,
+                appName: "1Password",
+                bundleId: "com.1password.1password",
+                windowTitle: "Vault - Bank Password",
+                url: "https://bank.example.com?token=secret123",
+                idleSeconds: 0,
+                screenLocked: false,
+                inputActive: true
+            )
+            let redactedInput = SemanticPayloadSanitizer.buildInput(
+                sample: pwSample,
+                ocrText: "master password 123456",
+                recentSpans: [],
+                budgets: budgets,
+                sendOCRSnippet: true,
+                privacyConfig: .default
+            )
+            try check(redactedInput != nil, "Redacted non-locked sample should produce app-only sanitized input")
+            try checkEqual(redactedInput?.redacted, true, "Redacted sample must preserve redacted=true")
+            try checkEqual(redactedInput?.windowTitle, nil, "Redacted sample must strip windowTitle")
+            try checkEqual(redactedInput?.url, nil, "Redacted sample must strip url")
+            try checkEqual(redactedInput?.ocrSnippet, nil, "Redacted sample must strip OCR snippet")
+
+            // Normal sample -> strips URL tokens, masks secrets, caps OCR at 320 chars
+            let longOCR = "Header Bearer supersecrettoken999999 sk-abcdefghij1234567890 " + String(repeating: "主图优化", count: 120)
+            let normalSample = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Example Shop api_key=rawsecret123",
+                url: "https://shop.example.com/item?id=42&token=mysecret&session=abc",
+                idleSeconds: 0,
+                screenLocked: false,
+                inputActive: true
+            )
+            let normalInput = SemanticPayloadSanitizer.buildInput(
+                sample: normalSample,
+                ocrText: longOCR,
+                recentSpans: [],
+                budgets: budgets,
+                sendOCRSnippet: true,
+                privacyConfig: .default
+            )
+            try check(normalInput != nil, "Normal sample should build classification input")
+            try check(!(normalInput?.windowTitle?.contains("rawsecret123") ?? true), "Title secrets must be masked")
+            try check(!(normalInput?.url?.contains("mysecret") ?? true), "URL sensitive query params must be stripped")
+            try check(!(normalInput?.ocrSnippet?.contains("supersecrettoken999999") ?? true), "OCR bearer token must be masked")
+            try check(!(normalInput?.ocrSnippet?.contains("sk-abcdefghij1234567890") ?? true), "OCR sk- key must be masked")
+            try check((normalInput?.ocrSnippet?.count ?? 999) <= SemanticPayloadSanitizer.maxOCRSnippetChars, "OCR snippet must be capped to <= 320 chars")
+        }
+
+        try await runCheck("62. SemanticAutoTracker deterministic hysteresis, caching & manual override") {
+            let t0 = baseDate()
+            let tracker = SemanticAutoTracker()
+
+            // 0. Calibrated sub-2s defaults (0.65s dwell ensures cold-TLS ~1.1s RTT stays <= 2.0s)
+            try checkApprox(tracker.config.minDwellBeforeClassifySeconds, 0.65, "Default pre-classify dwell should be 0.65s")
+            try checkApprox(tracker.config.cacheSwitchDwellSeconds, 0.45, "Default cached-switch anti-flicker dwell should be 0.45s")
+            try checkApprox(tracker.config.immediateSwitchConfidence, 0.80, "Default immediate switch confidence should be 0.80")
+            try checkApprox(tracker.config.fastSwitchConfirmSeconds, 1.2, "Default fast anti-flicker confirm should be 1.2s")
+            try checkApprox(tracker.config.minSwitchConfirmSeconds, 2.5, "Default standard anti-flicker confirm should be 2.5s")
+
+            // 1. Cold start commits immediately when confidence >= 0.55
+            let c1 = SemanticClassification(
+                categoryId: "ecommerce",
+                confidence: 0.88,
+                probabilities: ["ecommerce": 0.90],
+                sameTaskAsPrevious: nil,
+                isDistraction: 0.05,
+                source: .jev,
+                classifiedAt: t0
+            )
+            let d1 = tracker.apply(classification: c1, contextKey: "browser|chrome|shop.example.com", at: t0)
+            try checkEqual(d1.committedCategoryId, "ecommerce", "Cold start with high confidence should commit immediately")
+
+            // 2. Low-confidence noise while focusing does not switch
+            let cNoise = SemanticClassification(
+                categoryId: AutoActivityIds.otherWork,
+                confidence: 0.38,
+                probabilities: [AutoActivityIds.otherWork: 0.45],
+                sameTaskAsPrevious: 0.40,
+                isDistraction: 0.15,
+                source: .jev,
+                classifiedAt: t0.addingTimeInterval(30)
+            )
+            let dNoise = tracker.apply(classification: cNoise, contextKey: "app|finder|desktop", at: t0.addingTimeInterval(30))
+            try checkEqual(dNoise.committedCategoryId, "ecommerce", "Low-confidence classification must not switch active project")
+
+            // 3. Moderate-confidence switch (0.78 / same=0.30) enters fast anti-flicker dwell (1.2s) and reports exact remainingConfirmSeconds
+            let cSwitch = SemanticClassification(
+                categoryId: "hermes",
+                confidence: 0.78,
+                probabilities: ["hermes": 0.80],
+                sameTaskAsPrevious: 0.30,
+                isDistraction: 0.05,
+                source: .jev,
+                classifiedAt: t0.addingTimeInterval(60)
+            )
+            let dPending = tracker.apply(classification: cSwitch, contextKey: "app|obsidian|hermes-q4", at: t0.addingTimeInterval(60))
+            try checkEqual(dPending.committedCategoryId, "ecommerce", "Moderate-confidence candidate should enter brief anti-flicker dwell")
+            try checkEqual(dPending.pendingCategoryId, "hermes", "Moderate-confidence candidate should set pendingCategoryId")
+            try checkApprox(tracker.remainingConfirmSeconds(for: "app|obsidian|hermes-q4", at: t0.addingTimeInterval(60.5)) ?? -1, 0.7, tolerance: 0.05, "remainingConfirmSeconds should compute exact remaining fast confirm dwell")
+
+            let dBefore = tracker.tickDwell(activeContextKey: "app|obsidian|hermes-q4", at: t0.addingTimeInterval(60.8))
+            try checkEqual(dBefore.committedCategoryId, "ecommerce", "At 0.8s (< 1.2s) fast anti-flicker switch should still observe")
+
+            let dAfter = tracker.tickDwell(activeContextKey: "app|obsidian|hermes-q4", at: t0.addingTimeInterval(61.3))
+            try checkEqual(dAfter.committedCategoryId, "hermes", "At 1.3s (>= 1.2s) tickDwell should commit fast switch without extra API call")
+
+            // 3b. Ambiguous / high same_task switch (0.72 / same=0.70) uses standard anti-flicker dwell (2.5s)
+            let cAmbiguous = SemanticClassification(
+                categoryId: "infra-billing",
+                confidence: 0.72,
+                probabilities: ["infra-billing": 0.72],
+                sameTaskAsPrevious: 0.70,
+                isDistraction: 0.02,
+                source: .jev,
+                classifiedAt: t0.addingTimeInterval(90)
+            )
+            let dAmbPending = tracker.apply(classification: cAmbiguous, contextKey: "browser|chrome|aws.amazon.com|billing", at: t0.addingTimeInterval(90))
+            try checkEqual(dAmbPending.committedCategoryId, "hermes", "Ambiguous high-same_task switch must wait in standard anti-flicker dwell")
+            let dAmbMid = tracker.tickDwell(activeContextKey: "browser|chrome|aws.amazon.com|billing", at: t0.addingTimeInterval(91.5))
+            try checkEqual(dAmbMid.committedCategoryId, "hermes", "At 1.5s (< 2.5s) standard anti-flicker switch must not commit yet")
+            let dAmbCommit = tracker.tickDwell(activeContextKey: "browser|chrome|aws.amazon.com|billing", at: t0.addingTimeInterval(92.6))
+            try checkEqual(dAmbCommit.committedCategoryId, "infra-billing", "At 2.6s (>= 2.5s) standard anti-flicker switch should commit")
+
+            // 4. High-confidence switch (conf >= 0.80 & same <= 0.60) switches IMMEDIATELY
+            let cImmediate = SemanticClassification(
+                categoryId: AutoActivityIds.nonWork,
+                confidence: 0.82,
+                probabilities: [AutoActivityIds.nonWork: 0.84],
+                sameTaskAsPrevious: 0.52,
+                isDistraction: 0.90,
+                source: .jev,
+                classifiedAt: t0.addingTimeInterval(120)
+            )
+            let dImmediate = tracker.apply(classification: cImmediate, contextKey: "browser|chrome|bilibili.com|video", at: t0.addingTimeInterval(120))
+            try checkEqual(dImmediate.committedCategoryId, AutoActivityIds.nonWork, "High-confidence switch (>= 0.80 & same <= 0.60) must commit immediately without waiting")
+            try checkEqual(dImmediate.didSwitch, true, "High-confidence immediate switch must set didSwitch=true")
+
+            // 5. Cache hit within 300s TTL & OCR-upgrade cache bypass
+            let cached = tracker.cachedClassification(for: "app|obsidian|hermes-q4", budgetsVersion: 1, at: t0.addingTimeInterval(200))
+            try checkEqual(cached?.categoryId, "hermes", "Same contextKey within TTL should hit local cache")
+            try checkEqual(tracker.cachedClassification(for: "app|obsidian|hermes-q4", budgetsVersion: 2, at: t0.addingTimeInterval(200)), nil, "Budget change should invalidate cache")
+            try checkEqual(
+                tracker.cachedClassification(for: "app|obsidian|hermes-q4", budgetsVersion: 1, hasFreshOCR: true, at: t0.addingTimeInterval(200)),
+                nil,
+                "OCR-less cache entry must bypass once when fresh OCR arrives for the window"
+            )
+            tracker.storeCache(cSwitch, for: "app|obsidian|hermes-q4", budgetsVersion: 1, usedOCR: true, at: t0.addingTimeInterval(205))
+            try checkEqual(
+                tracker.cachedClassification(for: "app|obsidian|hermes-q4", budgetsVersion: 1, hasFreshOCR: true, at: t0.addingTimeInterval(210))?.categoryId,
+                "hermes",
+                "Cache entry already classified with OCR should hit cache"
+            )
+
+            // 6. Manual correction immediately commits and remembers contextKey for the day
+            tracker.recordManualSelection(categoryId: "infra-billing", contextKey: "app|terminal|zsh", at: t0.addingTimeInterval(220))
+            try checkEqual(tracker.currentCategoryId, "infra-billing", "Manual selection should immediately update currentCategoryId")
+            try checkEqual(tracker.manualOverride(for: "app|terminal|zsh"), "infra-billing", "Manual override should be remembered for that contextKey")
+        }
+
+        try await runCheck("63. JevActivityClient two-layer & zero-project schema + response decoding via MockJevTransport") {
+            let t0 = baseDate()
+            let capturedRequest = LockedBox<URLRequest?>(nil)
+            let mockResponseJSON = #"""
+            {
+              "model": "jev-1.14.0",
+              "answers": {
+                "activity_mode": {
+                  "type": "choice",
+                  "choice": "operate",
+                  "confidence": 0.96,
+                  "probabilities": {
+                    "operate": 0.96,
+                    "build": 0.02,
+                    "break": 0.02
+                  }
+                },
+                "focus_project": {
+                  "type": "choice",
+                  "choice": "ecommerce",
+                  "confidence": 0.94,
+                  "probabilities": {
+                    "ecommerce": 0.95,
+                    "none": 0.05
+                  }
+                },
+                "same_task": {
+                  "type": "noul",
+                  "noul": 0.89
+                }
+              },
+              "usage": {
+                "input_tokens": 612,
+                "output_tokens": 58
+              }
+            }
+            """#
+
+            let transport = MockJevTransport { request in
+                capturedRequest.set(request)
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (Data(mockResponseJSON.utf8), resp)
+            }
+            let client = JevActivityClient(transport: transport)
+            let input = SemanticClassificationInput(
+                timestamp: t0,
+                contextKey: "app|photoshop|banner.psd",
+                appName: "Adobe Photoshop",
+                bundleId: "com.adobe.Photoshop",
+                windowTitle: "banner.psd",
+                url: nil,
+                ocrSnippet: "SKU-101 秋季新品主图",
+                redacted: false,
+                recentHistory: [
+                    SemanticHistoryEntry(appName: "Google Chrome", windowTitle: "Example Shop 主图管理", domain: "shop.example.com", durationSeconds: 240)
+                ],
+                budgets: [
+                    TaskBudget(taskId: "ecommerce", displayName: "电商运营", description: "选品与主图优化", colorHex: "#3B82F6", targetMinutes: 90)
+                ]
+            )
+
+            let result = try await client.classify(input: input, apiKey: "mock_key_abc", model: "jev-latest")
+            try checkEqual(result.categoryId, "ecommerce", "Matched focus project should become resolved categoryId")
+            try checkEqual(result.activityMode, .operate, "Parsed activityMode should match .operate")
+            try checkEqual(result.focusProjectId, "ecommerce", "Parsed focusProjectId should match ecommerce")
+            try checkApprox(result.confidence, 0.96, "Parsed confidence should match 0.96")
+            try checkApprox(result.isDistraction, 0.02, "Parsed distraction probability should match break prob 0.02")
+            try checkApprox(result.sameTaskAsPrevious ?? -1, 0.89, "Parsed same_task noul should match 0.89")
+
+            let req = capturedRequest.get()
+            try checkEqual(req?.httpMethod, "POST", "Jev endpoint must use POST")
+            try checkEqual(req?.value(forHTTPHeaderField: "Authorization"), "Bearer mock_key_abc", "Bearer auth header must be set")
+            let bodyObj = try JSONSerialization.jsonObject(with: req?.httpBody ?? Data()) as? [String: Any]
+            let questions = bodyObj?["questions"] as? [String: Any]
+            let modeQ = questions?["activity_mode"] as? [String: Any]
+            let modeCriteria = modeQ?["criteria"] as? [String: String]
+            try checkEqual(modeCriteria?.count, ActivityMode.allCases.count, "activity_mode must include all 6 Layer-1 modes")
+            try check(modeCriteria?[ActivityMode.build.rawValue]?.contains("GitHub") == true, "build criteria should explicitly cover GitHub code repositories")
+            let projQ = questions?["focus_project"] as? [String: Any]
+            let projCriteria = projQ?["criteria"] as? [String: String]
+            try check(projCriteria?["ecommerce"]?.contains("选品与主图优化") == true, "Focus project criteria should include description")
+            try check(projCriteria?["none"] != nil, "Focus project criteria should include 'none'")
+            try check(questions?["same_task"] != nil, "Non-empty recentHistory should include same_task question")
+
+            // Zero-project mode: budgets=[] must omit focus_project question
+            let zeroPayload = JevActivityClient.buildRequestPayload(
+                input: SemanticClassificationInput(timestamp: t0, contextKey: "app|zed|main", appName: "Zed", windowTitle: "main.swift", budgets: []),
+                model: "jev-latest"
+            )
+            let zeroQuestions = zeroPayload["questions"] as? [String: Any]
+            try check(zeroQuestions?["activity_mode"] != nil, "Zero-project payload must include activity_mode")
+            try check(zeroQuestions?["focus_project"] == nil, "Zero-project payload must omit focus_project")
+        }
+
+        try await runCheck("64. DayHelmEngine auto-activity attribution for planned, otherWork & nonWork") {
+            let t0 = baseDate()
+            let clock = ManualClock(now: t0)
+            let engine = DayHelmEngine(budgets: sampleBudgets(), clock: clock)
+            engine.setAutoTrackingActive(true)
+
+            // Auto-attribute to otherWork for 10 minutes
+            engine.applyAutoCategory(AutoActivityIds.otherWork, at: t0)
+            for minute in 1...10 {
+                let ts = t0.addingTimeInterval(TimeInterval(minute * 60))
+                clock.advance(by: 60)
+                let alerts = engine.ingest(ActivitySample(timestamp: ts, appName: "Mail", windowTitle: "Office Lease", idleSeconds: 1))
+                try check(!alerts.contains(where: { if case .unassignedActivePrompt = $0.kind { return true }; return false }), "Auto-tracking should suppress manual unassignedActivePrompt")
+            }
+            try checkApprox(engine.otherWorkMinutes, 10.0, tolerance: 0.05, "otherWorkMinutes should accumulate 10m")
+
+            // Switch to nonWork for 5 minutes
+            let t1 = t0.addingTimeInterval(10 * 60)
+            engine.applyAutoCategory(AutoActivityIds.nonWork, at: t1)
+            for minute in 1...5 {
+                let ts = t1.addingTimeInterval(TimeInterval(minute * 60))
+                clock.advance(by: 60)
+                _ = engine.ingest(ActivitySample(timestamp: ts, appName: "Google Chrome", windowTitle: "Entertainment Video", idleSeconds: 1))
+            }
+            try checkApprox(engine.nonWorkMinutes, 5.0, tolerance: 0.05, "nonWorkMinutes should accumulate 5m")
+
+            // Switch to planned task ecommerce for 12 minutes
+            let t2 = t1.addingTimeInterval(5 * 60)
+            engine.applyAutoCategory("ecommerce", at: t2)
+            for minute in 1...12 {
+                let ts = t2.addingTimeInterval(TimeInterval(minute * 60))
+                clock.advance(by: 60)
+                _ = engine.ingest(ActivitySample(timestamp: ts, appName: "Google Chrome", windowTitle: "Example Shop", idleSeconds: 1))
+            }
+            try checkApprox(engine.focusedMinutes(for: "ecommerce"), 12.0, tolerance: 0.05, "Planned task should accumulate 12m automatically")
+            try checkApprox(engine.otherWorkMinutes, 10.0, tolerance: 0.05, "otherWorkMinutes should stop incrementing when switched to planned task")
+        }
+
+        try await runCheck("65. Coordinator + Jev end-to-end auto-tracking, API key prompt & MenuBar text labels") {
+            let t0 = baseDate()
+            let clock = ManualClock(now: t0)
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-65-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let store = DayHelmStore(directory: tmpDir)
+            let keyStore = JevAPIKeyStore(directory: tmpDir, environment: [:], dotEnvSearchPaths: [])
+            let callCount = LockedBox<Int>(0)
+            let nextChoice = LockedBox<(String, Double, Double)>(("ecommerce", 0.96, 0.04))
+
+            let mockJevTransport = MockJevTransport { request in
+                callCount.modify { $0 += 1 }
+                let (choice, conf, dist) = nextChoice.get()
+                let json = """
+                {
+                  "model": "jev-1.14.0",
+                  "answers": {
+                    "project": { "type": "choice", "choice": "\(choice)", "confidence": \(conf), "probabilities": { "\(choice)": \(conf) } },
+                    "is_distraction": { "type": "noul", "noul": \(dist) },
+                    "same_task_as_previous": { "type": "noul", "noul": 0.12 }
+                  },
+                  "usage": { "input_tokens": 500, "output_tokens": 40 }
+                }
+                """
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (Data(json.utf8), resp)
+            }
+
+            let engine = DayHelmEngine(budgets: sampleBudgets(), clock: clock)
+            let inspector = MockInspector(currentSample: ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Example Shop — 主图优化",
+                url: "https://shop.example.com/item/1",
+                idleSeconds: 0,
+                screenLocked: false,
+                inputActive: true
+            ))
+            let coordinator = await MainActor.run {
+                HybridActivityCoordinator(
+                    engine: engine,
+                    store: store,
+                    almaClient: AlmaActivityClient(baseURL: URL(string: "http://127.0.0.1:1")!, transport: MockAlmaTransport { _ in throw URLError(.cannotConnectToHost) }),
+                    inspector: inspector,
+                    clock: clock,
+                    jevClient: JevActivityClient(transport: mockJevTransport),
+                    jevAPIKeyStore: keyStore
+                )
+            }
+
+            // Enable Jev without key -> should flag jevNeedsAPIKey and make 0 API calls
+            await MainActor.run {
+                var s = coordinator.recorderSettings
+                s.jevAutoTrackingEnabled = true
+                s.menuBarDisplayMode = .standard
+                coordinator.updateRecorderSettings(s)
+            }
+            try await MainActor.run {
+                try checkEqual(coordinator.jevNeedsAPIKey, true, "Enabling Jev without key must prompt user for API key")
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 6)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Example Shop — 主图优化", url: "https://shop.example.com/item/1", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try checkEqual(callCount.get(), 0, "Missing API key must make zero outbound Jev calls")
+
+            // Configure API key -> auto-classifies after >= 4s dwell and updates MenuBar label
+            try await MainActor.run {
+                try coordinator.saveJevAPIKey("synthetic_live_key")
+                try checkEqual(coordinator.jevNeedsAPIKey, false, "Saving API key should clear jevNeedsAPIKey prompt")
+                coordinator.pollOnce()
+            }
+            try await waitUntil("Jev cold-start auto-attribution to ecommerce") {
+                await MainActor.run {
+                    if case .focusing(let id, _) = coordinator.sessionState, id == "ecommerce" {
+                        return true
+                    }
+                    return false
+                }
+            }
+            try await MainActor.run {
+                try check(coordinator.pillModel.text.hasPrefix("电商做深 "), "Menu bar should display text label for auto-tracked project (got: \(coordinator.pillModel.text))")
+            }
+
+            // Polling same window again hits cache (still 1 API call)
+            clock.advance(by: 60)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Example Shop — 主图优化", url: "https://shop.example.com/item/1", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try checkEqual(callCount.get(), 1, "Repeated polling of same cached context must not re-call Jev")
+            try await MainActor.run {
+                try checkEqual(coordinator.pillModel.text, "电商做深 1/90m", "Auto-attributed planned task should accumulate 1m in menu bar")
+            }
+
+            // Switch to otherWork -> fast switch at >= 8s dwell -> menu bar shows Layer-1 ActivityMode (沟通杂务)
+            nextChoice.set((AutoActivityIds.otherWork, 0.95, 0.05))
+            clock.advance(by: 2)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Mail", bundleId: "com.apple.mail", windowTitle: "Office Lease Contract", url: nil, idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 5)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Mail", bundleId: "com.apple.mail", windowTitle: "Office Lease Contract", url: nil, idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try await waitUntil("Jev classifies Mail as otherWork") {
+                callCount.get() >= 2
+            }
+            clock.advance(by: 10)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Mail", bundleId: "com.apple.mail", windowTitle: "Office Lease Contract", url: nil, idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 60)
+            try await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Mail", bundleId: "com.apple.mail", windowTitle: "Office Lease Contract", url: nil, idleSeconds: 0)
+                coordinator.pollOnce()
+                try checkEqual(coordinator.pillModel.visualState, .otherWork, "Menu bar visualState should reflect otherWork")
+                try checkEqual(coordinator.pillModel.text, "沟通杂务 1m", "Menu bar should show Layer-1 ActivityMode label + elapsed minutes when no focus project matches")
+            }
+
+            // Switch to nonWork (distraction) -> menu bar shows 休息分心
+            nextChoice.set((AutoActivityIds.nonWork, 0.98, 0.95))
+            clock.advance(by: 2)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Fun Video - Bilibili", url: "https://www.bilibili.com/video/1", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 5)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Fun Video - Bilibili", url: "https://www.bilibili.com/video/1", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try await waitUntil("Jev classifies Bilibili as nonWork") {
+                callCount.get() >= 3
+            }
+            clock.advance(by: 10)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Fun Video - Bilibili", url: "https://www.bilibili.com/video/1", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 60)
+            try await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Fun Video - Bilibili", url: "https://www.bilibili.com/video/1", idleSeconds: 0)
+                coordinator.pollOnce()
+                try checkEqual(coordinator.pillModel.visualState, .distraction, "Menu bar visualState should reflect distraction")
+                try checkEqual(coordinator.pillModel.text, "休息分心 1m", "Menu bar should show Layer-1 break label + elapsed minutes for distraction")
+            }
+        }
+
+        try await runCheck("66. JevDecisionLogEntry recording, persistence, metrics & clearing") {
+            let t0 = baseDate()
+            let clock = ManualClock(now: t0)
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-66-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let store = DayHelmStore(directory: tmpDir)
+            let keyStore = JevAPIKeyStore(directory: tmpDir, environment: [:], dotEnvSearchPaths: [])
+            try keyStore.saveKey("synthetic_log_key")
+
+            let mockJevTransport = MockJevTransport { request in
+                let json = """
+                {
+                  "model": "jev-1.14.0",
+                  "answers": {
+                    "project": { "type": "choice", "choice": "infra-billing", "confidence": 0.93, "probabilities": { "infra-billing": 0.94 } },
+                    "is_distraction": { "type": "noul", "noul": 0.04 },
+                    "same_task_as_previous": { "type": "noul", "noul": 0.11 }
+                  },
+                  "usage": { "input_tokens": 688, "output_tokens": 42 }
+                }
+                """
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (Data(json.utf8), resp)
+            }
+
+            let engine = DayHelmEngine(budgets: sampleBudgets(), clock: clock)
+            let inspector = MockInspector(currentSample: ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "AWS Cost Explorer - Billing",
+                url: "https://console.aws.amazon.com/costmanagement",
+                idleSeconds: 0,
+                screenLocked: false,
+                inputActive: true
+            ))
+
+            let coordinator = await MainActor.run {
+                HybridActivityCoordinator(
+                    engine: engine,
+                    store: store,
+                    almaClient: AlmaActivityClient(baseURL: URL(string: "http://127.0.0.1:1")!, transport: MockAlmaTransport { _ in throw URLError(.cannotConnectToHost) }),
+                    inspector: inspector,
+                    clock: clock,
+                    jevClient: JevActivityClient(transport: mockJevTransport),
+                    jevAPIKeyStore: keyStore
+                )
+            }
+
+            await MainActor.run {
+                var s = coordinator.recorderSettings
+                s.jevAutoTrackingEnabled = true
+                coordinator.updateRecorderSettings(s)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 5)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(
+                    timestamp: clock.now(),
+                    appName: "Google Chrome",
+                    bundleId: "com.google.Chrome",
+                    windowTitle: "AWS Cost Explorer - Billing",
+                    url: "https://console.aws.amazon.com/costmanagement",
+                    idleSeconds: 0,
+                    screenLocked: false,
+                    inputActive: true
+                )
+                coordinator.pollOnce()
+            }
+
+            try await waitUntil("Jev decision log recorded") {
+                await MainActor.run { !coordinator.jevDecisionLogs.isEmpty }
+            }
+
+            try await MainActor.run {
+                let first = try {
+                    guard let entry = coordinator.jevDecisionLogs.first else {
+                        throw CheckFailure(description: "Expected at least one JevDecisionLogEntry")
+                    }
+                    return entry
+                }()
+                try checkEqual(first.predictedCategoryId, "infra-billing", "Log entry should capture predictedCategoryId")
+                try checkEqual(first.predictedDisplayName, "Infra 维护", "Log entry should resolve displayName")
+                try checkEqual(first.outcome, .committedSwitch, "Cold-start high-confidence should log committedSwitch")
+                try checkEqual(first.inputTokens, 688, "Log entry should capture inputTokens")
+                try checkEqual(first.domain, "amazon.com", "Log entry should capture registrable domain")
+                try checkEqual(coordinator.pillModel.text, "Infra 维护 0/30m", "Menu bar should show full 'Infra 维护' without ellipsis")
+
+                let persisted = store.loadJevDecisionLogs(forDate: DayHelmDateFormatting.dayString(from: t0))
+                try checkEqual(persisted.count, 1, "Jev decision log should persist to jev-log.json for current day")
+
+                coordinator.clearJevDecisionLogs()
+                try checkEqual(coordinator.jevDecisionLogs.count, 0, "clearJevDecisionLogs should clear in-memory logs")
+                try checkEqual(store.loadJevDecisionLogs(forDate: DayHelmDateFormatting.dayString(from: t0)).count, 0, "clearJevDecisionLogs should clear persisted logs")
+            }
+        }
+
+        try await runCheck("67. Zero-project Layer-1 auto-tracking, semantic switch suppression & OCR gating") {
+            let t0 = baseDate()
+
+            // 1. OCR gating: strong single-purpose title skips OCR; weak titles & multi-purpose dashboards/workbenches attach body-cleaned OCR
+            try checkEqual(SemanticPayloadSanitizer.shouldAttachOCR(appName: "Google Chrome", windowTitle: "商品上货-抖店妙手", url: "https://shop.example.com/move"), false, "Clear single-purpose title+URL should skip full-screen OCR")
+            try checkEqual(SemanticPayloadSanitizer.shouldAttachOCR(appName: "Google Chrome", windowTitle: "Hermes Agent - Dashboard - Google Chrome", url: "http://127.0.0.1:8787/dashboard"), true, "Multi-purpose Hermes Dashboard must attach body OCR")
+            try checkEqual(SemanticPayloadSanitizer.shouldAttachOCR(appName: "Google Chrome", windowTitle: "Discord | 电商计划", url: "https://discord.com/channels/1/2"), true, "Multi-purpose Discord channel must attach body OCR")
+            try checkEqual(SemanticPayloadSanitizer.shouldAttachOCR(appName: "QQ", windowTitle: "QQ", url: nil), true, "Weak app-only title should attach OCR")
+            try checkEqual(SemanticPayloadSanitizer.shouldAttachOCR(appName: "Obsidian", windowTitle: "2026-11-19 - Vault", url: nil), true, "Date-only journal title should attach OCR")
+            let noisyOCR = "Chrome 文件 编辑 显示 历史记录 书签 个人资料 标签页 窗口 帮助\n正文第一行 电商选品分析"
+            let cleanedOCR = SemanticPayloadSanitizer.stripTopChromeNoise(from: noisyOCR)
+            try check(!cleanedOCR.contains("历史记录"), "stripTopChromeNoise should drop leading macOS menu-bar line")
+            try check(cleanedOCR.contains("电商选品分析"), "stripTopChromeNoise should preserve body text")
+
+            // Address-bar anchor stripping removes macOS menu bar + Chrome background tabs and keeps Hermes body
+            let browserOCR = [
+                "Chrome 文件 编辑 显示 历史记录 书签 窗口 帮助",
+                "开发构建 12m  11:24",
+                "GitHub - focus-guard  |  Claude  |  Hermes Agent - Dashboard",
+                "http://127.0.0.1:8787/dashboard",
+                "Hermes Agent",
+                "电商任务看板 · 抖店选品与主图巡检 · 每日定时任务"
+            ].joined(separator: "\n")
+            let browserBody = SemanticPayloadSanitizer.stripTopChromeNoise(from: browserOCR, url: "http://127.0.0.1:8787/dashboard")
+            try check(!browserBody.contains("GitHub - focus-guard"), "Address-bar anchored stripping must drop Chrome background tab titles")
+            try check(browserBody.contains("电商任务看板"), "Address-bar anchored stripping must keep actual page body")
+
+            // Fine-grained semanticContextKey distinguishes different pages/channels on same domain while ignoring unread badge jitter
+            let discordEcom = ActivitySample(timestamp: t0, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "(413) Discord | 电商计划 - Google Chrome", url: "https://discord.com/channels/1/2", idleSeconds: 0)
+            let discordEcomUnread = ActivitySample(timestamp: t0, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "(414) Discord | 电商计划 - Google Chrome", url: "https://discord.com/channels/1/2", idleSeconds: 0)
+            let discordDev = ActivitySample(timestamp: t0, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Discord | 内容创作 - Google Chrome", url: "https://discord.com/channels/1/3", idleSeconds: 0)
+            try checkEqual(
+                SemanticPayloadSanitizer.semanticContextKey(for: discordEcom),
+                SemanticPayloadSanitizer.semanticContextKey(for: discordEcomUnread),
+                "Unread count jitter should share the same semanticContextKey"
+            )
+            try check(
+                SemanticPayloadSanitizer.semanticContextKey(for: discordEcom) != SemanticPayloadSanitizer.semanticContextKey(for: discordDev),
+                "Different Discord channels on discord.com must have distinct semanticContextKeys"
+            )
+            try checkEqual(JevDecisionOutcome.pendingConfirmation.displayName, "防抖观察", "Pending outcome label must clarify automatic anti-flicker dwell, not user confirmation")
+
+            // Auxiliary overlays & blank browser new-tab transitions should skip outbound Jev calls
+            let xnipSample = ActivitySample(timestamp: t0, appName: "Xnip Helper", bundleId: "com.xnipapp.Xnip", windowTitle: "Window", url: nil, idleSeconds: 0)
+            let newTabSample = ActivitySample(timestamp: t0, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "新标签页 - Google Chrome", url: "chrome://newtab/", idleSeconds: 0)
+            let wechatSample = ActivitySample(timestamp: t0, appName: "微信", bundleId: "com.tencent.xinWeChat", windowTitle: nil, url: nil, idleSeconds: 0, redacted: true)
+            try checkEqual(SemanticPayloadSanitizer.shouldSkipSemanticClassification(sample: xnipSample), true, "Screenshot helper overlay should skip Jev")
+            try checkEqual(SemanticPayloadSanitizer.shouldSkipSemanticClassification(sample: newTabSample), true, "Blank browser New Tab page should skip Jev")
+            try checkEqual(SemanticPayloadSanitizer.shouldSkipSemanticClassification(sample: wechatSample), false, "Redacted WeChat must still be classified as comms_admin")
+
+            // 2. Semantic switch suppression: 12 rapid cross-app spans in same semanticGroup "mode:build" produce 0 thrashing windows
+            var sameSemSpans: [EnrichedSpan] = []
+            let apps = [("T3 Code", "com.t3.code", "A.swift"), ("Google Chrome", "com.google.Chrome", "Claude"), ("Ghostty", "com.mitchellh.ghostty", "zsh"), ("Electron", "com.electron.dev", "Preview")]
+            for i in 0..<14 {
+                let s = t0.addingTimeInterval(Double(i * 15))
+                let item = apps[i % apps.count]
+                sameSemSpans.append(EnrichedSpan(
+                    startedAt: s,
+                    endedAt: s.addingTimeInterval(14),
+                    appName: item.0,
+                    bundleId: item.1,
+                    windowTitle: "\(item.2) \(i)",
+                    url: item.0 == "Google Chrome" ? "https://claude.ai/chat/\(i)" : nil,
+                    semanticGroup: "mode:build"
+                ))
+            }
+            let semThrashing = SpectrumBuilder.detectThrashingWindows(spans: sameSemSpans, budgets: [])
+            try checkEqual(semThrashing.count, 0, "Cross-app collaboration sharing the same semanticGroup must never trigger thrashing")
+
+            // 3. Zero-project coordinator flow: budgets == [] automatically displays Layer-1 ActivityMode in MenuBar
+            let clock = ManualClock(now: t0)
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-67-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let store = DayHelmStore(directory: tmpDir)
+            let keyStore = JevAPIKeyStore(directory: tmpDir, environment: [:], dotEnvSearchPaths: [])
+            try keyStore.saveKey("synthetic_zero_proj_key")
+
+            let nextMode = LockedBox<(String, Double)>((ActivityMode.build.rawValue, 0.96))
+            let mockTransport = MockJevTransport { request in
+                let (m, conf) = nextMode.get()
+                let json = """
+                {
+                  "model": "jev-1.14.0",
+                  "answers": {
+                    "activity_mode": { "type": "choice", "choice": "\(m)", "confidence": \(conf), "probabilities": { "\(m)": \(conf) } },
+                    "same_task": { "type": "noul", "noul": 0.10 }
+                  },
+                  "usage": { "input_tokens": 520, "output_tokens": 30 }
+                }
+                """
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (Data(json.utf8), resp)
+            }
+
+            let engine = DayHelmEngine(budgets: [], clock: clock)
+            let inspector = MockInspector(currentSample: ActivitySample(timestamp: t0, appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0))
+            let coordinator = await MainActor.run {
+                HybridActivityCoordinator(
+                    engine: engine,
+                    store: store,
+                    almaClient: AlmaActivityClient(baseURL: URL(string: "http://127.0.0.1:1")!, transport: MockAlmaTransport { _ in throw URLError(.cannotConnectToHost) }),
+                    inspector: inspector,
+                    clock: clock,
+                    jevClient: JevActivityClient(transport: mockTransport),
+                    jevAPIKeyStore: keyStore
+                )
+            }
+
+            await MainActor.run {
+                var s = coordinator.recorderSettings
+                s.jevAutoTrackingEnabled = true
+                coordinator.updateRecorderSettings(s)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 5)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try await waitUntil("Zero-project cold-start auto-classifies as build") {
+                await MainActor.run { coordinator.activeActivityMode == .build }
+            }
+            clock.advance(by: 60)
+            try await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0)
+                coordinator.pollOnce()
+                try checkEqual(coordinator.pillModel.text, "开发构建 1m", "Zero-project mode should display Layer-1 ActivityMode + elapsed minutes")
+                try checkEqual(coordinator.pillModel.visualState, .focusing, "Active build mode should show focusing dot")
+            }
+
+            // Switch to break -> menu bar shows 休息分心
+            nextMode.set((ActivityMode.breakTime.rawValue, 0.99))
+            clock.advance(by: 2)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "主页 / X", url: "https://x.com/home", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 5)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "主页 / X", url: "https://x.com/home", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try await waitUntil("Jev classifies X home as break") {
+                await MainActor.run { coordinator.jevDecisionLogs.first?.activityMode == .breakTime }
+            }
+            clock.advance(by: 10)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "主页 / X", url: "https://x.com/home", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 60)
+            try await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "主页 / X", url: "https://x.com/home", idleSeconds: 0)
+                coordinator.pollOnce()
+                try checkEqual(coordinator.pillModel.text, "休息分心 1m", "Break mode should display 休息分心 in menu bar")
+                try checkEqual(coordinator.pillModel.visualState, .distraction, "Break mode should show distraction red dot")
+            }
+        }
+
+        try await runCheck("68. 3-minute idle backtrack deduction, auto-resume vs manual pause, sleep & gap cap") {
+            let t0 = baseDate()
+
+            // 1. Default idle threshold is 3 minutes (180s / 180_000ms)
+            try checkApprox(DayHelmEngineConfig.default.idleThresholdSeconds, 180.0, "Default DayHelmEngineConfig idle threshold must be 180s (3m)")
+            try checkEqual(DayHelmSettings.default.recorderIdleThresholdMs, 180_000, "Default DayHelmSettings recorderIdleThresholdMs must be 180_000ms (3m)")
+
+            // 2. Live 2s polling: 5m active + 3m walking away (idle ramps 2..180s) -> backtracks the 3m idle time cleanly
+            let clock = ManualClock(now: t0)
+            let engine = DayHelmEngine(
+                budgets: sampleBudgets(),
+                clock: clock,
+                config: DayHelmEngineConfig(maxTickGapSeconds: 60.0)
+            )
+            engine.applyAutoCategory("ecommerce", activityMode: .operate, at: t0)
+
+            // 5 minutes of active work (2s ticks)
+            for step in 1...150 {
+                let ts = t0.addingTimeInterval(TimeInterval(step * 2))
+                clock.advance(by: 2)
+                engine.ingest(ActivitySample(timestamp: ts, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop", url: "https://shop.example.com", idleSeconds: 0, screenLocked: false, inputActive: true))
+            }
+            try checkApprox(engine.focusedMinutes(for: "ecommerce"), 5.0, tolerance: 0.05, "5m active work should accumulate 5.0m")
+            try checkApprox(engine.activityModeMinutes[ActivityMode.operate.rawValue] ?? 0, 5.0, tolerance: 0.05, "Layer-1 operate mode should accumulate 5.0m")
+
+            // User walks away without locking screen: idle climbs 2s..180s over 3 minutes
+            let leaveAt = t0.addingTimeInterval(300)
+            for step in 1...90 {
+                let idleSec = TimeInterval(step * 2)
+                let ts = leaveAt.addingTimeInterval(idleSec)
+                clock.advance(by: 2)
+                engine.ingest(ActivitySample(timestamp: ts, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop", url: "https://shop.example.com", idleSeconds: idleSec, screenLocked: false, inputActive: false))
+            }
+            let pausedAt = leaveAt.addingTimeInterval(180)
+            try checkEqual(engine.focusState, .paused(taskId: "ecommerce", pausedAt: pausedAt), "Idle >= 180s must auto-pause focus")
+            try checkApprox(engine.focusedMinutes(for: "ecommerce"), 5.0, tolerance: 0.05, "3m unoperated idle tail must be backtracked & deducted from focusedMinutes")
+            try checkApprox(engine.activityModeMinutes[ActivityMode.operate.rawValue] ?? 0, 5.0, tolerance: 0.05, "3m unoperated idle tail must be backtracked & deducted from activityModeMinutes")
+
+            // 3. Returning after auto-pause automatically resumes focus without manual click
+            let returnAt = pausedAt.addingTimeInterval(120)
+            clock.advance(by: 120)
+            engine.ingest(ActivitySample(timestamp: returnAt, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop", url: "https://shop.example.com", idleSeconds: 0, screenLocked: false, inputActive: true))
+            if case .focusing(let resumedId, _) = engine.focusState {
+                try checkEqual(resumedId, "ecommerce", "Returning after idle auto-pause must auto-resume the previous focus task")
+            } else {
+                throw CheckFailure(description: "Expected auto-resume to .focusing after idle auto-pause, got \(engine.focusState)")
+            }
+            // Active 1 minute after returning
+            for step in 1...30 {
+                let ts = returnAt.addingTimeInterval(TimeInterval(step * 2))
+                clock.advance(by: 2)
+                engine.ingest(ActivitySample(timestamp: ts, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop", url: "https://shop.example.com", idleSeconds: 0, screenLocked: false, inputActive: true))
+            }
+            try checkApprox(engine.focusedMinutes(for: "ecommerce"), 6.0, tolerance: 0.05, "Auto-resumed session should accumulate +1m (total 6.0m)")
+
+            // 4. System sleep (2 hours) + wake must add 0.0m, and >60s sudden wall-clock jump must also add 0.0m
+            let sleepAt = returnAt.addingTimeInterval(60)
+            engine.handleSystemSleep(at: sleepAt)
+            let wakeAt = sleepAt.addingTimeInterval(7200)
+            clock.advance(by: 7200)
+            engine.ingest(ActivitySample(timestamp: wakeAt, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop", url: "https://shop.example.com", idleSeconds: 0, screenLocked: false, inputActive: true))
+            try checkApprox(engine.focusedMinutes(for: "ecommerce"), 6.0, tolerance: 0.05, "2-hour system sleep must never add active minutes")
+
+            // Sudden unannounced 30-minute wall-clock jump (even without will_sleep) must be rejected by maxTickGapSeconds
+            let jumpAt = wakeAt.addingTimeInterval(1800)
+            clock.advance(by: 1800)
+            engine.ingest(ActivitySample(timestamp: jumpAt, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop", url: "https://shop.example.com", idleSeconds: 0, screenLocked: false, inputActive: true))
+            try checkApprox(engine.focusedMinutes(for: "ecommerce"), 6.0, tolerance: 0.05, "Tick gap > maxTickGapSeconds (60s) must not accumulate ghost time")
+
+            // 5. Manual pause must NOT auto-resume when user stays active
+            engine.pauseFocus(at: jumpAt)
+            let afterManualPause = jumpAt.addingTimeInterval(10)
+            clock.advance(by: 10)
+            engine.ingest(ActivitySample(timestamp: afterManualPause, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop", url: "https://shop.example.com", idleSeconds: 0, screenLocked: false, inputActive: true))
+            try checkEqual(engine.focusState, .paused(taskId: "ecommerce", pausedAt: jumpAt), "Manual pause must remain paused even when active samples arrive")
+
+            // 6. Zero-project Layer-1 ActivityMode also backtracks 3m idle cleanly
+            let zeroClock = ManualClock(now: t0)
+            let zeroEngine = DayHelmEngine(budgets: [], clock: zeroClock, config: DayHelmEngineConfig(maxTickGapSeconds: 60.0))
+            zeroEngine.applyAutoCategory(AutoActivityIds.modeCategoryId(for: .build), activityMode: .build, at: t0)
+            for step in 1...120 { // 4m active
+                let ts = t0.addingTimeInterval(TimeInterval(step * 2))
+                zeroClock.advance(by: 2)
+                zeroEngine.ingest(ActivitySample(timestamp: ts, appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", url: nil, idleSeconds: 0))
+            }
+            for step in 1...90 { // 3m idle
+                let idleSec = TimeInterval(step * 2)
+                let ts = t0.addingTimeInterval(240 + idleSec)
+                zeroClock.advance(by: 2)
+                zeroEngine.ingest(ActivitySample(timestamp: ts, appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", url: nil, idleSeconds: idleSec))
+            }
+            try checkApprox(zeroEngine.activityModeMinutes[ActivityMode.build.rawValue] ?? 0, 4.0, tolerance: 0.05, "Zero-project Layer-1 mode must backtrack & deduct 3m idle tail (keep exact 4.0m)")
+        }
+
+        try await runCheck("69. Sub-2s event-driven Jev switching, anti-flicker Cmd+Tab filtering & cache dwell protection") {
+            let t0 = baseDate()
+
+            // Part A: Deterministic Cmd+Tab & cached pass-through anti-flicker + zero API surge
+            let clock = ManualClock(now: t0)
+            let tmpDirA = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-69a-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDirA, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDirA) }
+
+            let storeA = DayHelmStore(directory: tmpDirA)
+            let keyStoreA = JevAPIKeyStore(directory: tmpDirA, environment: [:], dotEnvSearchPaths: [])
+            try keyStoreA.saveKey("synthetic_fast_key")
+
+            let callsA = LockedBox<Int>(0)
+            let nextResponseA = LockedBox<(String, Double, Double)>((ActivityMode.build.rawValue, 0.95, 0.10))
+            let mockTransportA = MockJevTransport { request in
+                callsA.modify { $0 += 1 }
+                let (mode, conf, same) = nextResponseA.get()
+                let json = """
+                {
+                  "model": "jev-1.14.0",
+                  "answers": {
+                    "activity_mode": { "type": "choice", "choice": "\(mode)", "confidence": \(conf), "probabilities": { "\(mode)": \(conf) } },
+                    "same_task": { "type": "noul", "noul": \(same) }
+                  },
+                  "usage": { "input_tokens": 500, "output_tokens": 20 }
+                }
+                """
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (Data(json.utf8), resp)
+            }
+
+            let engineA = DayHelmEngine(budgets: [], clock: clock)
+            let inspectorA = MockInspector(currentSample: ActivitySample(timestamp: t0, appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0))
+            let coordA = await MainActor.run {
+                HybridActivityCoordinator(
+                    engine: engineA,
+                    store: storeA,
+                    almaClient: AlmaActivityClient(baseURL: URL(string: "http://127.0.0.1:1")!, transport: MockAlmaTransport { _ in throw URLError(.cannotConnectToHost) }),
+                    inspector: inspectorA,
+                    clock: clock,
+                    jevClient: JevActivityClient(transport: mockTransportA),
+                    jevAPIKeyStore: keyStoreA
+                )
+            }
+
+            await MainActor.run {
+                var s = coordA.recorderSettings
+                s.jevAutoTrackingEnabled = true
+                s.menuBarDisplayMode = .standard
+                coordA.updateRecorderSettings(s)
+                // Event-driven app_focus starts dwell tracking immediately without pollOnce()
+                coordA.handleMonitorEventForTesting(NativeMonitorEvent(timestamp: clock.now(), kind: "app_focus", appName: "Zed", bundleId: "dev.zed.Zed"))
+            }
+            clock.advance(by: 0.95)
+            await MainActor.run {
+                inspectorA.currentSample = ActivitySample(timestamp: clock.now(), appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0)
+                coordA.handleWindowContextChangedForTesting()
+            }
+            try await waitUntil("app_focus + 0.95s dwell classifies Zed as build") {
+                await MainActor.run { coordA.activeActivityMode == .build }
+            }
+            try checkEqual(callsA.get(), 1, "Initial classification should take 1 Jev call")
+
+            // Rapid Cmd+Tab cycling across 3 apps (300ms / 400ms / 300ms, all < 0.9s) must produce 0 Jev calls and 0 flicker
+            nextResponseA.set((ActivityMode.breakTime.rawValue, 0.98, 0.05))
+            let blips: [(String, String, String, String?, TimeInterval)] = [
+                ("Google Chrome", "com.google.Chrome", "Bilibili Video", "https://www.bilibili.com/video/1", 0.3),
+                ("Mail", "com.apple.mail", "Inbox", nil, 0.4),
+                ("Google Chrome", "com.google.Chrome", "X Home", "https://x.com/home", 0.3)
+            ]
+            for (app, bundle, title, url, step) in blips {
+                clock.advance(by: step)
+                await MainActor.run {
+                    inspectorA.currentSample = ActivitySample(timestamp: clock.now(), appName: app, bundleId: bundle, windowTitle: title, url: url, idleSeconds: 0)
+                    coordA.handleMonitorEventForTesting(NativeMonitorEvent(timestamp: clock.now(), kind: "app_focus", appName: app, bundleId: bundle))
+                }
+            }
+            try await MainActor.run {
+                try checkEqual(callsA.get(), 1, "Rapid <0.9s Cmd+Tab blips must trigger 0 outbound Jev calls")
+                try checkEqual(coordA.activeActivityMode, .build, "Rapid <0.9s Cmd+Tab blips must not flicker active mode")
+            }
+
+            // Settle on X Home for 0.95s -> switches to breakTime (call #2)
+            clock.advance(by: 0.95)
+            await MainActor.run {
+                inspectorA.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "X Home", url: "https://x.com/home", idleSeconds: 0)
+                coordA.handleWindowContextChangedForTesting()
+            }
+            try await waitUntil("Settling 0.95s on X Home switches to breakTime") {
+                await MainActor.run { coordA.activeActivityMode == .breakTime }
+            }
+            try checkEqual(callsA.get(), 2, "Settling on X Home should trigger 1 Jev call")
+
+            // Cached pass-through back to Zed for only 0.2s (< 0.45s cacheSwitchDwellSeconds) must NOT flicker toolbar
+            clock.advance(by: 0.2)
+            await MainActor.run {
+                inspectorA.currentSample = ActivitySample(timestamp: clock.now(), appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0)
+                coordA.handleMonitorEventForTesting(NativeMonitorEvent(timestamp: clock.now(), kind: "app_focus", appName: "Zed", bundleId: "dev.zed.Zed"))
+            }
+            try await MainActor.run {
+                try checkEqual(coordA.activeActivityMode, .breakTime, "0.2s pass-through over a cached app must not immediately flicker toolbar")
+            }
+            // Stay on cached Zed for 0.5s (>= 0.45s) -> commits from cache with 0 extra Jev calls
+            clock.advance(by: 0.5)
+            try await MainActor.run {
+                inspectorA.currentSample = ActivitySample(timestamp: clock.now(), appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0)
+                coordA.handleWindowContextChangedForTesting()
+                try checkEqual(coordA.activeActivityMode, .build, "Settling >=0.45s on cached app must switch toolbar from cache")
+                try checkEqual(callsA.get(), 2, "Cached switch must make 0 additional Jev calls")
+            }
+
+            // Part B: Real wall-clock timer-driven sub-2s E2E check (simulated 220ms Jev RTT, ZERO pollOnce calls!)
+            let tmpDirB = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-69b-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDirB, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDirB) }
+
+            let storeB = DayHelmStore(directory: tmpDirB)
+            let keyStoreB = JevAPIKeyStore(directory: tmpDirB, environment: [:], dotEnvSearchPaths: [])
+            try keyStoreB.saveKey("synthetic_live_timer_key")
+
+            let callsB = LockedBox<Int>(0)
+            let nextResponseB = LockedBox<(String, Double, Double)>((ActivityMode.breakTime.rawValue, 0.96, 0.05))
+            let mockTransportB = MockJevTransport { request in
+                callsB.modify { $0 += 1 }
+                try await Task.sleep(nanoseconds: 220_000_000) // Realistic 220ms Jev p50 RTT
+                let (mode, conf, same) = nextResponseB.get()
+                let json = """
+                {
+                  "model": "jev-1.14.0",
+                  "answers": {
+                    "activity_mode": { "type": "choice", "choice": "\(mode)", "confidence": \(conf), "probabilities": { "\(mode)": \(conf) } },
+                    "same_task": { "type": "noul", "noul": \(same) }
+                  },
+                  "usage": { "input_tokens": 500, "output_tokens": 20 }
+                }
+                """
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (Data(json.utf8), resp)
+            }
+
+            let sysClock = SystemClock()
+            let engineB = DayHelmEngine(budgets: [], clock: sysClock)
+            let inspectorB = MockInspector(currentSample: ActivitySample(timestamp: sysClock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "主页 / X - Google Chrome", url: "https://x.com/home", idleSeconds: 0))
+            let coordB = await MainActor.run {
+                let c = HybridActivityCoordinator(
+                    engine: engineB,
+                    store: storeB,
+                    almaClient: AlmaActivityClient(baseURL: URL(string: "http://127.0.0.1:1")!, transport: MockAlmaTransport { _ in throw URLError(.cannotConnectToHost) }),
+                    inspector: inspectorB,
+                    clock: sysClock,
+                    jevClient: JevActivityClient(transport: mockTransportB),
+                    jevAPIKeyStore: keyStoreB
+                )
+                c.enableLiveTimersForTesting = true
+                var s = c.recorderSettings
+                s.jevAutoTrackingEnabled = true
+                s.menuBarDisplayMode = .standard
+                c.updateRecorderSettings(s)
+                return c
+            }
+            defer {
+                Task { @MainActor in coordB.stop() }
+            }
+
+            // 1. Cross-app switch via app_focus (NO pollOnce called!) -> must finish < 1.8s
+            let tSwitch1 = Date()
+            await MainActor.run {
+                inspectorB.currentSample = ActivitySample(timestamp: sysClock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "主页 / X - Google Chrome", url: "https://x.com/home", idleSeconds: 0)
+                coordB.handleMonitorEventForTesting(NativeMonitorEvent(timestamp: sysClock.now(), kind: "app_focus", appName: "Google Chrome", bundleId: "com.google.Chrome"))
+            }
+            try await waitUntil("Sub-2s cross-app switch updates pillModel to break", timeoutSeconds: 2.5) {
+                await MainActor.run { coordB.pillModel.text.hasPrefix("休息分心") }
+            }
+            let elapsed1 = Date().timeIntervalSince(tSwitch1)
+            try check(elapsed1 < 1.8, "Cross-app switch with 220ms Jev RTT must complete < 1.8s (actual: \(String(format: "%.2f", elapsed1))s)")
+            try checkEqual(callsB.get(), 1, "Cross-app switch should make exactly 1 Jev call")
+
+            // 2. Same-browser tab switch via AX window_context_changed (NO pollOnce!) -> must finish < 1.8s
+            nextResponseB.set((ActivityMode.build.rawValue, 0.94, 0.08))
+            let tSwitch2 = Date()
+            await MainActor.run {
+                inspectorB.currentSample = ActivitySample(timestamp: sysClock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "focus-guard Pull Request - Google Chrome", url: "https://github.com/org/focus-guard/pull/1", idleSeconds: 0)
+                coordB.handleWindowContextChangedForTesting()
+            }
+            try await waitUntil("Sub-2s same-browser tab switch updates pillModel to build", timeoutSeconds: 2.5) {
+                await MainActor.run { coordB.pillModel.text.hasPrefix("开发构建") }
+            }
+            let elapsed2 = Date().timeIntervalSince(tSwitch2)
+            try check(elapsed2 < 1.8, "Same-browser tab switch with 220ms Jev RTT must complete < 1.8s (actual: \(String(format: "%.2f", elapsed2))s)")
+            try checkEqual(callsB.get(), 2, "Same-browser tab switch should make exactly 1 additional Jev call")
+
+            // 3. Cached tab return via AX window_context_changed -> must finish < 0.9s with 0 new Jev calls
+            let tSwitch3 = Date()
+            await MainActor.run {
+                inspectorB.currentSample = ActivitySample(timestamp: sysClock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "主页 / X - Google Chrome", url: "https://x.com/home", idleSeconds: 0)
+                coordB.handleWindowContextChangedForTesting()
+            }
+            try await waitUntil("Cached tab return switches pillModel back to break", timeoutSeconds: 1.5) {
+                await MainActor.run { coordB.pillModel.text.hasPrefix("休息分心") }
+            }
+            let elapsed3 = Date().timeIntervalSince(tSwitch3)
+            try check(elapsed3 < 0.9, "Cached tab return must complete < 0.9s (actual: \(String(format: "%.2f", elapsed3))s)")
+            try checkEqual(callsB.get(), 2, "Cached tab return must make 0 additional Jev calls")
+
+            // 4. Ambiguous switch (0.77 / same=0.30) commits via precision pending confirm timer without pollOnce()
+            nextResponseB.set((ActivityMode.operate.rawValue, 0.77, 0.30))
+            let tSwitch4 = Date()
+            await MainActor.run {
+                inspectorB.currentSample = ActivitySample(timestamp: sysClock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "商家后台 - 订单管理 - Google Chrome", url: "https://shop.example.com/orders", idleSeconds: 0)
+                coordB.handleWindowContextChangedForTesting()
+            }
+            try await waitUntil("Precision pending confirm timer commits ambiguous switch without pollOnce", timeoutSeconds: 3.5) {
+                await MainActor.run { coordB.pillModel.text.hasPrefix("业务运营") }
+            }
+            let elapsed4 = Date().timeIntervalSince(tSwitch4)
+            try check(elapsed4 >= 1.8 && elapsed4 < 3.0, "Ambiguous switch should respect 0.65s dwell + 0.22s RTT + 1.2s confirm (actual: \(String(format: "%.2f", elapsed4))s)")
         }
     }
 

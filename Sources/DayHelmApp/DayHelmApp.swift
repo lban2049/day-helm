@@ -39,6 +39,18 @@ final class DayHelmAppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         coordinator?.stop()
     }
+
+    @MainActor
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if ActivityRecorderWindowController.shared.bringToFrontIfOpen() {
+            return true
+        }
+        if let coordinator {
+            ActivityRecorderWindowController.shared.show(coordinator: coordinator)
+            return true
+        }
+        return false
+    }
 }
 
 struct DayHelmMenuBarApp: App {

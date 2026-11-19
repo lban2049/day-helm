@@ -3,9 +3,20 @@ import Combine
 import DayHelmCore
 import Foundation
 
+public enum MenuBarVisualState: Equatable, Sendable {
+    case standby
+    case focusing
+    case targetMet
+    case capReached
+    case otherWork
+    case distraction
+}
+
 @MainActor
 public final class MenuBarPillModel: ObservableObject {
-    @Published public var text: String = "○ DayHelm · 待命"
+    @Published public var text: String = ""
+    @Published public var helpText: String = "DayHelm · 待命"
+    @Published public var visualState: MenuBarVisualState = .standby
     public init() {}
 }
 
@@ -40,6 +51,20 @@ public final class HybridActivityCoordinator: ObservableObject {
     @Published public private(set) var apiServerPort: UInt16?
     @Published public private(set) var apiServerPorts: [UInt16] = []
 
+    // Jev semantic auto-tracking state
+    @Published public private(set) var jevAPIKeyConfigured: Bool = false
+    @Published public private(set) var jevAPIKeySource: JevAPIKeySource?
+    @Published public private(set) var jevNeedsAPIKey: Bool = false
+    @Published public private(set) var jevLastClassification: SemanticClassification?
+    @Published public private(set) var jevLastError: String?
+    @Published public private(set) var jevIsManualPinned: Bool = false
+    @Published public private(set) var jevDecisionLogs: [JevDecisionLogEntry] = []
+    @Published public private(set) var activeNonBudgetActivity: AutoNonBudgetActivity?
+    @Published public private(set) var activeActivityMode: ActivityMode?
+    @Published public private(set) var otherWorkMinutes: Double = 0.0
+    @Published public private(set) var nonWorkMinutes: Double = 0.0
+    @Published public private(set) var activityModeMinutes: [String: Double] = [:]
+
     public let isSyntheticDemo: Bool
     public let storeDirectoryURL: URL
 
@@ -51,16 +76,28 @@ public final class HybridActivityCoordinator: ObservableObject {
     private let clock: any DayHelmClock
     private let database: ActivityDatabase?
     private let screenRecorder: NativeScreenRecorder?
+    private let jevClient: JevActivityClient
+    private let jevAPIKeyStore: JevAPIKeyStore
+    private let semanticTracker = SemanticAutoTracker()
     private var httpServer: LocalActivityHTTPServer?
     private var eventMonitor: NativeEventMonitor?
+    private var windowChangeObserver: AXWindowChangeObserver?
     private var settings: DayHelmSettings
     private var syntheticSessionDetails: [RecordedSessionDetail] = []
+
+    public var enableLiveTimersForTesting: Bool = false
 
     private let runtimeStateBox = RuntimeStateBox()
 
     private var timerTask: Task<Void, Never>?
     private var almaSyncTask: Task<Void, Never>?
     private var typingPauseTask: Task<Void, Never>?
+    private var jevClassifyTask: Task<Void, Never>?
+    private var jevDwellTask: Task<Void, Never>?
+    private var jevDwellTargetContextKey: String?
+    private var jevPendingConfirmTask: Task<Void, Never>?
+    private var jevContextOCRTask: Task<Void, Never>?
+    private var jevContextOCRTargetKey: String?
     private var lastAlmaEventMs: Int64?
     private var latestAlmaBrowserSample: ActivitySample?
     private var lastAlmaInputAt: Date?
@@ -76,8 +113,19 @@ public final class HybridActivityCoordinator: ObservableObject {
     private var isStarted: Bool = false
     private var recorderCountRefreshInFlight: Bool = false
 
+    private var observedContextKey: String?
+    private var observedContextSince: Date?
+    private var jevInFlightSignature: String?
+    private var lastJevClassifiedSignature: String?
+    private var lastJevErrorAt: Date?
+
     private let minTitleChangeInterval: TimeInterval = 5.0
+    private let jevContextOCRDelaySeconds: TimeInterval = 0.35
     private var typingPauseQuietSeconds: TimeInterval = 2.0
+
+    private var shouldScheduleEventTimers: Bool {
+        isStarted || enableLiveTimersForTesting
+    }
 
     public init(
         engine: DayHelmEngine,
@@ -88,7 +136,9 @@ public final class HybridActivityCoordinator: ObservableObject {
         syntheticDemo: Bool = false,
         database: ActivityDatabase? = nil,
         screenRecorder: NativeScreenRecorder? = nil,
-        httpServer: LocalActivityHTTPServer? = nil
+        httpServer: LocalActivityHTTPServer? = nil,
+        jevClient: JevActivityClient = JevActivityClient(),
+        jevAPIKeyStore: JevAPIKeyStore? = nil
     ) {
         self.engine = engine
         self.basePrivacyConfig = engine.config.privacyConfig
@@ -100,13 +150,16 @@ public final class HybridActivityCoordinator: ObservableObject {
         self.database = database
         self.screenRecorder = screenRecorder
         self.httpServer = httpServer
+        self.jevClient = jevClient
+        let storeDir = store?.directory ?? DayHelmStore.defaultDirectory
+        self.jevAPIKeyStore = jevAPIKeyStore ?? JevAPIKeyStore(directory: storeDir)
 
         let loadedSettings = store?.loadSettings() ?? .default
         self.settings = loadedSettings
         self.recorderSettings = loadedSettings
         self.deepRecordingEnabled = loadedSettings.deepRecordingEnabled
         self.typingPauseQuietSeconds = TimeInterval(max(200, loadedSettings.typingPauseQuietMs)) / 1000.0
-        self.storeDirectoryURL = store?.directory ?? DayHelmStore.defaultDirectory
+        self.storeDirectoryURL = storeDir
         self.axTrusted = inspector.isAccessibilityTrusted
         self.screenCaptureTrusted = screenRecorder?.isScreenCaptureTrusted ?? false
 
@@ -115,6 +168,11 @@ public final class HybridActivityCoordinator: ObservableObject {
         inspector.updatePrivacyConfig(effectivePrivacy)
         screenRecorder?.applySettings(loadedSettings)
 
+        if !syntheticDemo, let store {
+            self.jevDecisionLogs = store.loadJevDecisionLogs(forDate: engine.currentDateString)
+        }
+
+        refreshJevAPIKeyStatus()
         refreshPublishedState()
         refreshRecorderCounts()
         syncCachedRuntimeState()
@@ -128,16 +186,17 @@ public final class HybridActivityCoordinator: ObservableObject {
         let budgets = TimeAuditConfigLoader.loadBudgets(dayhelmConfigURL: store.configURL)
         let todayStr = DayHelmDateFormatting.dayString(from: clock.now())
 
+        let liveConfig = DayHelmEngineConfig(maxTickGapSeconds: 60.0)
         let engine: DayHelmEngine
         if let existing = try? store.loadToday() {
             if existing.date == todayStr {
-                engine = DayHelmEngine(snapshot: existing, budgets: budgets, clock: clock)
+                engine = DayHelmEngine(snapshot: existing, budgets: budgets, clock: clock, config: liveConfig)
             } else {
                 _ = try? store.rolloverIfNeeded(currentSnapshot: existing, newDateString: todayStr)
-                engine = DayHelmEngine(budgets: budgets, clock: clock)
+                engine = DayHelmEngine(budgets: budgets, clock: clock, config: liveConfig)
             }
         } else {
-            engine = DayHelmEngine(budgets: budgets, clock: clock)
+            engine = DayHelmEngine(budgets: budgets, clock: clock, config: liveConfig)
         }
 
         let inspector = AXWindowInspector(clock: clock, privacyConfig: engine.config.privacyConfig)
@@ -509,6 +568,16 @@ public final class HybridActivityCoordinator: ObservableObject {
                 eventMonitor = monitor
                 syncCachedRuntimeState()
             }
+
+            if windowChangeObserver == nil {
+                let observer = AXWindowChangeObserver(coalesceSeconds: 0.06) { [weak self] in
+                    self?.handleWindowContextChanged()
+                }
+                if let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier {
+                    observer.attach(pid: frontPID)
+                }
+                windowChangeObserver = observer
+            }
         }
 
         timerTask = Task { [weak self] in
@@ -538,6 +607,12 @@ public final class HybridActivityCoordinator: ObservableObject {
         almaSyncTask = nil
         typingPauseTask?.cancel()
         typingPauseTask = nil
+        jevClassifyTask?.cancel()
+        jevClassifyTask = nil
+        jevInFlightSignature = nil
+        cancelJevScheduledTimers()
+        windowChangeObserver?.stop()
+        windowChangeObserver = nil
         eventMonitor?.stop()
         eventMonitor = nil
         httpServer?.stop()
@@ -573,10 +648,15 @@ public final class HybridActivityCoordinator: ObservableObject {
             sensitiveBundleIds: newSettings.sensitiveBundleIds,
             snapshotRetentionDays: newSettings.snapshotRetentionDays,
             snapshotMaxStorageBytes: newSettings.snapshotMaxStorageBytes,
-            ocrEveryN: newSettings.ocrEveryN
+            ocrEveryN: newSettings.ocrEveryN,
+            menuBarDisplayMode: newSettings.menuBarDisplayMode,
+            jevAutoTrackingEnabled: newSettings.jevAutoTrackingEnabled,
+            jevModel: newSettings.jevModel,
+            jevSendOCRSnippet: newSettings.jevSendOCRSnippet
         )
 
         let wasRecorderEnabled = settings.activityRecorderEnabled
+        let wasJevEnabled = settings.jevAutoTrackingEnabled
         settings = normalized
         recorderSettings = normalized
         deepRecordingEnabled = normalized.deepRecordingEnabled
@@ -592,6 +672,15 @@ public final class HybridActivityCoordinator: ObservableObject {
         screenRecorder?.applySettings(normalized)
         eventMonitor?.setInputMonitoringEnabled(normalized.inputMonitoringEnabled)
 
+        if wasJevEnabled && !normalized.jevAutoTrackingEnabled {
+            jevClassifyTask?.cancel()
+            jevClassifyTask = nil
+            jevInFlightSignature = nil
+            cancelJevScheduledTimers()
+            jevLastError = nil
+        }
+        refreshJevAPIKeyStatus()
+
         if wasRecorderEnabled && !normalized.activityRecorderEnabled {
             typingPauseTask?.cancel()
             typingPauseTask = nil
@@ -606,6 +695,7 @@ public final class HybridActivityCoordinator: ObservableObject {
 
         refreshRecorderCounts()
         refreshRecorderSessions()
+        _ = refreshPublishedState(now: clock.now(), forceUI: false)
         syncCachedRuntimeState()
     }
 
@@ -685,11 +775,120 @@ public final class HybridActivityCoordinator: ObservableObject {
         }
     }
 
+    public func refreshJevAPIKeyStatus() {
+        let resolved = jevAPIKeyStore.resolveKey()
+        let configured = (resolved != nil)
+        if jevAPIKeyConfigured != configured {
+            jevAPIKeyConfigured = configured
+        }
+        if jevAPIKeySource != resolved?.source {
+            jevAPIKeySource = resolved?.source
+        }
+        let needsKey = settings.jevAutoTrackingEnabled && !configured
+        if jevNeedsAPIKey != needsKey {
+            jevNeedsAPIKey = needsKey
+        }
+        engine.setAutoTrackingActive(settings.jevAutoTrackingEnabled && configured)
+    }
+
+    public func saveJevAPIKey(_ rawKey: String) throws {
+        try jevAPIKeyStore.saveKey(rawKey)
+        jevLastError = nil
+        lastJevErrorAt = nil
+        lastJevClassifiedSignature = nil
+        refreshJevAPIKeyStatus()
+        _ = refreshPublishedState(now: clock.now(), forceUI: false)
+    }
+
+    public func clearJevAPIKey() throws {
+        try jevAPIKeyStore.deleteKey()
+        jevClassifyTask?.cancel()
+        jevClassifyTask = nil
+        jevInFlightSignature = nil
+        cancelJevScheduledTimers()
+        refreshJevAPIKeyStatus()
+        _ = refreshPublishedState(now: clock.now(), forceUI: false)
+    }
+
+    public func testJevConnection(apiKeyOverride: String? = nil) async -> Result<JevPingResult, Error> {
+        let key: String?
+        if let override = apiKeyOverride?.trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
+            key = override
+        } else {
+            key = jevAPIKeyStore.resolveKey()?.key
+        }
+        guard let key, !key.isEmpty else {
+            return .failure(JevClientError.missingAPIKey)
+        }
+        do {
+            let result = try await jevClient.testConnection(apiKey: key, model: settings.jevModel)
+            jevLastError = nil
+            return .success(result)
+        } catch {
+            jevLastError = error.localizedDescription
+            return .failure(error)
+        }
+    }
+
+    public func resumeAutoTracking() {
+        semanticTracker.clearManualPin()
+        jevIsManualPinned = false
+        lastJevClassifiedSignature = nil
+        _ = refreshPublishedState(now: clock.now(), forceUI: false)
+    }
+
+    public func clearJevDecisionLogs() {
+        jevDecisionLogs = []
+        if !isSyntheticDemo, let store {
+            try? store.saveJevDecisionLogs([], forDate: engine.currentDateString)
+        }
+    }
+
+    private func categoryDisplayName(for categoryId: String) -> String {
+        if let reserved = AutoActivityIds.displayName(for: categoryId) {
+            return reserved
+        }
+        return engine.budgets.first(where: { $0.taskId == categoryId })?.displayName ?? categoryId
+    }
+
+    private func appendJevDecisionLog(_ entry: JevDecisionLogEntry) {
+        jevDecisionLogs.insert(entry, at: 0)
+        if jevDecisionLogs.count > 100 {
+            jevDecisionLogs.removeLast(jevDecisionLogs.count - 100)
+        }
+        if !isSyntheticDemo, let store {
+            try? store.saveJevDecisionLogs(jevDecisionLogs, forDate: engine.currentDateString)
+        }
+    }
+
     public func selectTask(_ taskId: String, note: String? = nil) {
         let now = clock.now()
         let trimmedNote = note?.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveNote = (trimmedNote?.isEmpty == false) ? trimmedNote : nil
         engine.switchTask(to: taskId, note: effectiveNote, at: now)
+        if settings.jevAutoTrackingEnabled {
+            semanticTracker.recordManualSelection(categoryId: taskId, contextKey: observedContextKey, at: now)
+            jevIsManualPinned = semanticTracker.isManualPinActive
+            if let sample = engine.lastSample {
+                appendJevDecisionLog(
+                    JevDecisionLogEntry(
+                        timestamp: now,
+                        appName: sample.appName,
+                        windowTitle: sample.redacted ? nil : sample.windowTitle,
+                        domain: sample.redacted ? nil : SwitchClassifier.registrableDomain(from: sample.url),
+                        redacted: sample.redacted,
+                        usedOCRSnippet: false,
+                        predictedCategoryId: taskId,
+                        predictedDisplayName: categoryDisplayName(for: taskId),
+                        confidence: 1.0,
+                        sameTaskAsPrevious: nil,
+                        isDistraction: 0.0,
+                        source: .localOverride,
+                        outcome: .manualOverride
+                    )
+                )
+            }
+        }
         if let alert = activeAlert {
             engine.dismissAlert(id: alert.id)
             activeAlert = nil
@@ -703,6 +902,10 @@ public final class HybridActivityCoordinator: ObservableObject {
         let trimmedNote = note?.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveNote = (trimmedNote?.isEmpty == false) ? trimmedNote : nil
         engine.pauseFocus(note: effectiveNote, at: now)
+        if settings.jevAutoTrackingEnabled {
+            semanticTracker.recordManualSelection(categoryId: nil, contextKey: nil, at: now)
+            jevIsManualPinned = false
+        }
         if let alert = activeAlert {
             engine.dismissAlert(id: alert.id)
             activeAlert = nil
@@ -716,6 +919,10 @@ public final class HybridActivityCoordinator: ObservableObject {
         let trimmedNote = note?.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveNote = (trimmedNote?.isEmpty == false) ? trimmedNote : nil
         engine.stopFocus(note: effectiveNote, at: now)
+        if settings.jevAutoTrackingEnabled {
+            semanticTracker.recordManualSelection(categoryId: nil, contextKey: nil, at: now)
+            jevIsManualPinned = false
+        }
         if let alert = activeAlert {
             engine.dismissAlert(id: alert.id)
             activeAlert = nil
@@ -770,6 +977,8 @@ public final class HybridActivityCoordinator: ObservableObject {
             return TaskBudget(
                 taskId: budget.taskId,
                 displayName: budget.displayName,
+                shortName: budget.shortName,
+                description: budget.description,
                 colorHex: budget.colorHex,
                 targetMinutes: targetMinutes,
                 capMinutes: capMinutes,
@@ -788,6 +997,8 @@ public final class HybridActivityCoordinator: ObservableObject {
     @discardableResult
     public func addTask(
         displayName: String,
+        shortName: String? = nil,
+        description: String? = nil,
         colorHex: String,
         targetMinutes: Int?,
         capMinutes: Int?,
@@ -797,6 +1008,8 @@ public final class HybridActivityCoordinator: ObservableObject {
     ) -> TaskBudget {
         let created = engine.addTask(
             displayName: displayName,
+            shortName: shortName,
+            description: description,
             colorHex: colorHex,
             targetMinutes: targetMinutes,
             capMinutes: capMinutes,
@@ -899,21 +1112,7 @@ public final class HybridActivityCoordinator: ObservableObject {
         TimeInterval(max(5000, settings.recorderIdleThresholdMs)) / 1000.0
     }
 
-    public func pollOnce() {
-        let now = clock.now()
-        checkDayRolloverIfNeeded(now: now)
-
-        let nextAxTrusted = inspector.isAccessibilityTrusted
-        if axTrusted != nextAxTrusted {
-            axTrusted = nextAxTrusted
-        }
-        if let screenRecorder {
-            let nextScreenCaptureTrusted = screenRecorder.isScreenCaptureTrusted
-            if screenCaptureTrusted != nextScreenCaptureTrusted {
-                screenCaptureTrusted = nextScreenCaptureTrusted
-            }
-        }
-
+    private func inspectPatchedSample(now: Date) -> ActivitySample {
         let privacy = engine.effectivePrivacyConfig
         let rawSample = inspector.inspectCurrent()
         var sample = (inspector is AXWindowInspector) ? rawSample : PrivacyRedactor.redact(rawSample, config: privacy)
@@ -969,11 +1168,37 @@ public final class HybridActivityCoordinator: ObservableObject {
                 )
             }
         }
+        return sample
+    }
+
+    public func pollOnce() {
+        let now = clock.now()
+        checkDayRolloverIfNeeded(now: now)
+
+        let nextAxTrusted = inspector.isAccessibilityTrusted
+        if axTrusted != nextAxTrusted {
+            axTrusted = nextAxTrusted
+        }
+        if isStarted, nextAxTrusted,
+           let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+           windowChangeObserver?.attachedPID != frontPID {
+            windowChangeObserver?.attach(pid: frontPID)
+        }
+        if let screenRecorder {
+            let nextScreenCaptureTrusted = screenRecorder.isScreenCaptureTrusted
+            if screenCaptureTrusted != nextScreenCaptureTrusted {
+                screenCaptureTrusted = nextScreenCaptureTrusted
+            }
+        }
+
+        let sample = inspectPatchedSample(now: now)
 
         let alerts = engine.ingestAlreadyRedacted(sample)
         if let newest = alerts.last, activeAlert != newest {
             activeAlert = newest
         }
+
+        evaluateJevAutoTrackingIfNeeded(sample: sample, now: now)
 
         var didRecordSample = false
         let wasFirstRecord = (lastRecordedAt == nil)
@@ -1079,6 +1304,35 @@ public final class HybridActivityCoordinator: ObservableObject {
         handleNativeMonitorEvent(event)
     }
 
+    public func handleWindowContextChangedForTesting() {
+        handleWindowContextChanged()
+    }
+
+    private func handleWindowContextChanged() {
+        guard !isSyntheticDemo else { return }
+        let now = clock.now()
+        checkDayRolloverIfNeeded(now: now)
+        let sample = inspectPatchedSample(now: now)
+        guard !sample.screenLocked else { return }
+
+        let prevContextKey = observedContextKey
+        let nextContextKey = SemanticPayloadSanitizer.semanticContextKey(for: sample)
+        let contextChanged = (nextContextKey != prevContextKey)
+
+        if contextChanged {
+            let alerts = engine.ingestAlreadyRedacted(sample)
+            if let newest = alerts.last, activeAlert != newest {
+                activeAlert = newest
+            }
+            if settings.activityRecorderEnabled, sample.idleSeconds < recorderIdleThresholdSeconds {
+                _ = recordSampleToDatabaseIfNeeded(sample)
+            }
+        }
+
+        evaluateJevAutoTrackingIfNeeded(sample: sample, now: now)
+        _ = refreshPublishedState(now: now)
+    }
+
     private func handleRawInput(isKeypress: Bool, at timestamp: Date) {
         guard !isSyntheticDemo, settings.activityRecorderEnabled, settings.inputMonitoringEnabled else { return }
         lastNativeInputAt = timestamp
@@ -1128,16 +1382,21 @@ public final class HybridActivityCoordinator: ObservableObject {
         guard !isSyntheticDemo else { return }
         let tsMs = Int64(event.timestamp.timeIntervalSince1970 * 1000)
         let taskId = currentDeclaredTaskId()
-        let privacy = engine.effectivePrivacyConfig
         let idleThreshold = recorderIdleThresholdSeconds
 
         switch event.kind {
         case "app_focus":
-            let sample = PrivacyRedactor.redact(inspector.inspectCurrent(), config: privacy)
-            let alerts = engine.ingest(sample)
+            if isStarted, let frontPID = NSWorkspace.shared.frontmostApplication?.processIdentifier {
+                windowChangeObserver?.attach(pid: frontPID)
+            }
+            let now = clock.now()
+            let sample = inspectPatchedSample(now: now)
+            let alerts = engine.ingestAlreadyRedacted(sample)
             if let newest = alerts.last, activeAlert != newest {
                 activeAlert = newest
             }
+            evaluateJevAutoTrackingIfNeeded(sample: sample, now: now)
+            let expectedContextKey = observedContextKey
             if settings.activityRecorderEnabled, !sample.screenLocked {
                 _ = recordSampleToDatabaseIfNeeded(sample)
                 screenRecorder?.triggerAppFocusCaptureIfNeeded(
@@ -1148,12 +1407,17 @@ public final class HybridActivityCoordinator: ObservableObject {
                     ocrEveryN: settings.ocrEveryN
                 ) { [weak self] in
                     Task { @MainActor [weak self] in
-                        guard let self, !self.shouldGateBackgroundUI else { return }
-                        self.refreshRecorderCountsAsync()
+                        guard let self else { return }
+                        if !self.shouldGateBackgroundUI {
+                            self.refreshRecorderCountsAsync()
+                        }
+                        if let expectedContextKey {
+                            self.handleJevOCRReady(expectedContextKey: expectedContextKey)
+                        }
                     }
                 }
             }
-            refreshPublishedState()
+            refreshPublishedState(now: now)
             if !shouldGateBackgroundUI {
                 refreshRecorderCountsAsync()
             }
@@ -1162,10 +1426,13 @@ public final class HybridActivityCoordinator: ObservableObject {
             typingPauseTask?.cancel()
             typingPauseTask = nil
             VisionOCRService.shutdownWorker()
+            engine.handleSystemSleep(at: event.timestamp)
             if !idleSessionClosed, let database {
                 try? database.closeActiveSessionAtLastActivity()
                 idleSessionClosed = true
             }
+            let metrics = refreshPublishedState(now: event.timestamp)
+            persistTodayIfNeeded(now: event.timestamp, precomputedMetrics: metrics)
 
         case "did_wake":
             screenRecorder?.resetDeduplicationBaseline()
@@ -1178,6 +1445,7 @@ public final class HybridActivityCoordinator: ObservableObject {
             typingPauseTask?.cancel()
             typingPauseTask = nil
             VisionOCRService.shutdownWorker()
+            engine.handleSystemSleep(at: event.timestamp)
             if settings.activityRecorderEnabled {
                 _ = try? database?.insertEvent(
                     timestampMs: tsMs,
@@ -1387,6 +1655,472 @@ public final class HybridActivityCoordinator: ObservableObject {
         }
     }
 
+    // MARK: - Jev Semantic Auto-Tracking
+
+    private func cancelJevScheduledTimers() {
+        jevDwellTask?.cancel()
+        jevDwellTask = nil
+        jevDwellTargetContextKey = nil
+        jevPendingConfirmTask?.cancel()
+        jevPendingConfirmTask = nil
+        jevContextOCRTask?.cancel()
+        jevContextOCRTask = nil
+        jevContextOCRTargetKey = nil
+    }
+
+    private func scheduleJevDwellTimerIfNeeded(for contextKey: String, after delaySeconds: TimeInterval) {
+        guard shouldScheduleEventTimers, !isSyntheticDemo, settings.jevAutoTrackingEnabled else { return }
+        if jevDwellTargetContextKey == contextKey, jevDwellTask != nil {
+            return
+        }
+        jevDwellTask?.cancel()
+        jevDwellTargetContextKey = contextKey
+        let sleepNanos = UInt64(max(0.02, delaySeconds) * 1_000_000_000) + 15_000_000
+        jevDwellTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: sleepNanos)
+            guard !Task.isCancelled, let self else { return }
+            guard self.jevDwellTargetContextKey == contextKey else { return }
+            self.jevDwellTask = nil
+            self.jevDwellTargetContextKey = nil
+            guard self.observedContextKey == contextKey else { return }
+            let now = self.clock.now()
+            let sample = self.inspectPatchedSample(now: now)
+            self.evaluateJevAutoTrackingIfNeeded(sample: sample, now: now)
+            _ = self.refreshPublishedState(now: now)
+        }
+    }
+
+    private func scheduleJevPendingConfirmTimerIfNeeded(for contextKey: String, now: Date) {
+        guard shouldScheduleEventTimers, !isSyntheticDemo, settings.jevAutoTrackingEnabled else { return }
+        guard let remaining = semanticTracker.remainingConfirmSeconds(for: contextKey, at: now) else {
+            jevPendingConfirmTask?.cancel()
+            jevPendingConfirmTask = nil
+            return
+        }
+        jevPendingConfirmTask?.cancel()
+        let sleepNanos = UInt64(max(0.02, remaining) * 1_000_000_000) + 20_000_000
+        jevPendingConfirmTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: sleepNanos)
+            guard !Task.isCancelled, let self else { return }
+            self.jevPendingConfirmTask = nil
+            guard self.observedContextKey == contextKey else { return }
+            let ts = self.clock.now()
+            let sample = self.inspectPatchedSample(now: ts)
+            self.evaluateJevAutoTrackingIfNeeded(sample: sample, now: ts)
+            _ = self.refreshPublishedState(now: ts)
+        }
+    }
+
+    private func scheduleContextOCRCaptureIfNeeded(sample: ActivitySample, contextKey: String) {
+        guard shouldScheduleEventTimers,
+              !isSyntheticDemo,
+              settings.jevAutoTrackingEnabled,
+              settings.jevSendOCRSnippet,
+              settings.activityRecorderEnabled,
+              deepRecordingEnabled,
+              settings.visionOCREnabled,
+              screenRecorder != nil,
+              !sample.redacted,
+              !sample.screenLocked else {
+            return
+        }
+        guard jevContextOCRTargetKey != contextKey else { return }
+        jevContextOCRTask?.cancel()
+        jevContextOCRTargetKey = contextKey
+        let sleepNanos = UInt64(jevContextOCRDelaySeconds * 1_000_000_000)
+        jevContextOCRTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: sleepNanos)
+            guard !Task.isCancelled, let self else { return }
+            self.jevContextOCRTask = nil
+            guard self.observedContextKey == contextKey,
+                  self.settings.jevAutoTrackingEnabled,
+                  self.settings.activityRecorderEnabled,
+                  self.deepRecordingEnabled else {
+                return
+            }
+            let ts = self.clock.now()
+            let fresh = self.inspectPatchedSample(now: ts)
+            guard !fresh.screenLocked,
+                  !fresh.redacted,
+                  fresh.idleSeconds < self.recorderIdleThresholdSeconds,
+                  SemanticPayloadSanitizer.semanticContextKey(for: fresh) == contextKey else {
+                return
+            }
+            self.screenRecorder?.triggerWindowContextCaptureIfNeeded(
+                sample: fresh,
+                deepRecordingEnabled: self.deepRecordingEnabled,
+                declaredTaskId: self.currentDeclaredTaskId(),
+                idleThresholdSeconds: self.recorderIdleThresholdSeconds,
+                ocrEveryN: self.settings.ocrEveryN
+            ) { [weak self] in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if !self.shouldGateBackgroundUI {
+                        self.refreshRecorderCountsAsync()
+                    }
+                    self.handleJevOCRReady(expectedContextKey: contextKey)
+                }
+            }
+        }
+    }
+
+    private func handleJevOCRReady(expectedContextKey: String) {
+        guard !isSyntheticDemo,
+              settings.jevAutoTrackingEnabled,
+              settings.jevSendOCRSnippet,
+              observedContextKey == expectedContextKey else {
+            return
+        }
+        let now = clock.now()
+        let sample = inspectPatchedSample(now: now)
+        guard !sample.screenLocked, !sample.redacted else { return }
+        evaluateJevAutoTrackingIfNeeded(sample: sample, now: now)
+        _ = refreshPublishedState(now: now)
+    }
+
+    private func evaluateJevAutoTrackingIfNeeded(sample: ActivitySample, now: Date) {
+        guard !isSyntheticDemo else { return }
+        guard !sample.screenLocked, sample.idleSeconds < engine.config.idleThresholdSeconds else {
+            return
+        }
+
+        // Ignore DayHelm's own windows, transient auxiliary overlays (Xnip/Spotlight/Stats),
+        // and blank browser New Tab transitions so they never hijack the active task or emit low-confidence noise.
+        let selfBundle = Bundle.main.bundleIdentifier?.lowercased()
+        let sampleBundle = sample.bundleId?.lowercased()
+        if (selfBundle != nil && sampleBundle == selfBundle)
+            || SemanticPayloadSanitizer.shouldSkipSemanticClassification(sample: sample) {
+            return
+        }
+
+        let probeSpan = EnrichedSpan(
+            startedAt: sample.timestamp,
+            endedAt: sample.timestamp,
+            appName: sample.appName,
+            bundleId: sample.bundleId,
+            windowTitle: sample.windowTitle,
+            url: sample.url,
+            declaredTaskId: nil,
+            redacted: sample.redacted
+        )
+        let canonicalKey = SwitchClassifier.canonicalContextKey(for: probeSpan)
+        let contextKey = SemanticPayloadSanitizer.semanticContextKey(for: sample)
+
+        if observedContextKey != contextKey {
+            observedContextKey = contextKey
+            observedContextSince = now
+            jevDwellTask?.cancel()
+            jevDwellTask = nil
+            jevDwellTargetContextKey = nil
+            jevPendingConfirmTask?.cancel()
+            jevPendingConfirmTask = nil
+            jevContextOCRTask?.cancel()
+            jevContextOCRTask = nil
+            jevContextOCRTargetKey = nil
+        } else if observedContextSince == nil {
+            observedContextSince = now
+        }
+
+        guard settings.jevAutoTrackingEnabled else { return }
+
+        let resolvedKey = jevAPIKeyStore.resolveKey()
+        let hasKey = (resolvedKey != nil)
+        if jevAPIKeyConfigured != hasKey {
+            jevAPIKeyConfigured = hasKey
+        }
+        if jevAPIKeySource != resolvedKey?.source {
+            jevAPIKeySource = resolvedKey?.source
+        }
+        let needsKey = !hasKey
+        if jevNeedsAPIKey != needsKey {
+            jevNeedsAPIKey = needsKey
+        }
+        engine.setAutoTrackingActive(hasKey)
+
+        guard let apiKey = resolvedKey?.key, !apiKey.isEmpty else {
+            return
+        }
+
+        // 1. Advance anti-flicker dwell on any pending candidate.
+        let dwellDecision = semanticTracker.tickDwell(activeContextKey: contextKey, at: now)
+        if dwellDecision.didSwitch, let committed = dwellDecision.committedCategoryId {
+            jevPendingConfirmTask?.cancel()
+            jevPendingConfirmTask = nil
+            let lastCls = semanticTracker.latestClassification
+            engine.applyAutoCategory(committed, activityMode: lastCls?.activityMode, at: now)
+            if let semGroup = lastCls?.semanticGroupKey {
+                engine.stampSemanticGroup(semGroup, forContextKey: canonicalKey, at: now)
+            }
+            let focusProjName = lastCls?.focusProjectId.map { categoryDisplayName(for: $0) }
+            appendJevDecisionLog(
+                JevDecisionLogEntry(
+                    timestamp: now,
+                    appName: sample.appName,
+                    windowTitle: sample.redacted ? nil : sample.windowTitle,
+                    domain: sample.redacted ? nil : SwitchClassifier.registrableDomain(from: sample.url),
+                    redacted: sample.redacted,
+                    usedOCRSnippet: false,
+                    predictedCategoryId: committed,
+                    predictedDisplayName: categoryDisplayName(for: committed),
+                    activityMode: lastCls?.activityMode,
+                    focusProjectDisplayName: focusProjName,
+                    confidence: lastCls?.confidence ?? 1.0,
+                    sameTaskAsPrevious: lastCls?.sameTaskAsPrevious,
+                    isDistraction: lastCls?.isDistraction ?? 0.0,
+                    source: .cache,
+                    outcome: .committedSwitch
+                )
+            )
+        } else if dwellDecision.pendingCategoryId != nil {
+            scheduleJevPendingConfirmTimerIfNeeded(for: contextKey, now: now)
+        }
+        let pinActive = semanticTracker.isManualPinActive
+        if jevIsManualPinned != pinActive {
+            jevIsManualPinned = pinActive
+        }
+
+        let budgetsVersion = engine.budgetsVersion
+
+        // 2. Day-scoped manual override short-circuits outbound calls.
+        if let overrideId = semanticTracker.manualOverride(for: contextKey) {
+            let overrideCls = SemanticClassification(
+                categoryId: overrideId,
+                confidence: 1.0,
+                probabilities: [overrideId: 1.0],
+                sameTaskAsPrevious: nil,
+                isDistraction: 0.0,
+                source: .localOverride,
+                classifiedAt: now
+            )
+            let decision = semanticTracker.apply(
+                classification: overrideCls,
+                contextKey: contextKey,
+                budgetsVersion: budgetsVersion,
+                at: now
+            )
+            if decision.didSwitch, let committed = decision.committedCategoryId {
+                engine.applyAutoCategory(committed, at: now)
+            }
+            return
+        }
+
+        // Check whether fresh same-window OCR is available (used both for cache upgrade and payload).
+        let needsOCR = settings.jevSendOCRSnippet
+            && !sample.redacted
+            && SemanticPayloadSanitizer.shouldAttachOCR(appName: sample.appName, windowTitle: sample.windowTitle, url: sample.url)
+        let ocrText: String?
+        if needsOCR, let database {
+            let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+            ocrText = database.latestOCRText(
+                withinSeconds: 180,
+                appName: sample.appName,
+                windowTitle: sample.windowTitle,
+                nowMs: nowMs
+            )
+        } else {
+            ocrText = nil
+        }
+
+        let dwellSeconds = max(0, now.timeIntervalSince(observedContextSince ?? now))
+
+        // 3. Local 5-minute context cache short-circuits redundant API calls.
+        // If previously classified without OCR and fresh OCR for this exact window has now landed, bypass once to upgrade.
+        if let cached = semanticTracker.cachedClassification(
+            for: contextKey,
+            budgetsVersion: budgetsVersion,
+            hasFreshOCR: ocrText != nil,
+            at: now
+        ) {
+            let isColdStart = (semanticTracker.currentCategoryId == nil)
+            let isSameCategory = (semanticTracker.currentCategoryId == cached.categoryId)
+            if !isColdStart && !isSameCategory && dwellSeconds < semanticTracker.config.cacheSwitchDwellSeconds {
+                scheduleJevDwellTimerIfNeeded(
+                    for: contextKey,
+                    after: semanticTracker.config.cacheSwitchDwellSeconds - dwellSeconds
+                )
+                return
+            }
+            engine.stampSemanticGroup(cached.semanticGroupKey, forContextKey: canonicalKey, at: now)
+            let decision = semanticTracker.apply(
+                classification: cached,
+                contextKey: contextKey,
+                budgetsVersion: budgetsVersion,
+                at: now
+            )
+            if decision.didSwitch, let committed = decision.committedCategoryId {
+                engine.applyAutoCategory(committed, activityMode: cached.activityMode, at: now)
+            } else if decision.pendingCategoryId != nil {
+                scheduleJevPendingConfirmTimerIfNeeded(for: contextKey, now: now)
+            }
+            return
+        }
+
+        // For weak-title / multi-purpose pages without recent OCR, trigger an on-demand capture+OCR after 0.35s paint settle.
+        if needsOCR && ocrText == nil {
+            scheduleContextOCRCaptureIfNeeded(sample: sample, contextKey: contextKey)
+        }
+
+        // 4. Enforce >= 0.65s precision dwell gate before calling Jev (filters Cmd+Tab blips & page-load title churn while keeping cold-TLS switches <= 2.0s).
+        guard dwellSeconds >= semanticTracker.config.minDwellBeforeClassifySeconds else {
+            scheduleJevDwellTimerIfNeeded(
+                for: contextKey,
+                after: semanticTracker.config.minDwellBeforeClassifySeconds - dwellSeconds
+            )
+            return
+        }
+
+        // Error backoff (15s) to avoid hammering on offline/invalid-key states.
+        if let lastErr = lastJevErrorAt, now.timeIntervalSince(lastErr) < 15.0 {
+            return
+        }
+
+        let ocrSig = ocrText.map { String($0.prefix(48)) } ?? ""
+        let requestSignature = "\(budgetsVersion)|\(contextKey)|\(ocrSig)"
+        if jevInFlightSignature == requestSignature || lastJevClassifiedSignature == requestSignature {
+            return
+        }
+
+        guard let sanitizedInput = SemanticPayloadSanitizer.buildInput(
+            sample: sample,
+            ocrText: ocrText,
+            recentSpans: engine.enrichedSpans,
+            budgets: engine.budgets,
+            sendOCRSnippet: settings.jevSendOCRSnippet,
+            privacyConfig: engine.effectivePrivacyConfig
+        ) else {
+            return
+        }
+
+        let usedOCR = (sanitizedInput.ocrSnippet != nil)
+        let model = settings.jevModel
+        let client = jevClient
+        jevInFlightSignature = requestSignature
+        jevClassifyTask?.cancel()
+        jevClassifyTask = Task { [weak self] in
+            do {
+                let classification = try await client.classify(
+                    input: sanitizedInput,
+                    apiKey: apiKey,
+                    model: model
+                )
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    if self.jevInFlightSignature == requestSignature {
+                        self.jevInFlightSignature = nil
+                    }
+                    self.lastJevClassifiedSignature = requestSignature
+                    self.lastJevErrorAt = nil
+                    self.jevLastError = nil
+                    self.jevLastClassification = classification
+
+                    let ts = self.clock.now()
+                    self.engine.stampSemanticGroup(classification.semanticGroupKey, forContextKey: canonicalKey, at: ts)
+
+                    // Guard against late-response flicker if the user already moved to another context while in flight.
+                    if self.observedContextKey != contextKey {
+                        self.semanticTracker.storeCache(
+                            classification,
+                            for: contextKey,
+                            budgetsVersion: budgetsVersion,
+                            usedOCR: usedOCR,
+                            at: ts
+                        )
+                        return
+                    }
+
+                    let previousCategory = self.semanticTracker.currentCategoryId
+                    let wasPinned = self.semanticTracker.isManualPinActive
+                    let decision = self.semanticTracker.apply(
+                        classification: classification,
+                        contextKey: contextKey,
+                        budgetsVersion: budgetsVersion,
+                        usedOCR: usedOCR,
+                        at: ts
+                    )
+                    if decision.didSwitch, let committed = decision.committedCategoryId {
+                        self.jevPendingConfirmTask?.cancel()
+                        self.jevPendingConfirmTask = nil
+                        self.engine.applyAutoCategory(committed, activityMode: classification.activityMode, at: ts)
+                    } else if decision.pendingCategoryId != nil {
+                        self.scheduleJevPendingConfirmTimerIfNeeded(for: contextKey, now: ts)
+                    }
+
+                    let outcome: JevDecisionOutcome
+                    if decision.didSwitch {
+                        outcome = .committedSwitch
+                    } else if wasPinned && self.semanticTracker.isManualPinActive {
+                        outcome = .manualPinned
+                    } else if decision.pendingCategoryId == classification.categoryId {
+                        outcome = .pendingConfirmation
+                    } else if previousCategory == classification.categoryId {
+                        outcome = .maintained
+                    } else {
+                        outcome = .ignoredLowConfidence
+                    }
+
+                    let ocrPreview = sanitizedInput.ocrSnippet.map { snippet in
+                        snippet.count > 80 ? String(snippet.prefix(80)) + "…" : snippet
+                    }
+                    let focusProjDisplay = classification.focusProjectId.map { self.categoryDisplayName(for: $0) }
+                    self.appendJevDecisionLog(
+                        JevDecisionLogEntry(
+                            timestamp: ts,
+                            appName: sanitizedInput.appName,
+                            windowTitle: sanitizedInput.windowTitle,
+                            domain: SwitchClassifier.registrableDomain(from: sanitizedInput.url),
+                            redacted: sanitizedInput.redacted,
+                            usedOCRSnippet: sanitizedInput.ocrSnippet != nil,
+                            ocrSnippetPreview: ocrPreview,
+                            predictedCategoryId: classification.categoryId,
+                            predictedDisplayName: self.categoryDisplayName(for: classification.categoryId),
+                            activityMode: classification.activityMode,
+                            focusProjectDisplayName: focusProjDisplay,
+                            confidence: classification.confidence,
+                            sameTaskAsPrevious: classification.sameTaskAsPrevious,
+                            isDistraction: classification.isDistraction,
+                            source: classification.source,
+                            outcome: outcome,
+                            latencyMs: classification.latencyMs,
+                            inputTokens: classification.inputTokens
+                        )
+                    )
+
+                    let metrics = self.refreshPublishedState(now: ts)
+                    if decision.didSwitch {
+                        self.persistTodayIfNeeded(now: ts, precomputedMetrics: metrics)
+                    }
+                }
+            } catch {
+                if Task.isCancelled { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    if self.jevInFlightSignature == requestSignature {
+                        self.jevInFlightSignature = nil
+                    }
+                    let ts = self.clock.now()
+                    self.lastJevErrorAt = ts
+                    self.jevLastError = error.localizedDescription
+                    self.appendJevDecisionLog(
+                        JevDecisionLogEntry(
+                            timestamp: ts,
+                            appName: sanitizedInput.appName,
+                            windowTitle: sanitizedInput.windowTitle,
+                            domain: SwitchClassifier.registrableDomain(from: sanitizedInput.url),
+                            redacted: sanitizedInput.redacted,
+                            usedOCRSnippet: sanitizedInput.ocrSnippet != nil,
+                            predictedCategoryId: "",
+                            predictedDisplayName: "识别失败",
+                            confidence: 0.0,
+                            source: .jev,
+                            outcome: .error,
+                            errorMessage: error.localizedDescription
+                        )
+                    )
+                }
+            }
+        }
+    }
+
     // MARK: - Helpers
 
     private func checkDayRolloverIfNeeded(now: Date) {
@@ -1399,6 +2133,15 @@ public final class HybridActivityCoordinator: ObservableObject {
             _ = try? store.rolloverIfNeeded(currentSnapshot: prevSnapshot, newDateString: currentDay)
         }
         engine.rolloverToNewDay(currentDay)
+        semanticTracker.resetForNewDay()
+        observedContextKey = nil
+        observedContextSince = nil
+        jevInFlightSignature = nil
+        lastJevClassifiedSignature = nil
+        cancelJevScheduledTimers()
+        jevLastClassification = nil
+        jevIsManualPinned = false
+        clearJevDecisionLogs()
         lastAlmaEventMs = nil
         latestAlmaBrowserSample = nil
         lastRecordedSampleKey = nil
@@ -1417,10 +2160,65 @@ public final class HybridActivityCoordinator: ObservableObject {
         if sessionState != nextSessionState {
             sessionState = nextSessionState
         }
+        let nextNonBudget = engine.activeNonBudgetActivity
+        if activeNonBudgetActivity != nextNonBudget {
+            activeNonBudgetActivity = nextNonBudget
+        }
+        let nextMode = engine.activeActivityMode
+        if activeActivityMode != nextMode {
+            activeActivityMode = nextMode
+        }
+        let nextOtherMin = engine.otherWorkMinutes
+        if abs(otherWorkMinutes - nextOtherMin) >= 0.01 {
+            otherWorkMinutes = nextOtherMin
+        }
+        let nextNonWorkMin = engine.nonWorkMinutes
+        if abs(nonWorkMinutes - nextNonWorkMin) >= 0.01 {
+            nonWorkMinutes = nextNonWorkMin
+        }
+        let nextModeMinutes = engine.activityModeMinutes
+        if activityModeMinutes != nextModeMinutes {
+            activityModeMinutes = nextModeMinutes
+        }
+        let nextPinActive = semanticTracker.isManualPinActive
+        if jevIsManualPinned != nextPinActive {
+            jevIsManualPinned = nextPinActive
+        }
+
         let nextProgress = engine.taskProgress()
-        let nextPill = Self.formatPillText(sessionState: nextSessionState, progressList: nextProgress)
+        let nextPill = Self.formatPillText(
+            sessionState: nextSessionState,
+            progressList: nextProgress,
+            activeActivityMode: nextMode,
+            activityModeMinutes: nextModeMinutes,
+            nonBudgetActivity: nextNonBudget,
+            otherWorkMinutes: nextOtherMin,
+            nonWorkMinutes: nextNonWorkMin,
+            mode: settings.menuBarDisplayMode
+        )
         if pillModel.text != nextPill {
             pillModel.text = nextPill
+        }
+        let nextHelp = Self.formatPillHelpText(
+            sessionState: nextSessionState,
+            progressList: nextProgress,
+            activeActivityMode: nextMode,
+            activityModeMinutes: nextModeMinutes,
+            nonBudgetActivity: nextNonBudget,
+            otherWorkMinutes: nextOtherMin,
+            nonWorkMinutes: nextNonWorkMin
+        )
+        if pillModel.helpText != nextHelp {
+            pillModel.helpText = nextHelp
+        }
+        let nextVisualState = Self.formatPillVisualState(
+            sessionState: nextSessionState,
+            progressList: nextProgress,
+            activeActivityMode: nextMode,
+            nonBudgetActivity: nextNonBudget
+        )
+        if pillModel.visualState != nextVisualState {
+            pillModel.visualState = nextVisualState
         }
 
         if shouldGateBackgroundUI && !forceUI {
@@ -1465,26 +2263,179 @@ public final class HybridActivityCoordinator: ObservableObject {
         return spectrum.metrics
     }
 
-    private static func formatPillText(sessionState: FocusSessionState, progressList: [TaskProgress]) -> String {
-        guard case .focusing(let taskId, _) = sessionState,
-              let progress = progressList.first(where: { $0.budget.taskId == taskId }) else {
-            return "○ DayHelm · 待命"
+    private static func shortTaskLabel(for budget: TaskBudget) -> String {
+        if let customShort = budget.shortName?.trimmingCharacters(in: .whitespacesAndNewlines), !customShort.isEmpty {
+            return customShort
+        }
+        let rawName = budget.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Visual width budget: CJK/wide scalars count as 2, ASCII/narrow count as 1.
+        // 16 units comfortably fits "Infra 维护" (10), "Hermes 投研" (11), "电商日常运营" (12) without ellipsis.
+        let maxVisualUnits = 16
+        var units = 0
+        var prefix = ""
+        for ch in rawName {
+            let w = ch.unicodeScalars.contains(where: { $0.value > 0x7F }) ? 2 : 1
+            if units + w > maxVisualUnits {
+                return prefix.trimmingCharacters(in: .whitespaces) + "…"
+            }
+            units += w
+            prefix.append(ch)
+        }
+        return rawName
+    }
+
+    private static func formatPillText(
+        sessionState: FocusSessionState,
+        progressList: [TaskProgress],
+        activeActivityMode: ActivityMode?,
+        activityModeMinutes: [String: Double],
+        nonBudgetActivity: AutoNonBudgetActivity?,
+        otherWorkMinutes: Double,
+        nonWorkMinutes: Double,
+        mode: MenuBarDisplayMode
+    ) -> String {
+        if mode == .iconOnly {
+            return ""
         }
 
-        let focused = Int(progress.focusedMinutes.rounded())
-        let rawName = progress.budget.displayName
-        let shortName = (rawName == "电商日常运营") ? "日常运营" : rawName
+        // Priority 1: Matched Focus Project (user-configured TaskBudget)
+        if case .focusing(let taskId, _) = sessionState,
+           let progress = progressList.first(where: { $0.budget.taskId == taskId }) {
+            let focused = Int(progress.focusedMinutes.rounded())
+            let isCapReached: Bool
+            if case .capReached = progress.status {
+                isCapReached = true
+            } else {
+                isCapReached = false
+            }
 
-        if case .capReached = progress.status, let cap = progress.budget.capMinutes {
-            return "▲ \(shortName) · \(focused)/\(cap)m"
+            let metricText: String
+            if isCapReached, let cap = progress.budget.capMinutes {
+                metricText = mode == .compact ? "\(focused)/\(cap)m!" : "\(focused)/\(cap)m▲"
+            } else if let target = progress.budget.targetMinutes {
+                metricText = "\(focused)/\(target)m"
+            } else if let cap = progress.budget.capMinutes {
+                metricText = "\(focused)/\(cap)m"
+            } else {
+                metricText = "\(focused)m"
+            }
+
+            switch mode {
+            case .iconOnly:
+                return ""
+            case .compact:
+                return metricText
+            case .standard:
+                let shortName = shortTaskLabel(for: progress.budget)
+                return "\(shortName) \(metricText)"
+            }
         }
-        if let target = progress.budget.targetMinutes {
-            return "● \(shortName) · \(focused)/\(target)m"
+
+        // Priority 2: Layer-1 ActivityMode (zero-project mode or unmatched project)
+        if let actMode = activeActivityMode {
+            let mins = Int((activityModeMinutes[actMode.rawValue] ?? (actMode.isDistraction ? nonWorkMinutes : otherWorkMinutes)).rounded())
+            // Keep legacy label parity if explicitly set via legacy __other_work__/__non_work__ without a richer mode
+            if let nonBudgetActivity, actMode == .commsAdmin, nonBudgetActivity == .otherWork, activityModeMinutes[actMode.rawValue] == nil {
+                let label = AutoActivityIds.menuBarLabel(for: AutoActivityIds.otherWork, compact: mode == .compact) ?? "其他事务"
+                return "\(label) \(Int(otherWorkMinutes.rounded()))m"
+            }
+            let label = (mode == .compact) ? actMode.compactLabel : actMode.displayName
+            return "\(label) \(mins)m"
         }
-        if let cap = progress.budget.capMinutes {
-            return "● \(shortName) · \(focused)/\(cap)m"
+
+        if let nonBudgetActivity {
+            switch nonBudgetActivity {
+            case .otherWork:
+                let mins = Int(otherWorkMinutes.rounded())
+                let label = AutoActivityIds.menuBarLabel(for: AutoActivityIds.otherWork, compact: mode == .compact) ?? "其他事务"
+                return "\(label) \(mins)m"
+            case .nonWork:
+                let mins = Int(nonWorkMinutes.rounded())
+                let label = AutoActivityIds.menuBarLabel(for: AutoActivityIds.nonWork, compact: mode == .compact) ?? "分心中"
+                return "\(label) \(mins)m"
+            }
         }
-        return "● \(shortName) · \(focused)m"
+
+        return mode == .standard ? "待命" : ""
+    }
+
+    private static func formatPillHelpText(
+        sessionState: FocusSessionState,
+        progressList: [TaskProgress],
+        activeActivityMode: ActivityMode?,
+        activityModeMinutes: [String: Double],
+        nonBudgetActivity: AutoNonBudgetActivity?,
+        otherWorkMinutes: Double,
+        nonWorkMinutes: Double
+    ) -> String {
+        if case .focusing(let taskId, _) = sessionState,
+           let progress = progressList.first(where: { $0.budget.taskId == taskId }) {
+            let focused = Int(progress.focusedMinutes.rounded())
+            let modeSuffix = activeActivityMode.map { " · \($0.displayName)" } ?? ""
+            if case .capReached = progress.status, let cap = progress.budget.capMinutes {
+                return "DayHelm · \(progress.budget.displayName)\(modeSuffix) \(focused)/\(cap)m (已达上限)"
+            }
+            if let target = progress.budget.targetMinutes {
+                return "DayHelm · \(progress.budget.displayName)\(modeSuffix) \(focused)/\(target)m"
+            }
+            if let cap = progress.budget.capMinutes {
+                return "DayHelm · \(progress.budget.displayName)\(modeSuffix) \(focused)/\(cap)m"
+            }
+            return "DayHelm · \(progress.budget.displayName)\(modeSuffix) \(focused)m"
+        }
+
+        if let actMode = activeActivityMode {
+            let mins = Int((activityModeMinutes[actMode.rawValue] ?? (actMode.isDistraction ? nonWorkMinutes : otherWorkMinutes)).rounded())
+            return "DayHelm · \(actMode.displayName)（自动识别）今日累计 \(mins)m"
+        }
+
+        if let nonBudgetActivity {
+            switch nonBudgetActivity {
+            case .otherWork:
+                return "DayHelm · 其他事务（自动识别）今日累计 \(Int(otherWorkMinutes.rounded()))m"
+            case .nonWork:
+                return "DayHelm · 分心/休息（自动识别）今日累计 \(Int(nonWorkMinutes.rounded()))m"
+            }
+        }
+        return "DayHelm · 待命"
+    }
+
+    private static func formatPillVisualState(
+        sessionState: FocusSessionState,
+        progressList: [TaskProgress],
+        activeActivityMode: ActivityMode?,
+        nonBudgetActivity: AutoNonBudgetActivity?
+    ) -> MenuBarVisualState {
+        if case .focusing(let taskId, _) = sessionState,
+           let progress = progressList.first(where: { $0.budget.taskId == taskId }) {
+            switch progress.status {
+            case .capReached:
+                return .capReached
+            case .targetMet:
+                return .targetMet
+            case .underTarget, .approachingCap, .noBudget:
+                return .focusing
+            }
+        }
+        if let actMode = activeActivityMode {
+            switch actMode {
+            case .breakTime:
+                return .distraction
+            case .commsAdmin:
+                return .otherWork
+            case .build, .create, .operate, .research:
+                return .focusing
+            }
+        }
+        if let nonBudgetActivity {
+            switch nonBudgetActivity {
+            case .otherWork:
+                return .otherWork
+            case .nonWork:
+                return .distraction
+            }
+        }
+        return .standby
     }
 
     public func refreshRecorderCounts() {

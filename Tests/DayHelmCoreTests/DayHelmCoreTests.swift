@@ -3779,7 +3779,7 @@ struct DayHelmAlmaParityTests {
         #expect(legacy.inputMonitoringEnabled == true)
         #expect(legacy.appFocusDebounceMs == 4000)
         #expect(legacy.heartbeatIntervalMs == 120_000)
-        #expect(legacy.recorderIdleThresholdMs == 300_000)
+        #expect(legacy.recorderIdleThresholdMs == 180_000)
         #expect(legacy.typingPauseQuietMs == 2000)
         #expect(legacy.visualCheckIntervalMs == 12_000)
         #expect(legacy.jpegQuality == 55)
@@ -4713,7 +4713,7 @@ struct DayHelmAlmaParityTests {
             )),
             clock: clock
         )
-        #expect(coordinator.pillModel.text == "○ DayHelm · 待命")
+        #expect(coordinator.pillModel.text == "待命")
         coordinator.selectTask("dev")
         #expect(coordinator.pillModel.text.contains("Dev"))
         let initialPill = coordinator.pillModel.text

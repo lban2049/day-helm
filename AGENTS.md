@@ -88,9 +88,12 @@ Sources/DayHelmChecks/      # 确定性自检断言，失败 exit 1
 | `alma-time-audit` | `~/.config/alma/scripts/`、`~/dev/code/alma-time-audit/` | 产出日/周报，做事后审计与评分。**DayHelm 负责当天实时掌舵并在 24001 开放完整数据，与它互补** |
 | 本机 AI Agents (Claude Code / Codex / Hermes) | CLI & `127.0.0.1:24001` | 通过 `dayhelm query/search/sessions` 或 `/api/dayhelm/context` 获取当日实时上下文 |
 
+## 开发规范
+
+- 完成阶段性修改后，按规范提交变更，避免大量变更积累在本地未提交
+
 ## 未得到用户明确要求时
 
 - 不运行会真正采集用户数据的常驻进程
-- 不修改 `~/.config/alma/time-audit/` 下的任何既有配置
-- 不提交、不推送、不部署
+- 不推送、不部署
 - 不在 `/Applications` 下的任何 app 包里改代码

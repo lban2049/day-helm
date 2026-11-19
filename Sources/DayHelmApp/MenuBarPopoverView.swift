@@ -5,15 +5,18 @@ import SwiftUI
 
 struct MenuBarLabelView: View {
     @ObservedObject var pillModel: MenuBarPillModel
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        HStack(spacing: 4) {
-            Image(nsImage: DayHelmMenuBarIcon.templateImage)
-                .renderingMode(.template)
-            Text(pillModel.text)
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .monospacedDigit()
+        HStack(spacing: pillModel.text.isEmpty ? 0 : 4) {
+            Image(nsImage: DayHelmMenuBarIcon.image(for: pillModel.visualState, isDark: colorScheme == .dark))
+            if !pillModel.text.isEmpty {
+                Text(pillModel.text)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .monospacedDigit()
+            }
         }
+        .help(pillModel.helpText)
     }
 }
 
@@ -223,6 +226,48 @@ struct MenuBarPopoverView: View {
             .fixedSize(horizontal: true, vertical: false)
             .help(apiServerHelpText)
 
+            if coordinator.jevNeedsAPIKey {
+                Text("·")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.quaternary)
+
+                Button {
+                    openRecorderWindow(section: .jev)
+                } label: {
+                    HStack(spacing: 3) {
+                        Circle()
+                            .fill(DayHelmColors.warningAmber)
+                            .frame(width: 5.5, height: 5.5)
+                        Text("Jev 待配Key")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(DayHelmColors.warningAmber)
+                    }
+                }
+                .buttonStyle(.plain)
+                .fixedSize(horizontal: true, vertical: false)
+                .help("已开启 Jev 自动识别，点击前往配置 JEV_API_KEY")
+            } else if coordinator.recorderSettings.jevAutoTrackingEnabled && coordinator.jevAPIKeyConfigured {
+                Text("·")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.quaternary)
+
+                Button {
+                    openRecorderWindow(section: .jev)
+                } label: {
+                    HStack(spacing: 3) {
+                        Circle()
+                            .fill(coordinator.jevLastError == nil ? DayHelmColors.successEmerald : DayHelmColors.warningAmber)
+                            .frame(width: 5.5, height: 5.5)
+                        Text("Jev")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .fixedSize(horizontal: true, vertical: false)
+                .help(jevStatusHelpText)
+            }
+
             Spacer(minLength: 4)
 
             Button {
@@ -260,9 +305,26 @@ struct MenuBarPopoverView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(activeFocusTitle)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(isFocusing ? .primary : .secondary)
+                    HStack(spacing: 5) {
+                        Text(activeFocusTitle)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(isFocusing || coordinator.activeActivityMode != nil || coordinator.activeNonBudgetActivity != nil ? .primary : .secondary)
+
+                        if coordinator.recorderSettings.jevAutoTrackingEnabled && coordinator.jevIsManualPinned {
+                            Button {
+                                coordinator.resumeAutoTracking()
+                            } label: {
+                                Text("恢复自动")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(DayHelmColors.primaryBlue)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1.5)
+                                    .background(DayHelmColors.primaryBlue.opacity(0.12), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .help("解除手动锁定，交回 Jev 自动识别")
+                        }
+                    }
                     Text(liveContextLine)
                         .font(.system(size: 10.5, design: .monospaced))
                         .foregroundStyle(.secondary)
@@ -272,7 +334,7 @@ struct MenuBarPopoverView: View {
 
                 Spacer(minLength: 8)
 
-                Text(formattedTimer(coordinator.elapsedFocusSeconds))
+                Text(formattedTimer(displayedTimerSeconds))
                     .font(.system(size: 20, weight: .semibold, design: .monospaced))
                     .monospacedDigit()
                     .foregroundStyle(timerColor)
@@ -334,6 +396,31 @@ struct MenuBarPopoverView: View {
                     )
                 }
                 .buttonStyle(.plain)
+            }
+
+            // Compact Layer-1 Activity Mode breakdown when auto-tracking has recorded mode minutes
+            let activeModes = ActivityMode.allCases.compactMap { mode -> (ActivityMode, Int)? in
+                let m = Int((coordinator.activityModeMinutes[mode.rawValue] ?? 0).rounded())
+                return m > 0 ? (mode, m) : nil
+            }
+            if !activeModes.isEmpty {
+                HStack(spacing: 5) {
+                    ForEach(activeModes.prefix(4), id: \.0.rawValue) { mode, mins in
+                        HStack(spacing: 3) {
+                            Circle()
+                                .fill(Color(hex: mode.colorHex))
+                                .frame(width: 5, height: 5)
+                            Text("\(mode.compactLabel) \(mins)m")
+                                .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.primary.opacity(0.045), in: Capsule())
+                    }
+                    Spacer(minLength: 0)
+                }
             }
 
             // Optional 1-line note field
@@ -598,32 +685,88 @@ struct MenuBarPopoverView: View {
         return nil
     }
 
+    private var jevStatusHelpText: String {
+        if let err = coordinator.jevLastError, !err.isEmpty {
+            return "Jev 自动识别异常：\(err)"
+        }
+        if let cls = coordinator.jevLastClassification {
+            let pct = Int((cls.confidence * 100).rounded())
+            return "Jev 自动识别运行中 · 最近置信度 \(pct)%"
+        }
+        return "Jev 智能自动识别已就绪"
+    }
+
+    private var displayedTimerSeconds: TimeInterval {
+        if isFocusing {
+            return coordinator.elapsedFocusSeconds
+        }
+        if let mode = coordinator.activeActivityMode {
+            let mins = coordinator.activityModeMinutes[mode.rawValue] ?? (mode.isDistraction ? coordinator.nonWorkMinutes : coordinator.otherWorkMinutes)
+            return mins * 60.0
+        }
+        if let nonBudget = coordinator.activeNonBudgetActivity {
+            switch nonBudget {
+            case .otherWork:
+                return coordinator.otherWorkMinutes * 60.0
+            case .nonWork:
+                return coordinator.nonWorkMinutes * 60.0
+            }
+        }
+        return 0
+    }
+
     private var activeFocusTitle: String {
+        let isJevLive = coordinator.recorderSettings.jevAutoTrackingEnabled && coordinator.jevAPIKeyConfigured
         switch coordinator.sessionState {
         case .focusing(let taskId, _):
             let name = coordinator.taskProgressList.first(where: { $0.budget.taskId == taskId })?.budget.displayName ?? taskId
+            if isJevLive {
+                return coordinator.jevIsManualPinned ? "手动纠偏 · \(name)" : "自动追踪 · \(name)"
+            }
             return "专注中 · \(name)"
         case .paused(let taskId, _):
             let name = coordinator.taskProgressList.first(where: { $0.budget.taskId == taskId })?.budget.displayName ?? taskId
             return "已暂停 · \(name)"
         case .unassigned:
-            return "待命 · 未指定专注"
+            if let mode = coordinator.activeActivityMode {
+                return "自动追踪 · \(mode.displayName)"
+            }
+            if let nonBudget = coordinator.activeNonBudgetActivity {
+                switch nonBudget {
+                case .otherWork:
+                    return "自动追踪 · 其他事务"
+                case .nonWork:
+                    return "自动追踪 · 分心/休息"
+                }
+            }
+            return isJevLive ? "自动追踪 · 等待识别" : "待命 · 未指定专注"
         }
     }
 
     private var timerColor: Color {
-        guard case .focusing(let taskId, _) = coordinator.sessionState,
-              let progress = coordinator.taskProgressList.first(where: { $0.budget.taskId == taskId }) else {
-            return .secondary
+        if case .focusing(let taskId, _) = coordinator.sessionState,
+           let progress = coordinator.taskProgressList.first(where: { $0.budget.taskId == taskId }) {
+            switch progress.status {
+            case .capReached, .approachingCap:
+                return DayHelmColors.warningAmber
+            case .targetMet:
+                return DayHelmColors.successEmerald
+            case .underTarget, .noBudget:
+                return DayHelmColors.primaryBlue
+            }
         }
-        switch progress.status {
-        case .capReached, .approachingCap:
-            return DayHelmColors.warningAmber
-        case .targetMet:
-            return DayHelmColors.successEmerald
-        case .underTarget, .noBudget:
-            return DayHelmColors.primaryBlue
+        if let mode = coordinator.activeActivityMode {
+            return Color(hex: mode.colorHex)
         }
+        if let nonBudget = coordinator.activeNonBudgetActivity {
+            switch nonBudget {
+            case .otherWork:
+                return .secondary
+            case .nonWork:
+                return DayHelmColors.destructiveRed
+            }
+        }
+        return .secondary
     }
 
     private var liveContextLine: String {

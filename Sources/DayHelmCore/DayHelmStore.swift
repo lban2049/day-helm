@@ -67,6 +67,9 @@ public struct DayHelmDaySnapshot: Sendable, Equatable, Codable {
     public let focusSessions: [FocusSessionRecord]
     public let enrichedSpans: [EnrichedSpan]
     public let metrics: DayMetrics
+    public let otherWorkMinutes: Double?
+    public let nonWorkMinutes: Double?
+    public let activityModeMinutes: [String: Double]?
 
     public init(
         schemaVersion: Int = 1,
@@ -76,7 +79,10 @@ public struct DayHelmDaySnapshot: Sendable, Equatable, Codable {
         budgets: [BudgetSnapshot],
         focusSessions: [FocusSessionRecord],
         enrichedSpans: [EnrichedSpan],
-        metrics: DayMetrics
+        metrics: DayMetrics,
+        otherWorkMinutes: Double? = nil,
+        nonWorkMinutes: Double? = nil,
+        activityModeMinutes: [String: Double]? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.date = date
@@ -86,6 +92,23 @@ public struct DayHelmDaySnapshot: Sendable, Equatable, Codable {
         self.focusSessions = focusSessions
         self.enrichedSpans = enrichedSpans
         self.metrics = metrics
+        self.otherWorkMinutes = otherWorkMinutes
+        self.nonWorkMinutes = nonWorkMinutes
+        self.activityModeMinutes = activityModeMinutes
+    }
+}
+
+public enum MenuBarDisplayMode: String, Sendable, Equatable, Codable, CaseIterable {
+    case compact
+    case standard
+    case iconOnly
+
+    public var displayName: String {
+        switch self {
+        case .compact: return "极简"
+        case .standard: return "标准"
+        case .iconOnly: return "仅图标"
+        }
     }
 }
 
@@ -114,7 +137,12 @@ public struct DayHelmSettings: Sendable, Equatable, Codable {
     public var snapshotRetentionDays: Int
     public var snapshotMaxStorageBytes: Int64
     public var ocrEveryN: Int
+    public var menuBarDisplayMode: MenuBarDisplayMode
+    public var jevAutoTrackingEnabled: Bool
+    public var jevModel: String
+    public var jevSendOCRSnippet: Bool
 
+    public static let defaultJevModel = "jev-latest"
     public static let `default` = DayHelmSettings()
 
     public init(
@@ -124,7 +152,7 @@ public struct DayHelmSettings: Sendable, Equatable, Codable {
         inputMonitoringEnabled: Bool = true,
         appFocusDebounceMs: Int = 4000,
         heartbeatIntervalMs: Int = 120_000,
-        recorderIdleThresholdMs: Int = 300_000,
+        recorderIdleThresholdMs: Int = 180_000,
         typingPauseQuietMs: Int = 2000,
         visualCheckIntervalMs: Int = 12_000,
         jpegQuality: Int = 55,
@@ -132,7 +160,11 @@ public struct DayHelmSettings: Sendable, Equatable, Codable {
         sensitiveBundleIds: [String] = DayHelmSettings.defaultSensitiveBundleIds,
         snapshotRetentionDays: Int = 7,
         snapshotMaxStorageBytes: Int64 = DayHelmSettings.defaultMaxStorageBytes,
-        ocrEveryN: Int = 1
+        ocrEveryN: Int = 1,
+        menuBarDisplayMode: MenuBarDisplayMode = .standard,
+        jevAutoTrackingEnabled: Bool = false,
+        jevModel: String = DayHelmSettings.defaultJevModel,
+        jevSendOCRSnippet: Bool = true
     ) {
         self.activityRecorderEnabled = activityRecorderEnabled
         self.deepRecordingEnabled = deepRecordingEnabled
@@ -149,6 +181,11 @@ public struct DayHelmSettings: Sendable, Equatable, Codable {
         self.snapshotRetentionDays = max(1, snapshotRetentionDays)
         self.snapshotMaxStorageBytes = max(0, snapshotMaxStorageBytes)
         self.ocrEveryN = max(1, ocrEveryN)
+        self.menuBarDisplayMode = menuBarDisplayMode
+        self.jevAutoTrackingEnabled = jevAutoTrackingEnabled
+        let trimmedModel = jevModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.jevModel = trimmedModel.isEmpty ? Self.defaultJevModel : trimmedModel
+        self.jevSendOCRSnippet = jevSendOCRSnippet
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -167,6 +204,10 @@ public struct DayHelmSettings: Sendable, Equatable, Codable {
         case snapshotRetentionDays
         case snapshotMaxStorageBytes
         case ocrEveryN
+        case menuBarDisplayMode
+        case jevAutoTrackingEnabled
+        case jevModel
+        case jevSendOCRSnippet
     }
 
     public init(from decoder: Decoder) throws {
@@ -177,7 +218,7 @@ public struct DayHelmSettings: Sendable, Equatable, Codable {
         let inputMonitoringEnabled = try container.decodeIfPresent(Bool.self, forKey: .inputMonitoringEnabled) ?? true
         let appFocusDebounceMs = try container.decodeIfPresent(Int.self, forKey: .appFocusDebounceMs) ?? 4000
         let heartbeatIntervalMs = try container.decodeIfPresent(Int.self, forKey: .heartbeatIntervalMs) ?? 120_000
-        let recorderIdleThresholdMs = try container.decodeIfPresent(Int.self, forKey: .recorderIdleThresholdMs) ?? 300_000
+        let recorderIdleThresholdMs = try container.decodeIfPresent(Int.self, forKey: .recorderIdleThresholdMs) ?? 180_000
         let typingPauseQuietMs = try container.decodeIfPresent(Int.self, forKey: .typingPauseQuietMs) ?? 2000
         let visualCheckIntervalMs = try container.decodeIfPresent(Int.self, forKey: .visualCheckIntervalMs) ?? 12_000
         let jpegQuality = try container.decodeIfPresent(Int.self, forKey: .jpegQuality) ?? 55
@@ -186,6 +227,10 @@ public struct DayHelmSettings: Sendable, Equatable, Codable {
         let snapshotRetentionDays = try container.decodeIfPresent(Int.self, forKey: .snapshotRetentionDays) ?? 7
         let snapshotMaxStorageBytes = try container.decodeIfPresent(Int64.self, forKey: .snapshotMaxStorageBytes) ?? Self.defaultMaxStorageBytes
         let ocrEveryN = try container.decodeIfPresent(Int.self, forKey: .ocrEveryN) ?? 1
+        let menuBarDisplayMode = try container.decodeIfPresent(MenuBarDisplayMode.self, forKey: .menuBarDisplayMode) ?? .standard
+        let jevAutoTrackingEnabled = try container.decodeIfPresent(Bool.self, forKey: .jevAutoTrackingEnabled) ?? false
+        let jevModel = try container.decodeIfPresent(String.self, forKey: .jevModel) ?? Self.defaultJevModel
+        let jevSendOCRSnippet = try container.decodeIfPresent(Bool.self, forKey: .jevSendOCRSnippet) ?? true
 
         self.init(
             activityRecorderEnabled: activityRecorderEnabled,
@@ -202,7 +247,11 @@ public struct DayHelmSettings: Sendable, Equatable, Codable {
             sensitiveBundleIds: sensitiveBundleIds,
             snapshotRetentionDays: snapshotRetentionDays,
             snapshotMaxStorageBytes: snapshotMaxStorageBytes,
-            ocrEveryN: ocrEveryN
+            ocrEveryN: ocrEveryN,
+            menuBarDisplayMode: menuBarDisplayMode,
+            jevAutoTrackingEnabled: jevAutoTrackingEnabled,
+            jevModel: jevModel,
+            jevSendOCRSnippet: jevSendOCRSnippet
         )
     }
 
@@ -280,6 +329,10 @@ public final class DayHelmStore: @unchecked Sendable {
         directory.appendingPathComponent("config.json")
     }
 
+    public var jevLogURL: URL {
+        directory.appendingPathComponent("jev-log.json")
+    }
+
     public init(directory: URL = defaultDirectory, fileManager: FileManager = .default) {
         self.directory = directory
         self.fileManager = fileManager
@@ -335,6 +388,10 @@ public final class DayHelmStore: @unchecked Sendable {
         var snapshotRetentionDays: Int?
         var snapshotMaxStorageBytes: Int64?
         var ocrEveryN: Int?
+        var menuBarDisplayMode: MenuBarDisplayMode?
+        var jevAutoTrackingEnabled: Bool?
+        var jevModel: String?
+        var jevSendOCRSnippet: Bool?
     }
 
     private func loadConfigDTO() -> DayHelmConfigFileDTO {
@@ -363,7 +420,7 @@ public final class DayHelmStore: @unchecked Sendable {
             inputMonitoringEnabled: dto.inputMonitoringEnabled ?? true,
             appFocusDebounceMs: dto.appFocusDebounceMs ?? 4000,
             heartbeatIntervalMs: dto.heartbeatIntervalMs ?? 120_000,
-            recorderIdleThresholdMs: dto.recorderIdleThresholdMs ?? 300_000,
+            recorderIdleThresholdMs: dto.recorderIdleThresholdMs ?? 180_000,
             typingPauseQuietMs: dto.typingPauseQuietMs ?? 2000,
             visualCheckIntervalMs: dto.visualCheckIntervalMs ?? 12_000,
             jpegQuality: dto.jpegQuality ?? 55,
@@ -371,7 +428,11 @@ public final class DayHelmStore: @unchecked Sendable {
             sensitiveBundleIds: dto.sensitiveBundleIds ?? DayHelmSettings.defaultSensitiveBundleIds,
             snapshotRetentionDays: dto.snapshotRetentionDays ?? 7,
             snapshotMaxStorageBytes: dto.snapshotMaxStorageBytes ?? DayHelmSettings.defaultMaxStorageBytes,
-            ocrEveryN: dto.ocrEveryN ?? 1
+            ocrEveryN: dto.ocrEveryN ?? 1,
+            menuBarDisplayMode: dto.menuBarDisplayMode ?? .standard,
+            jevAutoTrackingEnabled: dto.jevAutoTrackingEnabled ?? false,
+            jevModel: dto.jevModel ?? DayHelmSettings.defaultJevModel,
+            jevSendOCRSnippet: dto.jevSendOCRSnippet ?? true
         )
     }
 
@@ -392,7 +453,11 @@ public final class DayHelmStore: @unchecked Sendable {
             sensitiveBundleIds: settings.sensitiveBundleIds,
             snapshotRetentionDays: settings.snapshotRetentionDays,
             snapshotMaxStorageBytes: settings.snapshotMaxStorageBytes,
-            ocrEveryN: settings.ocrEveryN
+            ocrEveryN: settings.ocrEveryN,
+            menuBarDisplayMode: settings.menuBarDisplayMode,
+            jevAutoTrackingEnabled: settings.jevAutoTrackingEnabled,
+            jevModel: settings.jevModel,
+            jevSendOCRSnippet: settings.jevSendOCRSnippet
         )
         var payload = loadConfigDTO()
         payload.activityRecorderEnabled = normalized.activityRecorderEnabled
@@ -410,8 +475,35 @@ public final class DayHelmStore: @unchecked Sendable {
         payload.snapshotRetentionDays = normalized.snapshotRetentionDays
         payload.snapshotMaxStorageBytes = normalized.snapshotMaxStorageBytes
         payload.ocrEveryN = normalized.ocrEveryN
+        payload.menuBarDisplayMode = normalized.menuBarDisplayMode
+        payload.jevAutoTrackingEnabled = normalized.jevAutoTrackingEnabled
+        payload.jevModel = normalized.jevModel
+        payload.jevSendOCRSnippet = normalized.jevSendOCRSnippet
         let data = try encoder.encode(payload)
         try writeAtomically(data: data, to: configURL, tempURL: directory.appendingPathComponent("config.json.tmp"))
+    }
+
+    private struct JevDecisionLogFileDTO: Codable {
+        var date: String
+        var entries: [JevDecisionLogEntry]
+    }
+
+    public func saveJevDecisionLogs(_ entries: [JevDecisionLogEntry], forDate dateString: String) throws {
+        try ensureDirectory(directory)
+        let capped = Array(entries.prefix(100))
+        let payload = JevDecisionLogFileDTO(date: dateString, entries: capped)
+        let data = try encoder.encode(payload)
+        try writeAtomically(data: data, to: jevLogURL, tempURL: directory.appendingPathComponent("jev-log.json.tmp"))
+    }
+
+    public func loadJevDecisionLogs(forDate dateString: String) -> [JevDecisionLogEntry] {
+        guard fileManager.fileExists(atPath: jevLogURL.path),
+              let data = try? Data(contentsOf: jevLogURL),
+              let decoded = try? decoder.decode(JevDecisionLogFileDTO.self, from: data),
+              decoded.date == dateString else {
+            return []
+        }
+        return decoded.entries
     }
 
     @discardableResult
@@ -529,5 +621,133 @@ public final class DayHelmStore: @unchecked Sendable {
     private func fileSize(at url: URL) -> Int64 {
         let values = try? url.resourceValues(forKeys: [.fileSizeKey])
         return Int64(values?.fileSize ?? 0)
+    }
+}
+
+public enum JevAPIKeySource: String, Sendable, Equatable {
+    case localKeyFile = "local_key_file"
+    case environment = "environment"
+    case dotEnv = "dot_env"
+
+    public var displayName: String {
+        switch self {
+        case .localKeyFile: return "本地密钥文件"
+        case .environment: return "环境变量"
+        case .dotEnv: return "本地 .env"
+        }
+    }
+}
+
+public struct ResolvedJevAPIKey: Sendable, Equatable {
+    public let key: String
+    public let source: JevAPIKeySource
+
+    public init(key: String, source: JevAPIKeySource) {
+        self.key = key
+        self.source = source
+    }
+}
+
+/// Manages `JEV_API_KEY` isolated from `config.json` with 0600 permissions and env/.env fallbacks.
+public final class JevAPIKeyStore: @unchecked Sendable {
+    public let directory: URL
+    public let keyFileURL: URL
+    private let environment: [String: String]
+    private let dotEnvSearchPaths: [URL]
+    private let fileManager: FileManager
+
+    public init(
+        directory: URL = DayHelmStore.defaultDirectory,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        dotEnvSearchPaths: [URL]? = nil,
+        fileManager: FileManager = .default
+    ) {
+        self.directory = directory
+        self.keyFileURL = directory.appendingPathComponent("jev.key", isDirectory: false)
+        self.environment = environment
+        if let dotEnvSearchPaths {
+            self.dotEnvSearchPaths = dotEnvSearchPaths
+        } else {
+            let cwd = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
+            self.dotEnvSearchPaths = [cwd.appendingPathComponent(".env", isDirectory: false)]
+        }
+        self.fileManager = fileManager
+    }
+
+    public func resolveKey() -> ResolvedJevAPIKey? {
+        if fileManager.fileExists(atPath: keyFileURL.path),
+           let raw = try? String(contentsOf: keyFileURL, encoding: .utf8) {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return ResolvedJevAPIKey(key: trimmed, source: .localKeyFile)
+            }
+        }
+
+        for envKey in ["JEV_API_KEY", "TYPESAFE_API_KEY"] {
+            if let val = environment[envKey]?.trimmingCharacters(in: .whitespacesAndNewlines), !val.isEmpty {
+                return ResolvedJevAPIKey(key: val, source: .environment)
+            }
+        }
+
+        for envURL in dotEnvSearchPaths where fileManager.fileExists(atPath: envURL.path) {
+            if let found = Self.parseKey(fromDotEnv: envURL) {
+                return ResolvedJevAPIKey(key: found, source: .dotEnv)
+            }
+        }
+
+        return nil
+    }
+
+    public func saveKey(_ rawKey: String) throws {
+        let trimmed = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            try deleteKey()
+            return
+        }
+        if !fileManager.fileExists(atPath: directory.path) {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let tmpURL = directory.appendingPathComponent("jev.key.tmp", isDirectory: false)
+        if fileManager.fileExists(atPath: tmpURL.path) {
+            try? fileManager.removeItem(at: tmpURL)
+        }
+        let data = Data((trimmed + "\n").utf8)
+        fileManager.createFile(
+            atPath: tmpURL.path,
+            contents: data,
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o600))]
+        )
+        if fileManager.fileExists(atPath: keyFileURL.path) {
+            _ = try fileManager.replaceItemAt(keyFileURL, withItemAt: tmpURL, backupItemName: nil, options: [])
+        } else {
+            try fileManager.moveItem(at: tmpURL, to: keyFileURL)
+        }
+        try? fileManager.setAttributes([.posixPermissions: NSNumber(value: Int16(0o600))], ofItemAtPath: keyFileURL.path)
+    }
+
+    public func deleteKey() throws {
+        if fileManager.fileExists(atPath: keyFileURL.path) {
+            try fileManager.removeItem(at: keyFileURL)
+        }
+    }
+
+    private static func parseKey(fromDotEnv url: URL) -> String? {
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        for rawLine in content.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+            for prefix in ["JEV_API_KEY=", "TYPESAFE_API_KEY="] {
+                if line.hasPrefix(prefix) {
+                    var value = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) {
+                        value = String(value.dropFirst().dropLast())
+                    }
+                    if !value.isEmpty {
+                        return value
+                    }
+                }
+            }
+        }
+        return nil
     }
 }

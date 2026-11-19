@@ -5,6 +5,7 @@ import SwiftUI
 
 enum ActivityRecorderSection: String, CaseIterable, Hashable {
     case tasks = "事项与配额"
+    case jev = "Jev 识别"
     case capture = "活动采集"
     case privacyStorage = "隐私与存储"
     case history = "历史会话"
@@ -82,13 +83,13 @@ final class ActivityRecorderWindowController: NSObject, NSWindowDelegate, NSTool
         } else {
             let created = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 920, height: 760),
-                styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false
             )
             created.title = "DayHelm"
             created.titleVisibility = .hidden
-            created.titlebarAppearsTransparent = true
+            created.titlebarAppearsTransparent = false
             created.toolbarStyle = .unified
             created.minSize = NSSize(width: 760, height: 620)
             created.isReleasedWhenClosed = false
@@ -103,6 +104,10 @@ final class ActivityRecorderWindowController: NSObject, NSWindowDelegate, NSTool
             targetWindow = created
         }
 
+        // Show app icon in Dock & Cmd+Tab while the standalone settings/history window is open.
+        if NSApp.activationPolicy() != .regular {
+            NSApp.setActivationPolicy(.regular)
+        }
         NSApp.activate(ignoringOtherApps: true)
         targetWindow.makeKeyAndOrderFront(nil)
 
@@ -111,6 +116,18 @@ final class ActivityRecorderWindowController: NSObject, NSWindowDelegate, NSTool
             NSApp.activate(ignoringOtherApps: true)
             targetWindow.makeKeyAndOrderFront(nil)
         }
+    }
+
+    func bringToFrontIfOpen() -> Bool {
+        guard let window, window.isVisible || window.isMiniaturized else {
+            return false
+        }
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        return true
     }
 
     private func makeToolbar() -> NSToolbar {
@@ -178,5 +195,8 @@ final class ActivityRecorderWindowController: NSObject, NSWindowDelegate, NSTool
         window?.contentView = nil
         hostedCoordinator?.setRecorderWindowVisible(false)
         hostedCoordinator?.releaseHistoryWindowCaches()
+        if NSApp.activationPolicy() != .accessory {
+            NSApp.setActivationPolicy(.accessory)
+        }
     }
 }

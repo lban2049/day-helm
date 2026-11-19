@@ -41,7 +41,11 @@
 ```
 
 - 无遥测、无崩溃上报、无云同步、无网络分析
-- 进程**不发任何出站公网网络请求**
+- 默认情况下进程**不发任何出站公网网络请求**
+- **可选云端语义分类（Jev System One，默认关闭）**：仅当用户在设置中显式开启 `jevAutoTrackingEnabled` 且配置了有效的 `JEV_API_KEY`（保存于 `~/.config/alma/dayhelm/jev.key`，权限 `0600`，不写入 `config.json`；亦兼容环境变量 `JEV_API_KEY`）时，才向 `https://api.typesafe.ai/v1/systemone` 发送经过清洗的轻量活动上下文用于自动判断当前事务类型：
+  - 发送内容严格限制为：用户配置的事项名称与一句话说明、当前与最近 3 条窗口的 `appName` + 清洗后的 `windowTitle` / `url`（已剥离敏感 query 参数并执行凭据掩码），以及开启 `jevSendOCRSnippet` 时最多 **600 字符**的凭据脱敏并剥离顶栏噪声后的本机 OCR 正文摘要；
+  - **硬阻断**：锁屏状态不发起任何请求；命中 `PrivacyRedactor`（`redacted == true`）的窗口绝不发送 `windowTitle`、`url` 或 `ocrSnippet`；**永不上传任何屏幕截图图片**；
+  - 断网、关闭开关或清空 API Key 后立即恢复 100% 纯本机运行。
 - 内置本地 HTTP API 服务**严格只绑定环回地址 `127.0.0.1`**（主端口 `24001`，若被占用则在 `24001...24009` 自动选端，不占用 Alma 的 `23001`），绝不绑定外部网卡（`0.0.0.0`）
 - `GET /api/activity-recorder/snapshot-file` 只读服务 `~/.config/alma/dayhelm/snapshots/` 目录内的文件：解析软链接后的规范路径不在该目录内一律 `403`，不接受 `?path=` 指向数据库、`today.json` 或其他任意本地文件；快照已删除则 `404`，不隐式重新生成
 - 不修改 `~/.config/alma/time-audit/` 下的任何文件（仅在初次初始化时只读读取 `focus.json` 与 `config.json`）

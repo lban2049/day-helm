@@ -563,3 +563,143 @@ public final class AXWindowInspector: ActivityInspecting, @unchecked Sendable {
         return nil
     }
 }
+
+/// Lightweight, single-PID Accessibility observer attached strictly to the current frontmost application.
+/// Listens for window/tab title changes and focused-window switches on the main RunLoop with zero polling CPU,
+/// coalescing rapid title bursts (e.g. page load or terminal updates) into a single callback.
+@MainActor
+public final class AXWindowChangeObserver {
+    public private(set) var attachedPID: pid_t?
+
+    private let coalesceSeconds: TimeInterval
+    private let onContextChanged: @MainActor () -> Void
+
+    private var observer: AXObserver?
+    private var observedAppElement: AXUIElement?
+    private var observedWindowElement: AXUIElement?
+    private var coalesceTask: Task<Void, Never>?
+
+    public init(
+        coalesceSeconds: TimeInterval = 0.10,
+        onContextChanged: @escaping @MainActor () -> Void
+    ) {
+        self.coalesceSeconds = max(0.02, coalesceSeconds)
+        self.onContextChanged = onContextChanged
+    }
+
+    public func attach(pid: pid_t) {
+        guard AXIsProcessTrusted(), pid > 0, pid != getpid() else {
+            detach()
+            return
+        }
+
+        if attachedPID == pid, observer != nil {
+            rebindFocusedWindowNotification()
+            return
+        }
+
+        detach()
+
+        var created: AXObserver?
+        let status = AXObserverCreate(pid, Self.axCallback, &created)
+        guard status == .success, let newObserver = created else {
+            return
+        }
+
+        let appElement = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(appElement, 0.25)
+
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        _ = AXObserverAddNotification(newObserver, appElement, kAXFocusedWindowChangedNotification as CFString, refcon)
+        _ = AXObserverAddNotification(newObserver, appElement, kAXMainWindowChangedNotification as CFString, refcon)
+        _ = AXObserverAddNotification(newObserver, appElement, kAXTitleChangedNotification as CFString, refcon)
+
+        let source = AXObserverGetRunLoopSource(newObserver)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+
+        self.observer = newObserver
+        self.observedAppElement = appElement
+        self.attachedPID = pid
+        rebindFocusedWindowNotification()
+    }
+
+    public func stop() {
+        detach()
+    }
+
+    public func detach() {
+        coalesceTask?.cancel()
+        coalesceTask = nil
+
+        if let obs = observer {
+            if let win = observedWindowElement {
+                _ = AXObserverRemoveNotification(obs, win, kAXTitleChangedNotification as CFString)
+            }
+            if let app = observedAppElement {
+                _ = AXObserverRemoveNotification(obs, app, kAXFocusedWindowChangedNotification as CFString)
+                _ = AXObserverRemoveNotification(obs, app, kAXMainWindowChangedNotification as CFString)
+                _ = AXObserverRemoveNotification(obs, app, kAXTitleChangedNotification as CFString)
+            }
+            let source = AXObserverGetRunLoopSource(obs)
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+        }
+
+        observer = nil
+        observedWindowElement = nil
+        observedAppElement = nil
+        attachedPID = nil
+    }
+
+    private func rebindFocusedWindowNotification() {
+        guard let obs = observer, let app = observedAppElement else { return }
+        let nextWindow = Self.copyFocusedWindow(from: app)
+
+        if let prev = observedWindowElement, let next = nextWindow, CFEqual(prev, next) {
+            return
+        }
+        if let prev = observedWindowElement {
+            _ = AXObserverRemoveNotification(obs, prev, kAXTitleChangedNotification as CFString)
+            observedWindowElement = nil
+        }
+        if let next = nextWindow {
+            let refcon = Unmanaged.passUnretained(self).toOpaque()
+            _ = AXObserverAddNotification(obs, next, kAXTitleChangedNotification as CFString, refcon)
+            observedWindowElement = next
+        }
+    }
+
+    private func handleNotification(name: String) {
+        if name == kAXFocusedWindowChangedNotification || name == kAXMainWindowChangedNotification {
+            rebindFocusedWindowNotification()
+        }
+        scheduleCoalescedNotify()
+    }
+
+    private func scheduleCoalescedNotify() {
+        coalesceTask?.cancel()
+        let delayNanos = UInt64(coalesceSeconds * 1_000_000_000)
+        coalesceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delayNanos)
+            guard !Task.isCancelled, let self else { return }
+            self.onContextChanged()
+        }
+    }
+
+    private static let axCallback: AXObserverCallback = { _, _, notification, refcon in
+        guard let refcon else { return }
+        let name = notification as String
+        let instance = Unmanaged<AXWindowChangeObserver>.fromOpaque(refcon).takeUnretainedValue()
+        MainActor.assumeIsolated {
+            instance.handleNotification(name: name)
+        }
+    }
+
+    private static func copyFocusedWindow(from appElement: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, &value)
+        guard err == .success, let cfVal = value, CFGetTypeID(cfVal) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeDowncast(cfVal, to: AXUIElement.self)
+    }
+}

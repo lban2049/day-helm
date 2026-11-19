@@ -39,5 +39,6 @@ A / B / C，各自的代价，不要只写优点。
 | [009](009-activity-recorder-settings-and-session-history-ui.md) | 采集器配置面板与历史会话检视器（独立窗口 + Precision Telemetry 风格） | 已采纳 |
 | [010](010-cross-app-same-task-switch-detection.md) | 跨应用同任务切换判定与高频切换降噪机制 | 已采纳 |
 | [011](011-cpu-and-memory-performance-convergence.md) | CPU 与内存性能收敛：Core 记忆化、SQLite 索引、单次像素签名、OCR 降采样与 UI 按需解码 | 已采纳 |
-| 004 | 项目映射机制（如何区分"切去其它项目"与"多应用正常协同"） | 待阶段 2 开始前拍板 |
-| 005 | 跑偏与高频乱切的滑动窗口判定阈值及提醒交互 | 待阶段 2 开始前拍板 |
+| [012](012-jev-semantic-auto-tracking.md) | 基于 Jev (System One) 的零手工语义自动追踪与时间归属 | 已采纳 |
+| 004 | 项目映射机制（如何区分"切去其它项目"与"多应用正常协同"） | 被 010 / 012 演进覆盖 |
+| 005 | 跑偏与高频乱切的滑动窗口判定阈值及提醒交互 | 已在阶段 2 持续迭代 |
