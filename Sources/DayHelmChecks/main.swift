@@ -240,6 +240,22 @@ struct DayHelmChecksMain {
             try checkApprox(result.metrics.longestBlockMinutes, 20.0, tolerance: 0.5, "Longest block minutes")
         }
 
+        try await runCheck("8b. Spectrum falls back to Jev activity modes without concrete tasks") {
+            let t0 = baseDate()
+            let budgets = [TaskBudget(taskId: "dev", displayName: "开发事项", colorHex: "#3B82F6")]
+            let spans: [EnrichedSpan] = [
+                EnrichedSpan(startedAt: t0, endedAt: t0.addingTimeInterval(600), appName: "Xcode", bundleId: "com.apple.dt.Xcode", windowTitle: "App.swift", url: nil, declaredTaskId: nil, redacted: false, semanticGroup: "mode:build"),
+                EnrichedSpan(startedAt: t0.addingTimeInterval(600), endedAt: t0.addingTimeInterval(1200), appName: "Chrome", bundleId: "com.google.Chrome", windowTitle: "Ops Board", url: nil, declaredTaskId: nil, redacted: false, semanticGroup: "mode:operate"),
+                EnrichedSpan(startedAt: t0.addingTimeInterval(1200), endedAt: t0.addingTimeInterval(1800), appName: "Xcode", bundleId: "com.apple.dt.Xcode", windowTitle: "Engine.swift", url: nil, declaredTaskId: "dev", redacted: false, semanticGroup: "mode:build")
+            ]
+            let result = SpectrumBuilder.build(spans: spans, focusSessions: [], budgets: budgets, now: t0.addingTimeInterval(1800))
+            try check(result.segments.contains { if case .activityMode(let raw) = $0.kind { return raw == ActivityMode.build.rawValue }; return false }, "Build mode segment")
+            try check(result.segments.contains { if case .activityMode(let raw) = $0.kind { return raw == ActivityMode.operate.rawValue }; return false }, "Operate mode segment")
+            try check(result.segments.contains { if case .task(let id, _, _) = $0.kind { return id == "dev" }; return false }, "Concrete task still wins")
+            try check(!result.segments.contains { if case .unassigned = $0.kind { return true }; return false }, "Matched modes must not fall back to unassigned")
+            try checkApprox(result.metrics.longestBlockMinutes, 10.0, tolerance: 0.001, "Mode blocks count toward longest block")
+        }
+
         try await runCheck("9. DayHelmEngine cross-app collaboration tolerance") {
             let t0 = baseDate()
             let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))

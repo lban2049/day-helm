@@ -297,6 +297,7 @@ public struct FocusSessionRecord: Sendable, Equatable, Codable, Identifiable {
 
 public enum SpectrumSegmentKind: Sendable, Equatable, Codable {
     case task(taskId: String, displayName: String, colorHex: String)
+    case activityMode(rawValue: String)
     case thrashing(switchCount: Int)
     case idle
     case unassigned

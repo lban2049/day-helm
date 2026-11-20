@@ -131,6 +131,25 @@ final class DayHelmCoreTests: XCTestCase {
         XCTAssertEqual(result.metrics.solidBlocksCount, 1)
     }
 
+    func testSpectrumFallsBackToActivityModeWithoutConcreteTask() {
+        let t0 = baseDate()
+        let budgets = [
+            TaskBudget(taskId: "dev", displayName: "开发事项", colorHex: "#3B82F6")
+        ]
+        let spans: [EnrichedSpan] = [
+            EnrichedSpan(startedAt: t0, endedAt: t0.addingTimeInterval(600), appName: "Xcode", bundleId: "com.apple.dt.Xcode", windowTitle: "App.swift", url: nil, declaredTaskId: nil, redacted: false, semanticGroup: "mode:build"),
+            EnrichedSpan(startedAt: t0.addingTimeInterval(600), endedAt: t0.addingTimeInterval(1200), appName: "Chrome", bundleId: "com.google.Chrome", windowTitle: "Ops Board", url: nil, declaredTaskId: nil, redacted: false, semanticGroup: "mode:operate"),
+            EnrichedSpan(startedAt: t0.addingTimeInterval(1200), endedAt: t0.addingTimeInterval(1800), appName: "Xcode", bundleId: "com.apple.dt.Xcode", windowTitle: "Engine.swift", url: nil, declaredTaskId: "dev", redacted: false, semanticGroup: "mode:build")
+        ]
+
+        let result = SpectrumBuilder.build(spans: spans, focusSessions: [], budgets: budgets, now: t0.addingTimeInterval(1800))
+        XCTAssertTrue(result.segments.contains { if case .activityMode(let raw) = $0.kind { return raw == ActivityMode.build.rawValue }; return false })
+        XCTAssertTrue(result.segments.contains { if case .activityMode(let raw) = $0.kind { return raw == ActivityMode.operate.rawValue }; return false })
+        XCTAssertTrue(result.segments.contains { if case .task(let id, _, _) = $0.kind { return id == "dev" }; return false })
+        XCTAssertFalse(result.segments.contains { if case .unassigned = $0.kind { return true }; return false })
+        XCTAssertEqual(result.metrics.longestBlockMinutes, 10.0, accuracy: 0.001)
+    }
+
     func testEngineAllowsCrossAppCollaborationDuringFocus() {
         let t0 = baseDate()
         let engine = DayHelmEngine(budgets: sampleBudgets(), clock: ManualClock(now: t0))
@@ -1581,6 +1600,26 @@ struct DayHelmCoreTests {
         #expect(result.segments.contains { if case .idle = $0.kind { return true }; return false })
         #expect(abs(result.metrics.longestBlockMinutes - 20.0) < 0.5)
         #expect(result.metrics.solidBlocksCount == 1)
+    }
+
+    @Test("Spectrum falls back to activity mode without a concrete task")
+    func spectrumFallsBackToActivityModeWithoutConcreteTask() {
+        let t0 = baseDate()
+        let budgets = [
+            TaskBudget(taskId: "dev", displayName: "开发事项", colorHex: "#3B82F6")
+        ]
+        let spans: [EnrichedSpan] = [
+            EnrichedSpan(startedAt: t0, endedAt: t0.addingTimeInterval(600), appName: "Xcode", bundleId: "com.apple.dt.Xcode", windowTitle: "App.swift", url: nil, declaredTaskId: nil, redacted: false, semanticGroup: "mode:build"),
+            EnrichedSpan(startedAt: t0.addingTimeInterval(600), endedAt: t0.addingTimeInterval(1200), appName: "Chrome", bundleId: "com.google.Chrome", windowTitle: "Ops Board", url: nil, declaredTaskId: nil, redacted: false, semanticGroup: "mode:operate"),
+            EnrichedSpan(startedAt: t0.addingTimeInterval(1200), endedAt: t0.addingTimeInterval(1800), appName: "Xcode", bundleId: "com.apple.dt.Xcode", windowTitle: "Engine.swift", url: nil, declaredTaskId: "dev", redacted: false, semanticGroup: "mode:build")
+        ]
+
+        let result = SpectrumBuilder.build(spans: spans, focusSessions: [], budgets: budgets, now: t0.addingTimeInterval(1800))
+        #expect(result.segments.contains { if case .activityMode(let raw) = $0.kind { return raw == ActivityMode.build.rawValue }; return false })
+        #expect(result.segments.contains { if case .activityMode(let raw) = $0.kind { return raw == ActivityMode.operate.rawValue }; return false })
+        #expect(result.segments.contains { if case .task(let id, _, _) = $0.kind { return id == "dev" }; return false })
+        #expect(!result.segments.contains { if case .unassigned = $0.kind { return true }; return false })
+        #expect(abs(result.metrics.longestBlockMinutes - 10.0) < 0.001)
     }
 
     @Test("Engine allows cross-app collaboration during focus")

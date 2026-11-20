@@ -650,11 +650,18 @@ public enum SpectrumBuilder {
             let span = sortedSpans[idx]
             let end = max(span.startedAt, span.endedAt)
             guard end > span.startedAt else { continue }
-            let kind: SpectrumSegmentKind = span.declaredTaskId.map {
-                taskKind(for: $0, budgetMap: budgetMap)
-            } ?? .unassigned
+            let kind: SpectrumSegmentKind
             let isTask: Bool
-            if case .task = kind { isTask = true } else { isTask = false }
+            if let taskId = span.declaredTaskId {
+                kind = taskKind(for: taskId, budgetMap: budgetMap)
+                isTask = true
+            } else if let mode = activityMode(for: span) {
+                kind = .activityMode(rawValue: mode.rawValue)
+                isTask = true
+            } else {
+                kind = .unassigned
+                isTask = false
+            }
             if let last = tailSpanIntervals.last,
                last.kind == kind,
                span.startedAt.timeIntervalSince(last.endedAt) <= 0.001 {
@@ -840,6 +847,15 @@ public enum SpectrumBuilder {
                 if seg.durationMinutes >= solidBlockMinimumMinutes {
                     solidBlocksCount += 1
                 }
+            case .activityMode(let rawValue):
+                guard rawValue != ActivityMode.breakTime.rawValue else { break }
+                activeMinutes += seg.durationMinutes
+                if seg.durationMinutes > longestBlockMinutes {
+                    longestBlockMinutes = seg.durationMinutes
+                }
+                if seg.durationMinutes >= solidBlockMinimumMinutes {
+                    solidBlocksCount += 1
+                }
             case .thrashing(let switchCount):
                 _ = switchCount
                 activeMinutes += seg.durationMinutes
@@ -871,6 +887,15 @@ public enum SpectrumBuilder {
             return spans.sorted { $0.startedAt < $1.startedAt }
         }
         return spans
+    }
+
+    private static func activityMode(for span: EnrichedSpan) -> ActivityMode? {
+        guard let group = span.semanticGroup, !group.isEmpty else { return nil }
+        if group == "break" {
+            return .breakTime
+        }
+        guard group.hasPrefix("mode:") else { return nil }
+        return ActivityMode(rawValue: String(group.dropFirst(5)))
     }
 
     private static func taskKind(for taskId: String, budgetMap: [String: TaskBudget]) -> SpectrumSegmentKind {
