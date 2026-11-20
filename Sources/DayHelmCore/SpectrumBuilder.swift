@@ -5,12 +5,21 @@ public struct ThrashingWindow: Sendable, Equatable {
     public let endedAt: Date
     public let switchCount: Int
     public let distinctContextCount: Int
+    /// Keys present in the qualifying window, in first-seen order.
+    public let contextKeys: [String]
 
-    public init(startedAt: Date, endedAt: Date, switchCount: Int, distinctContextCount: Int = 0) {
+    public init(
+        startedAt: Date,
+        endedAt: Date,
+        switchCount: Int,
+        distinctContextCount: Int = 0,
+        contextKeys: [String] = []
+    ) {
         self.startedAt = startedAt
         self.endedAt = endedAt
         self.switchCount = switchCount
         self.distinctContextCount = distinctContextCount
+        self.contextKeys = contextKeys
     }
 }
 
@@ -193,7 +202,10 @@ public enum SpectrumBuilder {
                                         startedAt: stablePrepared[cache.left].span.startedAt,
                                         endedAt: windowEnd,
                                         switchCount: switches,
-                                        distinctContextCount: distinctContextCount
+                                        distinctContextCount: distinctContextCount,
+                                        contextKeys: Self.orderedContextKeys(in: cache.left...right) {
+                                            SwitchClassifier.thrashingContextKey(for: stablePrepared[$0])
+                                        }
                                     )
                                 )
                             }
@@ -302,7 +314,10 @@ public enum SpectrumBuilder {
                             startedAt: preparedAt(localLeft).span.startedAt,
                             endedAt: windowEnd,
                             switchCount: switches,
-                            distinctContextCount: distinctContextCount
+                            distinctContextCount: distinctContextCount,
+                            contextKeys: Self.orderedContextKeys(in: localLeft...right) {
+                                SwitchClassifier.thrashingContextKey(for: preparedAt($0))
+                            }
                         )
                     )
                 }
@@ -319,17 +334,44 @@ public enum SpectrumBuilder {
         for win in sortedWindows.dropFirst() {
             let last = merged[merged.count - 1]
             if win.startedAt <= last.endedAt {
+                let mergedKeys = Self.mergedContextKeys(last.contextKeys, win.contextKeys)
                 merged[merged.count - 1] = ThrashingWindow(
                     startedAt: last.startedAt,
                     endedAt: max(last.endedAt, win.endedAt),
                     switchCount: max(last.switchCount, win.switchCount),
-                    distinctContextCount: max(last.distinctContextCount, win.distinctContextCount)
+                    distinctContextCount: max(last.distinctContextCount, win.distinctContextCount, mergedKeys.count),
+                    contextKeys: mergedKeys
                 )
             } else {
                 merged.append(win)
             }
         }
         return merged
+    }
+
+    private static func orderedContextKeys(
+        in range: ClosedRange<Int>,
+        keyAt: (Int) -> String
+    ) -> [String] {
+        var seen: Set<String> = []
+        var keys: [String] = []
+        keys.reserveCapacity(range.count)
+        for index in range {
+            let key = keyAt(index)
+            if seen.insert(key).inserted {
+                keys.append(key)
+            }
+        }
+        return keys
+    }
+
+    private static func mergedContextKeys(_ lhs: [String], _ rhs: [String]) -> [String] {
+        var seen = Set(lhs)
+        var result = lhs
+        for key in rhs where seen.insert(key).inserted {
+            result.append(key)
+        }
+        return result
     }
 
     private static func detectThrashingWindows(

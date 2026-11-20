@@ -201,7 +201,45 @@ final class DayHelmCoreTests: XCTestCase {
         for i in 0..<12 {
             thrashAlerts.append(contentsOf: engine.ingest(ActivitySample(timestamp: thrashBase.addingTimeInterval(Double(i) * 20), appName: i % 2 == 0 ? "Chrome" : "Terminal", bundleId: i % 2 == 0 ? "com.google.Chrome" : "com.apple.Terminal", windowTitle: "Tab \(i)", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)))
         }
-        XCTAssertTrue(thrashAlerts.contains { if case .highFrequencySwitch = $0.kind { return true }; return false })
+        let thrashAlert = thrashAlerts.first { if case .highFrequencySwitch = $0.kind { return true }; return false }
+        XCTAssertNotNil(thrashAlert)
+        XCTAssertTrue(thrashAlert?.title.contains("切换偏碎") == true)
+        XCTAssertTrue(thrashAlert?.message.contains("固定一个任务 10 分钟") == true)
+    }
+
+    func testHighFrequencySwitchAlertExplainsSemanticActivityTypes() {
+        let t0 = baseDate()
+        let engine = DayHelmEngine(budgets: [], clock: ManualClock(now: t0))
+        let modes: [ActivityMode] = [.build, .commsAdmin, .operate, .research, .create]
+        var alerts: [SupervisorAlert] = []
+
+        for i in 0..<12 {
+            let mode = modes[i % modes.count]
+            let ts = t0.addingTimeInterval(Double(i) * 20)
+            engine.applyAutoCategory(mode.categoryId, activityMode: mode, at: ts)
+            alerts.append(contentsOf: engine.ingest(
+                ActivitySample(
+                    timestamp: ts,
+                    appName: mode == .commsAdmin ? "微信" : "SyntheticApp\(i)",
+                    bundleId: "com.synthetic.app\(i)",
+                    windowTitle: "Synthetic \(mode.rawValue) \(i)",
+                    url: nil,
+                    idleSeconds: 0,
+                    screenLocked: false,
+                    inputActive: true
+                )
+            ))
+        }
+
+        let alert = alerts.first { if case .highFrequencySwitch = $0.kind { return true }; return false }
+        XCTAssertNotNil(alert)
+        XCTAssertTrue(alert?.title.contains("跨了 5 类活动") == true)
+        XCTAssertTrue(alert?.message.contains("开发构建") == true)
+        XCTAssertTrue(alert?.message.contains("沟通杂务") == true)
+        XCTAssertTrue(alert?.message.contains("业务运营") == true)
+        XCTAssertTrue(alert?.message.contains("研究规划") == true)
+        XCTAssertTrue(alert?.message.contains("内容创作") == true)
+        XCTAssertTrue(alert?.message.contains("固定一个活动 10 分钟") == true)
     }
 
     func testTimeAuditConfigLoaderFallbackAndParsing() throws {
@@ -1619,7 +1657,46 @@ struct DayHelmCoreTests {
         for i in 0..<12 {
             thrashAlerts.append(contentsOf: engine.ingest(ActivitySample(timestamp: thrashBase.addingTimeInterval(Double(i) * 20), appName: i % 2 == 0 ? "Chrome" : "Terminal", bundleId: i % 2 == 0 ? "com.google.Chrome" : "com.apple.Terminal", windowTitle: "Tab \(i)", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)))
         }
-        #expect(thrashAlerts.contains { if case .highFrequencySwitch = $0.kind { return true }; return false })
+        let thrashAlert = thrashAlerts.first { if case .highFrequencySwitch = $0.kind { return true }; return false }
+        #expect(thrashAlert != nil)
+        #expect(thrashAlert?.title.contains("切换偏碎") == true)
+        #expect(thrashAlert?.message.contains("固定一个任务 10 分钟") == true)
+    }
+
+    @Test("High-frequency switch alert explains semantic activity types")
+    func highFrequencySwitchAlertExplainsSemanticActivityTypes() {
+        let t0 = baseDate()
+        let engine = DayHelmEngine(budgets: [], clock: ManualClock(now: t0))
+        let modes: [ActivityMode] = [.build, .commsAdmin, .operate, .research, .create]
+        var alerts: [SupervisorAlert] = []
+
+        for i in 0..<12 {
+            let mode = modes[i % modes.count]
+            let ts = t0.addingTimeInterval(Double(i) * 20)
+            engine.applyAutoCategory(mode.categoryId, activityMode: mode, at: ts)
+            alerts.append(contentsOf: engine.ingest(
+                ActivitySample(
+                    timestamp: ts,
+                    appName: mode == .commsAdmin ? "微信" : "SyntheticApp\(i)",
+                    bundleId: "com.synthetic.app\(i)",
+                    windowTitle: "Synthetic \(mode.rawValue) \(i)",
+                    url: nil,
+                    idleSeconds: 0,
+                    screenLocked: false,
+                    inputActive: true
+                )
+            ))
+        }
+
+        let alert = alerts.first { if case .highFrequencySwitch = $0.kind { return true }; return false }
+        #expect(alert != nil)
+        #expect(alert?.title.contains("跨了 5 类活动") == true)
+        #expect(alert?.message.contains("开发构建") == true)
+        #expect(alert?.message.contains("沟通杂务") == true)
+        #expect(alert?.message.contains("业务运营") == true)
+        #expect(alert?.message.contains("研究规划") == true)
+        #expect(alert?.message.contains("内容创作") == true)
+        #expect(alert?.message.contains("固定一个活动 10 分钟") == true)
     }
 
     @Test("TimeAuditConfigLoader falls back gracefully and merges project keywords")

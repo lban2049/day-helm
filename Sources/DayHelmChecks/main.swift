@@ -311,7 +311,41 @@ struct DayHelmChecksMain {
             for i in 0..<12 {
                 thrashAlerts.append(contentsOf: engine.ingest(ActivitySample(timestamp: thrashBase.addingTimeInterval(Double(i) * 20), appName: i % 2 == 0 ? "Chrome" : "Terminal", bundleId: i % 2 == 0 ? "com.google.Chrome" : "com.apple.Terminal", windowTitle: "Tab \(i)", url: nil, idleSeconds: 0, screenLocked: false, inputActive: true)))
             }
-            try check(thrashAlerts.contains { if case .highFrequencySwitch = $0.kind { return true }; return false }, "High-frequency switch alert")
+            let thrashAlert = thrashAlerts.first { if case .highFrequencySwitch = $0.kind { return true }; return false }
+            try check(thrashAlert != nil, "High-frequency switch alert")
+            try check(thrashAlert?.title.contains("切换偏碎") == true, "High-frequency switch title explains choppy switching")
+            try check(thrashAlert?.message.contains("固定一个任务 10 分钟") == true, "High-frequency switch message gives an action")
+        }
+
+        try await runCheck("12b. High-frequency switch alert explains semantic activity types") {
+            let t0 = baseDate()
+            let engine = DayHelmEngine(budgets: [], clock: ManualClock(now: t0))
+            let modes: [ActivityMode] = [.build, .commsAdmin, .operate, .research, .create]
+            var alerts: [SupervisorAlert] = []
+            for i in 0..<12 {
+                let mode = modes[i % modes.count]
+                let ts = t0.addingTimeInterval(Double(i) * 20)
+                engine.applyAutoCategory(mode.categoryId, activityMode: mode, at: ts)
+                alerts.append(contentsOf: engine.ingest(
+                    ActivitySample(
+                        timestamp: ts,
+                        appName: mode == .commsAdmin ? "微信" : "SyntheticApp\(i)",
+                        bundleId: "com.synthetic.app\(i)",
+                        windowTitle: "Synthetic \(mode.rawValue) \(i)",
+                        url: nil,
+                        idleSeconds: 0,
+                        screenLocked: false,
+                        inputActive: true
+                    )
+                ))
+            }
+            let alert = alerts.first { if case .highFrequencySwitch = $0.kind { return true }; return false }
+            try check(alert != nil, "Semantic-mode thrashing alert")
+            try check(alert?.title.contains("跨了 5 类活动") == true, "Alert title names the activity category count")
+            for label in ["开发构建", "沟通杂务", "业务运营", "研究规划", "内容创作"] {
+                try check(alert?.message.contains(label) == true, "Alert message includes \(label)")
+            }
+            try check(alert?.message.contains("固定一个活动 10 分钟") == true, "Alert message gives a concrete next step")
         }
 
         try await runCheck("13. TimeAuditConfigLoader fallback and synthetic parsing") {

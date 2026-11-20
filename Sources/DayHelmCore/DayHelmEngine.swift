@@ -1160,23 +1160,60 @@ public final class DayHelmEngine: @unchecked Sendable {
         lastThrashingAlertAt = ts
         alertCounter += 1
         let windowMins = max(1, Int(config.thrashingWindowSeconds / 60.0))
+        let labels = highFrequencySwitchLabels(for: latest.contextKeys)
+        let showsLabels = !labels.isEmpty && labels.count == latest.distinctContextCount
+        let title: String
         let message: String
-        if latest.distinctContextCount > 0 {
-            message = "过去 \(windowMins) 分钟内在 \(latest.distinctContextCount) 个不同上下文间频繁切换，连续专注被打散，建议稳住当前任务或先休息 3 分钟。"
+
+        if showsLabels {
+            let visible = labels.prefix(5).joined(separator: " → ")
+            let suffix = labels.count > 5 ? " 等" : ""
+            title = "近 \(windowMins)m 跨了 \(latest.distinctContextCount) 类活动（\(latest.switchCount) 次切换）"
+            message = "当前识别到：\(visible)\(suffix)。若这些都在服务同一件事，忽略本轮即可；否则先固定一个活动 10 分钟，再处理其他分支。"
         } else {
-            message = "过去 \(windowMins) 分钟内应用切换频繁，连续专注被打散，建议稳住当前任务或先休息 3 分钟。"
+            let contextText = latest.distinctContextCount > 0
+                ? "，涉及 \(latest.distinctContextCount) 个应用/站点分组"
+                : ""
+            title = "近 \(windowMins)m 切换偏碎（\(latest.switchCount) 次）"
+            message = "最近 \(windowMins) 分钟检测到 \(latest.switchCount) 次跨任务切换\(contextText)。若属于同一件事的多应用配合，可忽略；否则先固定一个任务 10 分钟。"
         }
+
         return SupervisorAlert(
             id: "alert_\(alertCounter)",
             timestamp: ts,
             kind: .highFrequencySwitch(switchesInWindow: latest.switchCount, windowMinutes: windowMins),
-            title: "检测到高频切换（\(latest.switchCount) 次 / \(windowMins)m）",
+            title: title,
             message: message,
             actions: [
                 .snooze(minutes: 15, label: "15m 后再说"),
                 .dismiss(label: "知道了")
             ]
         )
+    }
+
+    private func highFrequencySwitchLabels(for contextKeys: [String]) -> [String] {
+        var labels: [String] = []
+        var seen: Set<String> = []
+        for key in contextKeys {
+            guard key.hasPrefix("sem|") else { continue }
+            let group = String(key.dropFirst(4))
+            let label: String?
+            if group == "break" {
+                label = ActivityMode.breakTime.displayName
+            } else if group.hasPrefix("mode:"),
+                      let mode = ActivityMode(rawValue: String(group.dropFirst(5))) {
+                label = mode.displayName
+            } else if group.hasPrefix("proj:") {
+                let taskId = String(group.dropFirst(5))
+                label = _budgets.first { $0.taskId == taskId }?.displayName ?? taskId
+            } else {
+                label = nil
+            }
+            if let label, seen.insert(label).inserted {
+                labels.append(label)
+            }
+        }
+        return labels
     }
 
     private func makeCapAlertLocked(budget: TaskBudget, focusedMinutes: Double, cap: Int, at ts: Date) -> SupervisorAlert {
