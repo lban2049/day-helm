@@ -97,3 +97,42 @@ Sources/DayHelmChecks/      # 确定性自检断言，失败 exit 1
 - 不运行会真正采集用户数据的常驻进程
 - 不推送、不部署
 - 不在 `/Applications` 下的任何 app 包里改代码
+
+## 任务看板与需求建卡规范（`vboard`）
+
+本项目已绑定本地异步任务看板（项目标识：`focus-guard`，对应看板空间「DayHelm」）。在需求讨论、体验复盘或缺陷梳理过程中，当用户要求把结论记录为任务卡时，**通过本机 `vboard` CLI 按以下规范直接建卡**（严禁将任何看板 Token 或私密地址写入代码仓库）：
+
+### 建卡命令与默认落列
+```bash
+vboard add focus-guard \
+  --title "<动词开头的简明标题，30字内>" \
+  --desc "<按下方模板整理的结构化描述>" \
+  --column draft \
+  [--size S|M|L]
+```
+- 多行长描述优先用 `--desc-file <path>` 传入，避免 Shell 转义问题；建卡后务必向用户汇报返回的 `taskId`、落列、档位与卡片链接。
+- **默认落入 `draft`（草稿箱）**，不触发后台自动执行；**仅当用户明确要求“直接进 Ready / 立刻排队执行”时**才传 `--column ready`。
+- 后台任务按 `Ready` 列顺序在独立 Git Worktree 串行消费，整批清空后自动合并回 `main` 并执行 `./scripts/install-app.sh --launch` 更新 `/Applications/DayHelm.app`。
+
+### 复杂度档位（`--size`，可选）
+未传 `--size` 时，批次主控会在领取后自动推测并在验收不通过时自动升档；复杂度明确时建议直接附带：
+- **`S`（简单微调 → `DeepSeek V4.1 Flash`）**：文案/排版微调、单配置项、明显单点小修（预估 ≤ 2 文件，不涉核心状态机或文档架构变更）。
+- **`M`（标准任务 → `Gemini 4 Hydrogen`）**：常规 Bug 修复、单模块新功能、菜单栏/面板交互调整、需补齐确定性自检（约 3~6 文件）。
+- **`L`（复杂核心 → `Gemini 4 Neon`）**：采集引擎/SQLite/HTTP/配额算法/隐私脱敏边界变更、架构重构或需新增 ADR 决策记录的复杂任务。
+
+### 任务卡描述标准模板（确保异步 Agent 无需追问即可闭环）
+```markdown
+## 背景与目标
+- 当前体验痛点 / 需求背景与期望结果
+
+## 改动范围与设计要点
+- 涉及模块（`DayHelmCore` / `DayHelmCapture` / `DayHelmApp` / `DayHelmChecks`）与关键交互细节
+- 需同步更新的文档（`docs/requirements.md` / `docs/architecture.md` / `docs/privacy.md` / ADR）
+
+## 约束与边界
+- 需遵守的四条硬约束、隐私脱敏边界及明确不做的范围
+
+## 验收标准（AC）
+- [ ] `DayHelmChecks` 新增的确定性测试断言（无 GUI/无网络/注入时钟）
+- [ ] 用户可复现的桌面预览验收步骤
+```
