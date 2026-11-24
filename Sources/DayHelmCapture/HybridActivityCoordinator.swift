@@ -871,6 +871,9 @@ public final class HybridActivityCoordinator: ObservableObject {
         engine.switchTask(to: taskId, note: effectiveNote, at: now)
         if settings.jevAutoTrackingEnabled {
             semanticTracker.recordManualSelection(categoryId: taskId, contextKey: observedContextKey, at: now)
+            if let ctxKey = observedContextKey {
+                engine.stampSemanticGroup("proj:\(taskId)", forContextKey: ctxKey, at: now)
+            }
             jevIsManualPinned = semanticTracker.isManualPinActive
             if let sample = engine.lastSample {
                 appendJevDecisionLog(
@@ -1812,17 +1815,6 @@ public final class HybridActivityCoordinator: ObservableObject {
             return
         }
 
-        let probeSpan = EnrichedSpan(
-            startedAt: sample.timestamp,
-            endedAt: sample.timestamp,
-            appName: sample.appName,
-            bundleId: sample.bundleId,
-            windowTitle: sample.windowTitle,
-            url: sample.url,
-            declaredTaskId: nil,
-            redacted: sample.redacted
-        )
-        let canonicalKey = SwitchClassifier.canonicalContextKey(for: probeSpan)
         let contextKey = SemanticPayloadSanitizer.semanticContextKey(for: sample)
 
         if observedContextKey != contextKey {
@@ -1868,12 +1860,12 @@ public final class HybridActivityCoordinator: ObservableObject {
         if dwellDecision.didSwitch, let committed = dwellDecision.committedCategoryId {
             jevPendingConfirmTask?.cancel()
             jevPendingConfirmTask = nil
-            let lastCls = semanticTracker.latestClassification
-            engine.applyAutoCategory(committed, activityMode: lastCls?.activityMode, at: now)
-            if let semGroup = lastCls?.semanticGroupKey {
-                engine.stampSemanticGroup(semGroup, forContextKey: canonicalKey, at: now)
+            let committedCls = dwellDecision.committedClassification ?? semanticTracker.latestClassification
+            engine.applyAutoCategory(committed, activityMode: committedCls?.activityMode, at: now)
+            if let semGroup = committedCls?.semanticGroupKey {
+                engine.stampSemanticGroup(semGroup, forContextKey: contextKey, at: now)
             }
-            let focusProjName = lastCls?.focusProjectId.map { categoryDisplayName(for: $0) }
+            let focusProjName = committedCls?.focusProjectId.map { categoryDisplayName(for: $0) }
             appendJevDecisionLog(
                 JevDecisionLogEntry(
                     timestamp: now,
@@ -1884,12 +1876,12 @@ public final class HybridActivityCoordinator: ObservableObject {
                     usedOCRSnippet: false,
                     predictedCategoryId: committed,
                     predictedDisplayName: categoryDisplayName(for: committed),
-                    activityMode: lastCls?.activityMode,
+                    activityMode: committedCls?.activityMode,
                     focusProjectDisplayName: focusProjName,
-                    confidence: lastCls?.confidence ?? 1.0,
-                    sameTaskAsPrevious: lastCls?.sameTaskAsPrevious,
-                    isDistraction: lastCls?.isDistraction ?? 0.0,
-                    source: .cache,
+                    confidence: committedCls?.confidence ?? 1.0,
+                    sameTaskAsPrevious: committedCls?.sameTaskAsPrevious,
+                    isDistraction: committedCls?.isDistraction ?? 0.0,
+                    source: committedCls?.source ?? .cache,
                     outcome: .committedSwitch
                 )
             )
@@ -1914,15 +1906,22 @@ public final class HybridActivityCoordinator: ObservableObject {
                 source: .localOverride,
                 classifiedAt: now
             )
+            let wasPinned = semanticTracker.isManualPinActive
+            let previousCategory = semanticTracker.currentCategoryId
             let decision = semanticTracker.apply(
                 classification: overrideCls,
                 contextKey: contextKey,
                 budgetsVersion: budgetsVersion,
                 at: now
             )
-            if decision.didSwitch, let committed = decision.committedCategoryId {
-                engine.applyAutoCategory(committed, at: now)
-            }
+            applySemanticWriteBackIfAdopted(
+                classification: overrideCls,
+                decision: decision,
+                previousCategory: previousCategory,
+                wasPinned: wasPinned,
+                contextKey: contextKey,
+                at: now
+            )
             return
         }
 
@@ -1963,16 +1962,23 @@ public final class HybridActivityCoordinator: ObservableObject {
                 )
                 return
             }
-            engine.stampSemanticGroup(cached.semanticGroupKey, forContextKey: canonicalKey, at: now)
+            let wasPinned = semanticTracker.isManualPinActive
+            let previousCategory = semanticTracker.currentCategoryId
             let decision = semanticTracker.apply(
                 classification: cached,
                 contextKey: contextKey,
                 budgetsVersion: budgetsVersion,
                 at: now
             )
-            if decision.didSwitch, let committed = decision.committedCategoryId {
-                engine.applyAutoCategory(committed, activityMode: cached.activityMode, at: now)
-            } else if decision.pendingCategoryId != nil {
+            applySemanticWriteBackIfAdopted(
+                classification: cached,
+                decision: decision,
+                previousCategory: previousCategory,
+                wasPinned: wasPinned,
+                contextKey: contextKey,
+                at: now
+            )
+            if !decision.didSwitch && decision.pendingCategoryId != nil {
                 scheduleJevPendingConfirmTimerIfNeeded(for: contextKey, now: now)
             }
             return
@@ -2056,12 +2062,10 @@ public final class HybridActivityCoordinator: ObservableObject {
                     self.lastJevClassifiedSignature = requestSignature
                     self.lastJevErrorAt = nil
                     self.jevLastError = nil
-                    self.jevLastClassification = classification
 
                     let ts = self.clock.now()
-                    self.engine.stampSemanticGroup(classification.semanticGroupKey, forContextKey: canonicalKey, at: ts)
 
-                    // Guard against late-response flicker if the user already moved to another context while in flight.
+                    // Guard against late-response flicker & write-back privilege escalation if the user already moved to another context while in flight.
                     if self.observedContextKey != contextKey {
                         self.semanticTracker.storeCache(
                             classification,
@@ -2073,6 +2077,7 @@ public final class HybridActivityCoordinator: ObservableObject {
                         return
                     }
 
+                    self.jevLastClassification = classification
                     let previousCategory = self.semanticTracker.currentCategoryId
                     let wasPinned = self.semanticTracker.isManualPinActive
                     let decision = self.semanticTracker.apply(
@@ -2082,11 +2087,15 @@ public final class HybridActivityCoordinator: ObservableObject {
                         usedOCR: usedOCR,
                         at: ts
                     )
-                    if decision.didSwitch, let committed = decision.committedCategoryId {
-                        self.jevPendingConfirmTask?.cancel()
-                        self.jevPendingConfirmTask = nil
-                        self.engine.applyAutoCategory(committed, activityMode: classification.activityMode, at: ts)
-                    } else if decision.pendingCategoryId != nil {
+                    self.applySemanticWriteBackIfAdopted(
+                        classification: classification,
+                        decision: decision,
+                        previousCategory: previousCategory,
+                        wasPinned: wasPinned,
+                        contextKey: contextKey,
+                        at: ts
+                    )
+                    if !decision.didSwitch && decision.pendingCategoryId != nil {
                         self.scheduleJevPendingConfirmTimerIfNeeded(for: contextKey, now: ts)
                     }
 
@@ -2164,6 +2173,35 @@ public final class HybridActivityCoordinator: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Applies engine category switching and fine-grained span semanticGroup stamping
+    /// ONLY when `SemanticAutoTracker` genuinely commits or maintains the classification
+    /// (never on `ignored_low_confidence`, `pending_confirmation`, or `manualPin` interception).
+    private func applySemanticWriteBackIfAdopted(
+        classification: SemanticClassification,
+        decision: SemanticTrackerDecision,
+        previousCategory: String?,
+        wasPinned: Bool,
+        contextKey: String,
+        at timestamp: Date
+    ) {
+        if decision.didSwitch, let committed = decision.committedCategoryId {
+            jevPendingConfirmTask?.cancel()
+            jevPendingConfirmTask = nil
+            engine.applyAutoCategory(committed, activityMode: classification.activityMode, at: timestamp)
+            engine.stampSemanticGroup(classification.semanticGroupKey, forContextKey: contextKey, at: timestamp)
+            return
+        }
+        let blockedByPin = wasPinned && semanticTracker.isManualPinActive
+        guard !blockedByPin,
+              decision.pendingCategoryId == nil,
+              previousCategory == classification.categoryId,
+              decision.committedCategoryId == classification.categoryId,
+              classification.confidence >= semanticTracker.config.coldStartConfidence else {
+            return
+        }
+        engine.stampSemanticGroup(classification.semanticGroupKey, forContextKey: contextKey, at: timestamp)
     }
 
     // MARK: - Helpers

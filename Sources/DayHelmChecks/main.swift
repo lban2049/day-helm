@@ -4703,6 +4703,336 @@ struct DayHelmChecksMain {
             let normalProse = "历史记录显示昨天成交 12 笔\n第二行详细数据"
             try checkEqual(SemanticPayloadSanitizer.stripTopChromeNoise(from: normalProse), normalProse, "Normal prose must not be stripped by menu bar heuristic")
         }
+
+        try await runCheck("72. Jev semantic write-back gating, late-response isolation & subdomain contextKey isolation") {
+            let t0 = baseDate()
+
+            // 1. Subdomain & channel isolation in semanticContextKey (even when titles are nil or identical)
+            let taskEmptyTitle = ActivitySample(timestamp: t0, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: nil, url: "https://task.lban2049.xyz", idleSeconds: 0)
+            let mausEmptyTitle = ActivitySample(timestamp: t0, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: nil, url: "https://maus-bot.lban2049.xyz", idleSeconds: 0)
+            try check(
+                SemanticPayloadSanitizer.semanticContextKey(for: taskEmptyTitle) != SemanticPayloadSanitizer.semanticContextKey(for: mausEmptyTitle),
+                "Different subdomains with nil title must produce distinct semanticContextKeys"
+            )
+
+            let taskDashTitle = ActivitySample(timestamp: t0, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Dashboard - Google Chrome - Work", url: "https://task.lban2049.xyz/", idleSeconds: 0)
+            let mausDashTitle = ActivitySample(timestamp: t0, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Dashboard - Google Chrome - Work", url: "https://maus-bot.lban2049.xyz/", idleSeconds: 0)
+            try check(
+                SemanticPayloadSanitizer.semanticContextKey(for: taskDashTitle) != SemanticPayloadSanitizer.semanticContextKey(for: mausDashTitle),
+                "Different subdomains with identical title must produce distinct semanticContextKeys"
+            )
+
+            let wwwSame = ActivitySample(timestamp: t0, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Example - Google Chrome", url: "https://www.example.com/a", idleSeconds: 0)
+            let bareSame = ActivitySample(timestamp: t0, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Example - Google Chrome", url: "https://example.com/a", idleSeconds: 0)
+            try checkEqual(
+                SemanticPayloadSanitizer.semanticContextKey(for: wwwSame),
+                SemanticPayloadSanitizer.semanticContextKey(for: bareSame),
+                "www. prefix stripping must remain consistent in semanticContextKey"
+            )
+
+            // 2. DayHelmEngine.stampSemanticGroup must not back-contaminate different subdomains or Discord channels within 60s
+            let isoClock = ManualClock(now: t0)
+            let isoEngine = DayHelmEngine(budgets: sampleBudgets(), clock: isoClock)
+            isoEngine.setAutoTrackingActive(true)
+            let vikunjaSample = ActivitySample(timestamp: t0, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Vikunja - Google Chrome", url: "https://task.lban2049.xyz/projects/1", idleSeconds: 0)
+            isoEngine.applyAutoCategory(AutoActivityIds.modeCategoryId(for: .research), activityMode: .research, at: t0)
+            isoEngine.ingest(vikunjaSample)
+            isoEngine.stampSemanticGroup("mode:research", forContextKey: SemanticPayloadSanitizer.semanticContextKey(for: vikunjaSample), at: t0)
+
+            let tMaus = t0.addingTimeInterval(15)
+            isoClock.advance(by: 15)
+            let mausSample = ActivitySample(timestamp: tMaus, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "MausBot - Google Chrome", url: "https://maus-bot.lban2049.xyz/", idleSeconds: 0)
+            isoEngine.ingest(mausSample)
+            isoEngine.applyAutoCategory(AutoActivityIds.modeCategoryId(for: .build), activityMode: .build, at: tMaus)
+            isoEngine.stampSemanticGroup("mode:build", forContextKey: SemanticPayloadSanitizer.semanticContextKey(for: mausSample), at: tMaus)
+
+            try checkEqual(isoEngine.enrichedSpans.count, 2, "Expected 2 distinct spans for Vikunja and MausBot")
+            try checkEqual(isoEngine.enrichedSpans[0].semanticGroup, "mode:research", "MausBot stampSemanticGroup must NOT overwrite earlier Vikunja span on same parent domain")
+            try checkEqual(isoEngine.enrichedSpans[1].semanticGroup, "mode:build", "MausBot span must be stamped mode:build")
+
+            let tDiscordA = t0.addingTimeInterval(25)
+            isoClock.advance(by: 10)
+            let discordEcom = ActivitySample(timestamp: tDiscordA, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Discord | 电商计划 - Google Chrome", url: "https://discord.com/channels/1/2", idleSeconds: 0)
+            isoEngine.ingest(discordEcom)
+            isoEngine.applyAutoCategory("ecommerce", activityMode: .operate, at: tDiscordA)
+            isoEngine.stampSemanticGroup("proj:ecommerce", forContextKey: SemanticPayloadSanitizer.semanticContextKey(for: discordEcom), at: tDiscordA)
+
+            let tDiscordB = t0.addingTimeInterval(35)
+            isoClock.advance(by: 10)
+            let discordCreate = ActivitySample(timestamp: tDiscordB, appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Discord | 内容创作 - Google Chrome", url: "https://discord.com/channels/1/3", idleSeconds: 0)
+            isoEngine.ingest(discordCreate)
+            isoEngine.applyAutoCategory(AutoActivityIds.modeCategoryId(for: .create), activityMode: .create, at: tDiscordB)
+            isoEngine.stampSemanticGroup("mode:create", forContextKey: SemanticPayloadSanitizer.semanticContextKey(for: discordCreate), at: tDiscordB)
+
+            try checkEqual(isoEngine.enrichedSpans.count, 4, "Expected 4 spans including two Discord channels")
+            try checkEqual(isoEngine.enrichedSpans[2].semanticGroup, "proj:ecommerce", "Discord create channel must NOT overwrite earlier Discord ecommerce channel span")
+            try checkEqual(isoEngine.enrichedSpans[3].semanticGroup, "mode:create", "Discord create channel span must be stamped mode:create")
+
+            // 3. Coordinator E2E: ignored_low_confidence, pending_confirmation, dwell commit, late response, cache hit & manualPin
+            let clock = ManualClock(now: t0)
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-72-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let store = DayHelmStore(directory: tmpDir)
+            let keyStore = JevAPIKeyStore(directory: tmpDir, environment: [:], dotEnvSearchPaths: [])
+            try keyStore.saveKey("synthetic_gate_key")
+
+            struct MockReply {
+                let mode: String
+                let project: String
+                let confidence: Double
+                let sameTask: Double
+                let delayGate: AsyncStream<Void>?
+            }
+            let replyBox = LockedBox<MockReply>(MockReply(mode: "build", project: "none", confidence: 0.96, sameTask: 0.10, delayGate: nil))
+            let jevCalls = LockedBox<Int>(0)
+
+            let mockTransport = MockJevTransport { request in
+                jevCalls.modify { $0 += 1 }
+                let spec = replyBox.get()
+                if let gate = spec.delayGate {
+                    for await _ in gate { break }
+                }
+                let json = """
+                {
+                  "model": "jev-1.14.0",
+                  "answers": {
+                    "activity_mode": { "type": "choice", "choice": "\(spec.mode)", "confidence": \(spec.confidence), "probabilities": { "\(spec.mode)": \(spec.confidence) } },
+                    "focus_project": { "type": "choice", "choice": "\(spec.project)", "confidence": \(spec.confidence), "probabilities": { "\(spec.project)": \(spec.confidence) } },
+                    "same_task": { "type": "noul", "noul": \(spec.sameTask) }
+                  },
+                  "usage": { "input_tokens": 400, "output_tokens": 25 }
+                }
+                """
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (Data(json.utf8), resp)
+            }
+
+            let engine = DayHelmEngine(budgets: sampleBudgets(), clock: clock)
+            let zedSample0 = ActivitySample(timestamp: t0, appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0)
+            let inspector = MockInspector(currentSample: zedSample0)
+            let coordinator = await MainActor.run {
+                HybridActivityCoordinator(
+                    engine: engine,
+                    store: store,
+                    almaClient: AlmaActivityClient(baseURL: URL(string: "http://127.0.0.1:1")!, transport: MockAlmaTransport { _ in throw URLError(.cannotConnectToHost) }),
+                    inspector: inspector,
+                    clock: clock,
+                    jevClient: JevActivityClient(transport: mockTransport),
+                    jevAPIKeyStore: keyStore
+                )
+            }
+
+            await MainActor.run {
+                var s = coordinator.recorderSettings
+                s.jevAutoTrackingEnabled = true
+                coordinator.updateRecorderSettings(s)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 1.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try await waitUntil("Initial Zed classifies as build") {
+                await MainActor.run { coordinator.activeActivityMode == .build }
+            }
+            try checkEqual(engine.enrichedSpans.last?.semanticGroup, "mode:build", "Committed Zed span must be stamped mode:build")
+
+            // 3a. Low-confidence prediction (ignored_low_confidence: conf 0.60 < 0.70) must NOT stamp span or mutate _currentSemanticGroup
+            replyBox.set(MockReply(mode: "break", project: "none", confidence: 0.60, sameTask: 0.20, delayGate: nil))
+            clock.advance(by: 2.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "News Portal - Google Chrome", url: "https://news.example.com/feed", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 1.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "News Portal - Google Chrome", url: "https://news.example.com/feed", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try await waitUntil("Low-confidence Jev decision logged") {
+                await MainActor.run { coordinator.jevDecisionLogs.first?.outcome == .ignoredLowConfidence }
+            }
+            try await MainActor.run {
+                try checkEqual(coordinator.activeActivityMode, .build, "Low-confidence prediction must keep activeActivityMode as .build")
+                try checkEqual(engine.currentSemanticGroup, "mode:build", "Low-confidence prediction must keep currentSemanticGroup as mode:build")
+                try checkEqual(engine.enrichedSpans.last?.semanticGroup, "mode:build", "Low-confidence prediction must NOT stamp span with 'break'")
+            }
+
+            // 3b. Pending confirmation (conf 0.76, same_task 0.40) must NOT stamp before 1.2s dwell completes
+            replyBox.set(MockReply(mode: "research", project: "none", confidence: 0.76, sameTask: 0.40, delayGate: nil))
+            clock.advance(by: 2.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Vikunja Tasks - Google Chrome", url: "https://task.lban2049.xyz/", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 1.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Vikunja Tasks - Google Chrome", url: "https://task.lban2049.xyz/", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try await waitUntil("Pending-confirmation Jev decision logged") {
+                await MainActor.run { coordinator.jevDecisionLogs.first?.outcome == .pendingConfirmation }
+            }
+            let vikunjaPendingIdx = engine.enrichedSpans.count - 1
+            try await MainActor.run {
+                try checkEqual(coordinator.activeActivityMode, .build, "Pending confirmation must keep activeActivityMode as .build")
+                try checkEqual(engine.currentSemanticGroup, "mode:build", "Pending confirmation must keep currentSemanticGroup as mode:build")
+                try checkEqual(engine.enrichedSpans[vikunjaPendingIdx].semanticGroup, "mode:build", "Pending confirmation must NOT stamp span with 'mode:research' prematurely")
+            }
+
+            // Advance >= 1.2s -> dwell confirm commits research and stamps ONLY Vikunja span
+            clock.advance(by: 1.3)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Vikunja Tasks - Google Chrome", url: "https://task.lban2049.xyz/", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try await MainActor.run {
+                try checkEqual(coordinator.activeActivityMode, .research, "Pending dwell >= 1.2s must commit research")
+                try checkEqual(engine.currentSemanticGroup, "mode:research", "Committed dwell confirmation must update currentSemanticGroup to mode:research")
+                try checkEqual(engine.enrichedSpans[vikunjaPendingIdx].semanticGroup, "mode:research", "Committed dwell confirmation must stamp current Vikunja span as mode:research")
+                try checkEqual(engine.enrichedSpans[0].semanticGroup, "mode:build", "Previous Zed span must remain mode:build")
+            }
+
+            // 3c. Late Jev response arriving after user switched context must ONLY cache and NEVER mutate currentSemanticGroup or spans
+            var slowGateContinuation: AsyncStream<Void>.Continuation?
+            let slowGate = AsyncStream<Void> { cont in
+                slowGateContinuation = cont
+            }
+            let callsBeforeSlow = jevCalls.get()
+            replyBox.set(MockReply(mode: "break", project: "none", confidence: 0.99, sameTask: 0.05, delayGate: slowGate))
+            clock.advance(by: 2.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Slow Tab - Google Chrome", url: "https://slow.lban2049.xyz/", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 1.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Slow Tab - Google Chrome", url: "https://slow.lban2049.xyz/", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try await waitUntil("Slow Jev request entered transport") {
+                jevCalls.get() == callsBeforeSlow + 1
+            }
+
+            // User switches back to cached Zed (>= 0.45s) while slow request is still in flight
+            clock.advance(by: 2.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 0.6)
+            try await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0)
+                coordinator.pollOnce()
+                try checkEqual(coordinator.activeActivityMode, .build, "Cached switch back to Zed should restore .build")
+            }
+
+            // Now release the late response from Slow Tab (which returns break!)
+            slowGateContinuation?.yield()
+            slowGateContinuation?.finish()
+            // Give MainActor task a brief moment to settle
+            try await Task.sleep(nanoseconds: 80_000_000)
+
+            // Verify Zed span & _currentSemanticGroup were NOT polluted by the late 'break' response
+            clock.advance(by: 2.0)
+            try await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "helper.swift", idleSeconds: 0)
+                coordinator.pollOnce()
+                try checkEqual(coordinator.activeActivityMode, .build, "Late Jev response must NOT flip activeActivityMode to breakTime")
+                try checkEqual(engine.currentSemanticGroup, "mode:build", "Late Jev response must keep currentSemanticGroup as mode:build")
+                try checkEqual(engine.enrichedSpans.last?.semanticGroup, "mode:build", "Late Jev response must NOT pollute _currentSemanticGroup on subsequent spans")
+                let slowSpans = engine.enrichedSpans.filter { $0.url == "https://slow.lban2049.xyz/" }
+                try check(!slowSpans.contains(where: { $0.semanticGroup == "break" }), "Late Jev response must NOT stamp slow tab span when user already left")
+            }
+
+            // Cache WAS stored for slow.lban2049.xyz: switching back and settling >= 0.45s switches via cache with 0 extra API calls
+            let callsAfterLate = jevCalls.get()
+            clock.advance(by: 2.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Slow Tab - Google Chrome", url: "https://slow.lban2049.xyz/", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 0.6)
+            try await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Slow Tab - Google Chrome", url: "https://slow.lban2049.xyz/", idleSeconds: 0)
+                coordinator.pollOnce()
+                try checkEqual(coordinator.activeActivityMode, .breakTime, "Cached late response should activate when user returns for >= 0.45s")
+                try checkEqual(jevCalls.get(), callsAfterLate, "Cache hit on slow tab must make 0 additional Jev calls")
+                try checkEqual(engine.enrichedSpans.last?.semanticGroup, "break", "Cache hit after genuine adoption must stamp slow tab span")
+                let vikunjaStillResearch = engine.enrichedSpans.filter { $0.url == "https://task.lban2049.xyz/" }
+                try check(vikunjaStillResearch.allSatisfy { $0.semanticGroup == "mode:research" }, "Cache hit stamp on slow.lban2049.xyz must NOT overwrite task.lban2049.xyz")
+            }
+
+            // 3d. manualPin interception: an in-flight Jev response returning 'break' after user manually selected 'ecommerce' must NOT overwrite span or currentSemanticGroup
+            var pinGateContinuation: AsyncStream<Void>.Continuation?
+            let pinGate = AsyncStream<Void> { cont in
+                pinGateContinuation = cont
+            }
+            let callsBeforePin = jevCalls.get()
+            replyBox.set(MockReply(mode: "break", project: "none", confidence: 0.99, sameTask: 0.05, delayGate: pinGate))
+            clock.advance(by: 2.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop Admin - Google Chrome", url: "https://shop.lban2049.xyz/", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 1.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop Admin - Google Chrome", url: "https://shop.lban2049.xyz/", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            try await waitUntil("Pin-test Jev request entered transport") {
+                jevCalls.get() == callsBeforePin + 1
+            }
+
+            // User manually clicks ecommerce while Jev is in flight on the same window
+            await MainActor.run {
+                coordinator.selectTask("ecommerce")
+            }
+            pinGateContinuation?.yield()
+            pinGateContinuation?.finish()
+            try await waitUntil("ManualPin outcome logged") {
+                await MainActor.run { coordinator.jevDecisionLogs.first?.outcome == .manualPinned }
+            }
+            try await MainActor.run {
+                if case .focusing(let taskId, _) = coordinator.sessionState {
+                    try checkEqual(taskId, "ecommerce", "manualPin must keep focusing on ecommerce")
+                } else {
+                    throw CheckFailure(description: "Expected focusing state on ecommerce while manualPin is active")
+                }
+                try checkEqual(engine.currentSemanticGroup, "proj:ecommerce", "manualPin must keep currentSemanticGroup as proj:ecommerce")
+                try checkEqual(engine.enrichedSpans.last?.semanticGroup, "proj:ecommerce", "manualPin-intercepted Jev response must NOT overwrite span semanticGroup to 'break'")
+            }
+
+            // Switching to cached Zed (>= 0.45s) breaks context-scoped manualPin -> switches to build, then returning to shop.lban2049.xyz hits manualOverride -> restores proj:ecommerce & stamps span
+            clock.advance(by: 2.0)
+            await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0)
+                coordinator.pollOnce()
+            }
+            clock.advance(by: 0.6)
+            try await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Zed", bundleId: "dev.zed.Zed", windowTitle: "main.swift", idleSeconds: 0)
+                coordinator.pollOnce()
+                try checkEqual(coordinator.activeActivityMode, .build, "Leaving pinned window to cached Zed should switch to .build")
+                try checkEqual(engine.currentSemanticGroup, "mode:build", "Leaving pinned window should update currentSemanticGroup to mode:build")
+            }
+
+            clock.advance(by: 2.0)
+            try await MainActor.run {
+                inspector.currentSample = ActivitySample(timestamp: clock.now(), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop Admin - Google Chrome", url: "https://shop.lban2049.xyz/", idleSeconds: 0)
+                coordinator.pollOnce()
+                if case .focusing(let taskId, _) = coordinator.sessionState {
+                    try checkEqual(taskId, "ecommerce", "Returning to manually overridden window must restore ecommerce")
+                } else {
+                    throw CheckFailure(description: "Expected focusing on ecommerce via manualOverride")
+                }
+                try checkEqual(engine.currentSemanticGroup, "proj:ecommerce", "manualOverride must update currentSemanticGroup to proj:ecommerce")
+                try checkEqual(engine.enrichedSpans.last?.semanticGroup, "proj:ecommerce", "manualOverride must stamp current window span with proj:ecommerce")
+            }
+        }
     }
 
     private static func waitUntil(

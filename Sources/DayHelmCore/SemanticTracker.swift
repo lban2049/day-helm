@@ -470,40 +470,82 @@ public enum SemanticPayloadSanitizer {
         " the ", " and ", " for ", " with ", " this ", " that ", " from ", " please ", " is ", " are "
     ]
 
-    /// Fine-grained semantic context key used for Jev caching & dwell tracking.
-    /// Unlike SwitchClassifier's domain-level key, browser tabs keep their normalized title
-    /// (after stripping browser/Profile/memory suffixes) so different channels/dashboards/pages
-    /// on the same host do not collide while Profile names & memory warnings share the cache.
+    /// Fine-grained semantic context key used for Jev caching, dwell tracking, and span attribution.
+    /// Unlike SwitchClassifier's domain-level key, browsers preserve the full subdomain host
+    /// (stripping only leading `www.` and keeping non-default ports) plus the normalized cleaned title
+    /// so different subdomains (e.g. `task.foo.xyz` vs `maus-bot.foo.xyz`) and different channels/pages
+    /// never collide while Chrome profiles & memory warnings share the same cache key.
     public static func semanticContextKey(for sample: ActivitySample) -> String {
-        let isBrowser = ActivityClassifier.isBrowser(appName: sample.appName, bundleId: sample.bundleId)
-        let cleanedBrowserTitle: String? = (!sample.redacted && isBrowser)
-            ? sample.windowTitle.flatMap { raw -> String? in
-                let cleaned = cleanBrowserWindowTitle(raw, appName: sample.appName)
-                return cleaned.isEmpty ? nil : cleaned
-            }
-            : sample.windowTitle
-        let probeSpan = EnrichedSpan(
-            startedAt: sample.timestamp,
-            endedAt: sample.timestamp,
+        computeSemanticContextKey(
             appName: sample.appName,
             bundleId: sample.bundleId,
-            windowTitle: cleanedBrowserTitle,
+            windowTitle: sample.windowTitle,
             url: sample.url,
-            declaredTaskId: nil,
             redacted: sample.redacted
         )
-        let baseKey = SwitchClassifier.canonicalContextKey(for: probeSpan)
-        guard !sample.redacted, isBrowser else {
-            return baseKey
+    }
+
+    public static func semanticContextKey(for span: EnrichedSpan) -> String {
+        computeSemanticContextKey(
+            appName: span.appName,
+            bundleId: span.bundleId,
+            windowTitle: span.windowTitle,
+            url: span.url,
+            redacted: span.redacted
+        )
+    }
+
+    private static func normalizedBrowserHost(from rawURL: String?) -> String? {
+        guard let trimmed = rawURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty,
+              let components = URLComponents(string: trimmed),
+              let rawHost = components.host?.lowercased(),
+              !rawHost.isEmpty else {
+            return nil
         }
-        guard let normTitle = SwitchClassifier.switchNormalizedTitle(cleanedBrowserTitle),
-              !normTitle.isEmpty else {
-            return baseKey
+        var host = rawHost
+        if host.hasPrefix("www.") {
+            host = String(host.dropFirst(4))
         }
-        if baseKey.hasSuffix("|\(normTitle)") {
-            return baseKey
+        if let port = components.port {
+            let scheme = components.scheme?.lowercased()
+            let isDefaultPort = (scheme == "http" && port == 80) || (scheme == "https" && port == 443)
+            if !isDefaultPort {
+                return "\(host):\(port)"
+            }
         }
-        return "\(baseKey)|\(normTitle)"
+        return host
+    }
+
+    private static func computeSemanticContextKey(
+        appName: String,
+        bundleId: String?,
+        windowTitle: String?,
+        url: String?,
+        redacted: Bool
+    ) -> String {
+        let appKey = SwitchClassifier.normalizedAppKey(appName: appName, bundleId: bundleId)
+        if redacted {
+            return "redacted|\(appKey)"
+        }
+        let isBrowser = ActivityClassifier.isBrowser(appName: appName, bundleId: bundleId)
+        guard isBrowser else {
+            let titleKey = SwitchClassifier.switchNormalizedTitle(windowTitle) ?? ""
+            return "app|\(appKey)|\(titleKey)"
+        }
+        let cleanedBrowserTitle = windowTitle.flatMap { raw -> String? in
+            let cleaned = cleanBrowserWindowTitle(raw, appName: appName)
+            return cleaned.isEmpty ? nil : cleaned
+        }
+        let normTitle = SwitchClassifier.switchNormalizedTitle(cleanedBrowserTitle)
+        if let host = normalizedBrowserHost(from: url) {
+            if let normTitle, !normTitle.isEmpty, host != normTitle {
+                return "browser|\(appKey)|\(host)|\(normTitle)"
+            }
+            return "browser|\(appKey)|\(host)"
+        }
+        let titleKey = normTitle ?? ""
+        return "browser|\(appKey)|\(titleKey)"
     }
 
     /// Returns true when window title/URL is weak/generic OR belongs to a multi-purpose
@@ -821,6 +863,8 @@ public enum SemanticPayloadSanitizer {
             if history.count >= maxHistoryEntries { break }
             guard span.durationSeconds >= SwitchClassifier.defaultMinEffectiveDwellSeconds else { continue }
 
+            let spanKey = semanticContextKey(for: span)
+            if spanKey == contextKey { continue }
             let spanAsSample = ActivitySample(
                 timestamp: span.endedAt,
                 appName: span.appName,
@@ -832,8 +876,6 @@ public enum SemanticPayloadSanitizer {
                 inputActive: true,
                 redacted: span.redacted
             )
-            let spanKey = semanticContextKey(for: spanAsSample)
-            if spanKey == contextKey { continue }
             let cleanHist = PrivacyRedactor.redact(spanAsSample, config: privacyConfig)
             let histTitle: String?
             let histDomain: String?
@@ -937,11 +979,18 @@ public struct SemanticTrackerDecision: Sendable, Equatable {
     public let committedCategoryId: String?
     public let didSwitch: Bool
     public let pendingCategoryId: String?
+    public let committedClassification: SemanticClassification?
 
-    public init(committedCategoryId: String?, didSwitch: Bool, pendingCategoryId: String?) {
+    public init(
+        committedCategoryId: String?,
+        didSwitch: Bool,
+        pendingCategoryId: String?,
+        committedClassification: SemanticClassification? = nil
+    ) {
         self.committedCategoryId = committedCategoryId
         self.didSwitch = didSwitch
         self.pendingCategoryId = pendingCategoryId
+        self.committedClassification = committedClassification
     }
 }
 
@@ -953,6 +1002,7 @@ public final class SemanticAutoTracker: @unchecked Sendable {
         let firstSeenAt: Date
         var latestConfidence: Double
         var latestSameTaskProb: Double?
+        var classification: SemanticClassification
     }
 
     private struct CacheEntry {
@@ -1101,7 +1151,8 @@ public final class SemanticAutoTracker: @unchecked Sendable {
                     return SemanticTrackerDecision(
                         committedCategoryId: classification.categoryId,
                         didSwitch: true,
-                        pendingCategoryId: nil
+                        pendingCategoryId: nil,
+                        committedClassification: classification
                     )
                 }
                 return SemanticTrackerDecision(committedCategoryId: nil, didSwitch: false, pendingCategoryId: nil)
@@ -1138,7 +1189,8 @@ public final class SemanticAutoTracker: @unchecked Sendable {
                 return SemanticTrackerDecision(
                     committedCategoryId: classification.categoryId,
                     didSwitch: true,
-                    pendingCategoryId: nil
+                    pendingCategoryId: nil,
+                    committedClassification: classification
                 )
             }
 
@@ -1148,6 +1200,7 @@ public final class SemanticAutoTracker: @unchecked Sendable {
                 existing.contextKey = contextKey
                 existing.latestConfidence = classification.confidence
                 existing.latestSameTaskProb = classification.sameTaskAsPrevious
+                existing.classification = classification
                 pending = existing
                 return evaluatePendingLocked(at: now)
             } else {
@@ -1156,7 +1209,8 @@ public final class SemanticAutoTracker: @unchecked Sendable {
                     contextKey: contextKey,
                     firstSeenAt: now,
                     latestConfidence: classification.confidence,
-                    latestSameTaskProb: classification.sameTaskAsPrevious
+                    latestSameTaskProb: classification.sameTaskAsPrevious,
+                    classification: classification
                 )
                 return SemanticTrackerDecision(
                     committedCategoryId: _currentCategoryId,
@@ -1248,11 +1302,13 @@ public final class SemanticAutoTracker: @unchecked Sendable {
             let committed = candidate.categoryId
             let changed = (_currentCategoryId != committed)
             _currentCategoryId = committed
+            _latestClassification = candidate.classification
             pending = nil
             return SemanticTrackerDecision(
                 committedCategoryId: committed,
                 didSwitch: changed,
-                pendingCategoryId: nil
+                pendingCategoryId: nil,
+                committedClassification: candidate.classification
             )
         }
         return SemanticTrackerDecision(

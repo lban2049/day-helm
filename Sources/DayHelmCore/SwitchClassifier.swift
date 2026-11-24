@@ -1044,7 +1044,7 @@ public enum SwitchClassifier {
     )
     private static let trimCharacterSet = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
 
-    private static func normalizedAppKey(appName: String, bundleId: String?) -> String {
+    internal static func normalizedAppKey(appName: String, bundleId: String?) -> String {
         if let bundle = bundleId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !bundle.isEmpty {
             return bundle
         }

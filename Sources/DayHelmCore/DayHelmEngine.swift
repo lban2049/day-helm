@@ -165,6 +165,11 @@ public final class DayHelmEngine: @unchecked Sendable {
         return _activeActivityMode
     }
 
+    public var currentSemanticGroup: String? {
+        lock.lock(); defer { lock.unlock() }
+        return _currentSemanticGroup
+    }
+
     public var otherWorkMinutes: Double {
         lock.lock(); defer { lock.unlock() }
         return _otherWorkMinutes
@@ -197,7 +202,7 @@ public final class DayHelmEngine: @unchecked Sendable {
         }
     }
 
-    /// Stamps recent spans matching `contextKey` with a semanticGroup (used by SwitchClassifier).
+    /// Stamps recent spans matching fine-grained `contextKey` with a semanticGroup (used by SwitchClassifier).
     public func stampSemanticGroup(_ semanticGroup: String, forContextKey contextKey: String, withinSeconds: TimeInterval = 60.0, at now: Date? = nil) {
         lock.lock()
         defer { lock.unlock() }
@@ -208,7 +213,7 @@ public final class DayHelmEngine: @unchecked Sendable {
             if ts.timeIntervalSince(_enrichedSpans[i].endedAt) > withinSeconds {
                 break
             }
-            if SwitchClassifier.canonicalContextKey(for: _enrichedSpans[i]) == contextKey {
+            if SemanticPayloadSanitizer.semanticContextKey(for: _enrichedSpans[i]) == contextKey {
                 if _enrichedSpans[i].semanticGroup != semanticGroup {
                     _enrichedSpans[i].semanticGroup = semanticGroup
                     changed = true
@@ -528,9 +533,13 @@ public final class DayHelmEngine: @unchecked Sendable {
         let ts = date ?? clock.now()
         _autoPausedByAbsence = false
         _activeNonBudgetActivity = nil
+        _activeActivityMode = nil
         _nonBudgetLastTimestamp = nil
         _nonBudgetSegmentStartedAt = nil
         _nonBudgetSegmentMinutes = 0.0
+        if _autoTrackingActive, _budgets.contains(where: { $0.taskId == taskId }) {
+            _currentSemanticGroup = "proj:\(taskId)"
+        }
         closeActiveSessionLocked(at: ts, closingNote: nil)
         openNewSessionLocked(taskId: taskId, note: note, at: ts)
     }
@@ -541,9 +550,13 @@ public final class DayHelmEngine: @unchecked Sendable {
         let ts = date ?? clock.now()
         _autoPausedByAbsence = false
         _activeNonBudgetActivity = nil
+        _activeActivityMode = nil
         _nonBudgetLastTimestamp = nil
         _nonBudgetSegmentStartedAt = nil
         _nonBudgetSegmentMinutes = 0.0
+        if _autoTrackingActive, _budgets.contains(where: { $0.taskId == taskId }) {
+            _currentSemanticGroup = "proj:\(taskId)"
+        }
         if case .focusing(let currentTaskId, _) = _focusState, currentTaskId == taskId {
             if let idx = activeSessionIndex, let note {
                 _focusSessions[idx].note = note
@@ -562,9 +575,11 @@ public final class DayHelmEngine: @unchecked Sendable {
         // Explicit manual pause: never auto-resume when user returns/continues typing.
         _autoPausedByAbsence = false
         _activeNonBudgetActivity = nil
+        _activeActivityMode = nil
         _nonBudgetLastTimestamp = nil
         _nonBudgetSegmentStartedAt = nil
         _nonBudgetSegmentMinutes = 0.0
+        _currentSemanticGroup = nil
         guard case .focusing(let taskId, _) = _focusState else {
             return
         }
@@ -580,9 +595,11 @@ public final class DayHelmEngine: @unchecked Sendable {
         let ts = date ?? clock.now()
         _autoPausedByAbsence = false
         _activeNonBudgetActivity = nil
+        _activeActivityMode = nil
         _nonBudgetLastTimestamp = nil
         _nonBudgetSegmentStartedAt = nil
         _nonBudgetSegmentMinutes = 0.0
+        _currentSemanticGroup = nil
         closeActiveSessionLocked(at: ts, closingNote: note)
         _focusState = .unassigned
         _stateVersion &+= 1
