@@ -11,7 +11,7 @@
 | 窗口标题 `windowTitle` | 2s 轮询 (AX `kAXTitleAttribute`) | Accessibility | 识别具体工作内容、补齐会话标题并辅助跑偏检测 |
 | 浏览器当前 `url` | 2s 轮询 (AX `AXDocument`)，缺失时经隐私预检后用 1s 超时 AppleScript 兜底（含熔断） | Accessibility (+ 可选 Automation) | 区分不同项目页面与泛刷行为（写入前剥离敏感 query 参数；锁屏或命中 `PrivacyRedactor` 绝不调用 AppleScript） |
 | 屏幕快照（可选深度录制） | 32-bin 直方图 (`>= 4%`) + 160×90 缩略像素差 (`>= 2%`) 双条件去重（`320px` 探针预检 + `1920px` JPEG 0.55） | **可选** `Screen Recording` + `deepRecordingEnabled` 开关 | 保留视觉工作上下文并驱动设备端 OCR；`>1天` 降采样为 `1280px/0.4` (`warm`)，`>7天` 降采样为 `640px/0.3` (`cold`)，默认保留 7 天且总磁盘上限 `10 GB`（超限裁至 `7.5 GB`） |
-| 设备端 OCR 文本（可选深度录制） | 随去重快照（`app_focus` 立即执行，非 `app_focus` 最小间隔 `25s`，按 `ocrEveryN` + 会话内连续去重），由短命无头子进程 `DayHelm __ocr-worker`（空闲 `15s` 或满 `10` 帧退出）从落盘 JPEG 按 `1280px` 缩略解码后运行 Apple Vision OCR（`.accurate`、`usesLanguageCorrection = false`） | 同上（**完全本机离线识别**） | 为 AI Agent 与 `alma-time-audit` 提供可检索的屏幕语义摘要 |
+| 设备端 OCR 文本（可选深度录制） | 随去重快照（`app_focus` 立即执行，非 `app_focus` 最小间隔 `25s`，按 `ocrEveryN` + 会话内连续去重），由短命无头子进程 `DayHelm __ocr-worker`（空闲 `15s` 或满 `10` 帧退出）从落盘 JPEG 按 `1280px` 缩略解码后运行 Apple Vision OCR（`.accurate`、`usesLanguageCorrection = false`；对 `height >= 480px` 全屏图像默认排除顶部 `4%` 菜单栏 `y > 0.96`，避免系统菜单栏与 DayHelm 自身状态文本入库） | 同上（**完全本机离线识别**） | 为 AI Agent 与 `alma-time-audit` 提供可检索的屏幕语义摘要 |
 | 空闲时长（秒数，不含内容） | 2s 轮询 (`CGEventSource` / `IOHIDSystem`) | 无需权限 | 判断人是否在场，避免空转计入专注时长 |
 | 屏幕锁定状态 | `DistributedNotificationCenter` + 休眠/唤醒事件 | 无需权限 | 排除锁屏与休眠时段并立即终止截屏与 OCR |
 | 专注事项元数据（当前事项、目标配额、备注） | 用户输入 | — | 当日配额追踪与上下文恢复 |
@@ -43,7 +43,7 @@
 - 无遥测、无崩溃上报、无云同步、无网络分析
 - 默认情况下进程**不发任何出站公网网络请求**
 - **可选云端语义分类（Jev System One，默认关闭）**：仅当用户在设置中显式开启 `jevAutoTrackingEnabled` 且配置了有效的 `JEV_API_KEY`（保存于 `~/.config/alma/dayhelm/jev.key`，权限 `0600`，不写入 `config.json`；亦兼容环境变量 `JEV_API_KEY`）时，才向 `https://api.typesafe.ai/v1/systemone` 发送经过清洗的轻量活动上下文用于自动判断当前事务类型：
-  - 发送内容严格限制为：用户配置的事项名称与一句话说明、当前与最近 3 条窗口的 `appName` + 清洗后的 `windowTitle` / `url`（已剥离敏感 query 参数并执行凭据掩码），以及开启 `jevSendOCRSnippet` 时最多 **600 字符**的凭据脱敏并剥离顶栏噪声后的本机 OCR 正文摘要；
+  - 发送内容严格限制为：用户配置的事项名称与一句话说明、当前与最近 3 条窗口的 `appName` + 清洗后的 `windowTitle`（已剥离浏览器/Profile 后缀与动态内存后缀并掩码凭据）/ `url`（已剥离敏感 query 参数并执行凭据掩码），以及开启 `jevSendOCRSnippet` 时最多 **600 字符**的凭据脱敏并剥离顶栏/菜单栏/DayHelm 状态胶囊噪声后的本机 OCR 正文摘要；
   - **硬阻断**：锁屏状态不发起任何请求；命中 `PrivacyRedactor`（`redacted == true`）的窗口绝不发送 `windowTitle`、`url` 或 `ocrSnippet`；**永不上传任何屏幕截图图片**；
   - 断网、关闭开关或清空 API Key 后立即恢复 100% 纯本机运行。
 - 内置本地 HTTP API 服务**严格只绑定环回地址 `127.0.0.1`**（主端口 `24001`，若被占用则在 `24001...24009` 自动选端，不占用 Alma 的 `23001`），绝不绑定外部网卡（`0.0.0.0`）

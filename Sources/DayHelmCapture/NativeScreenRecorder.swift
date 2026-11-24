@@ -495,6 +495,12 @@ public struct OCRResult: Sendable, Equatable {
 
 public enum VisionOCRService {
     public static let defaultLanguages = ["zh-Hans", "zh-Hant", "en-US", "ja"]
+    /// Top 4% of full-screen captures (`y > 0.96` in Vision bottom-left coordinates)
+    /// covers both standard 24pt and notch 37–38pt macOS menu bars without clipping app content.
+    public static let topMenuBarExcludeHeightRatio: CGFloat = 0.04
+    /// Minimum image height in pixels required before cropping the top menu bar,
+    /// preserving compatibility with compact synthetic test banners (e.g. 960x240).
+    public static let minTopMenuBarCropHeight: Int = 480
     private static let ocrQueue = DispatchQueue(label: "com.dayhelm.vision.ocr", qos: .utility)
 
     private final class WorkerClientState: @unchecked Sendable {
@@ -539,7 +545,8 @@ public enum VisionOCRService {
 
     public static func recognizeTextSync(
         from image: CGImage,
-        languages: [String] = defaultLanguages
+        languages: [String] = defaultLanguages,
+        excludeTopMenuBar: Bool = true
     ) throws -> OCRResult {
         defer {
             malloc_zone_pressure_relief(nil, 0)
@@ -550,11 +557,20 @@ public enum VisionOCRService {
             request.recognitionLanguages = languages
             request.usesLanguageCorrection = false
 
+            let shouldExcludeTopMenuBar = excludeTopMenuBar && image.height >= minTopMenuBarCropHeight
+            let maxAllowedNormalizedY = 1.0 - topMenuBarExcludeHeightRatio
+            if shouldExcludeTopMenuBar {
+                request.regionOfInterest = CGRect(x: 0, y: 0, width: 1, height: maxAllowedNormalizedY)
+            }
+
             let handler = VNImageRequestHandler(cgImage: image, options: [:])
             try handler.perform([request])
 
             let observations = request.results ?? []
             let lines = observations.compactMap { obs -> String? in
+                if shouldExcludeTopMenuBar && obs.boundingBox.maxY > maxAllowedNormalizedY + 0.005 {
+                    return nil
+                }
                 guard let candidate = obs.topCandidates(1).first?.string
                     .trimmingCharacters(in: .whitespacesAndNewlines),
                       !candidate.isEmpty else {
@@ -574,12 +590,17 @@ public enum VisionOCRService {
 
     public static func recognizeText(
         from image: CGImage,
-        languages: [String] = defaultLanguages
+        languages: [String] = defaultLanguages,
+        excludeTopMenuBar: Bool = true
     ) async throws -> OCRResult {
         try await withCheckedThrowingContinuation { continuation in
             ocrQueue.async {
                 do {
-                    let result = try recognizeTextSync(from: image, languages: languages)
+                    let result = try recognizeTextSync(
+                        from: image,
+                        languages: languages,
+                        excludeTopMenuBar: excludeTopMenuBar
+                    )
                     continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)
@@ -591,7 +612,8 @@ public enum VisionOCRService {
     public static func recognizeText(
         at imageFileURL: URL,
         maxDimension: Int = 1280,
-        languages: [String] = defaultLanguages
+        languages: [String] = defaultLanguages,
+        excludeTopMenuBar: Bool = true
     ) async throws -> OCRResult {
         try await withCheckedThrowingContinuation { continuation in
             ocrQueue.async {
@@ -601,7 +623,8 @@ public enum VisionOCRService {
                         executableURL: workerExec,
                         imageFileURL: imageFileURL,
                         maxDimension: maxDimension,
-                        languages: languages
+                        languages: languages,
+                        excludeTopMenuBar: excludeTopMenuBar
                        ) {
                         continuation.resume(returning: result)
                         return
@@ -613,7 +636,11 @@ public enum VisionOCRService {
                     ) else {
                         throw ScreenCaptureError.jpegEncodingFailed(imageFileURL.path)
                     }
-                    let result = try recognizeTextSync(from: cgImage, languages: languages)
+                    let result = try recognizeTextSync(
+                        from: cgImage,
+                        languages: languages,
+                        excludeTopMenuBar: excludeTopMenuBar
+                    )
                     continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)
@@ -641,7 +668,8 @@ public enum VisionOCRService {
         executableURL: URL,
         imageFileURL: URL,
         maxDimension: Int,
-        languages: [String]
+        languages: [String],
+        excludeTopMenuBar: Bool
     ) throws -> OCRResult {
         try ensureWorkerProcessLocked(executableURL: executableURL)
         guard let stdinHandle = workerState.stdinHandle,
@@ -653,7 +681,8 @@ public enum VisionOCRService {
         let payload: [String: Any] = [
             "imagePath": imageFileURL.path,
             "maxDimension": maxDimension,
-            "languages": languages
+            "languages": languages,
+            "excludeTopMenuBar": excludeTopMenuBar
         ]
         var lineData = try JSONSerialization.data(withJSONObject: payload, options: [])
         lineData.append(0x0A)
@@ -759,6 +788,7 @@ public enum VisionOCRWorker {
         let imagePath: String
         let maxDimension: Int?
         let languages: [String]?
+        let excludeTopMenuBar: Bool?
     }
 
     public static func processRequestJSONData(_ data: Data) -> Data {
@@ -774,7 +804,11 @@ public enum VisionOCRWorker {
                 guard let cgImage = ScreenSnapshotCapturer.decodeThumbnailCGImage(at: fileURL, maxPixelSize: maxDim) else {
                     return encodeError("Failed to decode image at \(req.imagePath)")
                 }
-                let result = try VisionOCRService.recognizeTextSync(from: cgImage, languages: languages)
+                let result = try VisionOCRService.recognizeTextSync(
+                    from: cgImage,
+                    languages: languages,
+                    excludeTopMenuBar: req.excludeTopMenuBar ?? true
+                )
                 let response: [String: Any] = [
                     "ok": true,
                     "text": result.text,

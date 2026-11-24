@@ -33,7 +33,7 @@ struct DayHelmChecksMain {
     static func main() async {
         do {
             try await runAllChecks()
-            print("ALL DAYHELM CHECKS PASSED (68/68)")
+            print("ALL DAYHELM CHECKS PASSED (71/71)")
             exit(0)
         } catch {
             fputs("DAYHELM CHECK FAILED: \(error)\n", stderr)
@@ -4542,6 +4542,167 @@ struct DayHelmChecksMain {
             try await Task.sleep(nanoseconds: 1_500_000_000)
             try checkEqual(capturedOCRFlagsB.get(), [true], "Live timer on-demand OCR must emit exactly 1 OCR request and 0 noOCR double-fires")
         }
+
+        try await runCheck("71. OCR top menu bar cropping, fuzzy chrome denoising & Chrome title suffix/memory normalization") {
+            // 1. Full-screen synthetic image: top 4% menu bar text must be excluded by VisionOCRService while body text is preserved
+            let fullScreenImg = try makeSyntheticMenuBarAndBodyImage(
+                menuBarText: "Chrome File Edit 开发构建 32m 11:24",
+                bodyText: "Synthetic Body Dashboard 2026",
+                width: 1280,
+                height: 800
+            )
+            let fullOCR = try await VisionOCRService.recognizeText(from: fullScreenImg)
+            try check(!fullOCR.text.contains("开发构建"), "Top menu bar DayHelm pill must be excluded from OCR (got: '\(fullOCR.text)')")
+            try check(!fullOCR.text.contains("32m"), "Top menu bar duration must be excluded from OCR (got: '\(fullOCR.text)')")
+            try check(!fullOCR.text.contains("File"), "Top menu bar File/Edit must be excluded from OCR (got: '\(fullOCR.text)')")
+            try check(fullOCR.text.contains("Dashboard") || fullOCR.text.contains("2026"), "Body text must remain intact in OCR (got: '\(fullOCR.text)')")
+
+            // Small synthetic banner (< 480px height) with text near top must NOT be mis-cropped
+            let smallBanner = try makeSyntheticTopTextBanner(text: "SMALL_BANNER_KEEP_2026", width: 960, height: 240)
+            let smallOCR = try await VisionOCRService.recognizeText(from: smallBanner)
+            try check(smallOCR.text.contains("SMALL") || smallOCR.text.contains("2026"), "Small synthetic banner must not be cropped by top menu bar filter (got: '\(smallOCR.text)')")
+
+            // 2. Chrome title suffix + Profile name normalization (buildInput + semanticContextKey)
+            let t0 = baseDate()
+            let budgets = sampleBudgets()
+            let composioShopProfile = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Composio - Google Chrome - カネタ (抖音个人店铺)",
+                url: "https://app.composio.dev/apps",
+                idleSeconds: 0
+            )
+            let composioWorkProfile = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Composio - Google Chrome - 晓亮",
+                url: "https://app.composio.dev/apps",
+                idleSeconds: 0
+            )
+            let composioNoURL1 = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Composio - Google Chrome - カネタ (抖音个人店铺)",
+                url: nil,
+                idleSeconds: 0
+            )
+            let composioNoURL2 = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Composio - Google Chrome - 晓亮",
+                url: nil,
+                idleSeconds: 0
+            )
+
+            let inputShop = SemanticPayloadSanitizer.buildInput(
+                sample: composioShopProfile,
+                ocrText: nil,
+                recentSpans: [],
+                budgets: budgets,
+                sendOCRSnippet: true,
+                privacyConfig: .default
+            )
+            let inputWork = SemanticPayloadSanitizer.buildInput(
+                sample: composioWorkProfile,
+                ocrText: nil,
+                recentSpans: [],
+                budgets: budgets,
+                sendOCRSnippet: true,
+                privacyConfig: .default
+            )
+            try checkEqual(inputShop?.windowTitle, "Composio", "buildInput must strip Chrome and Profile suffix")
+            try checkEqual(inputWork?.windowTitle, "Composio", "buildInput must normalize different Chrome profiles to identical title")
+            try checkEqual(
+                SemanticPayloadSanitizer.semanticContextKey(for: composioShopProfile),
+                SemanticPayloadSanitizer.semanticContextKey(for: composioWorkProfile),
+                "Different Chrome profiles on same page must share the same semanticContextKey"
+            )
+            try checkEqual(
+                SemanticPayloadSanitizer.semanticContextKey(for: composioNoURL1),
+                SemanticPayloadSanitizer.semanticContextKey(for: composioNoURL2),
+                "Different Chrome profiles without URL must also share the same semanticContextKey"
+            )
+
+            // 3. Dynamic memory usage suffix normalization
+            let xHighMem = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "主页 / X - 内存用量高 - 883 MB - Google Chrome - 晓亮",
+                url: "https://x.com/home",
+                idleSeconds: 0
+            )
+            let xNormal = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "主页 / X - Google Chrome - 晓亮",
+                url: "https://x.com/home",
+                idleSeconds: 0
+            )
+            let xEnglishMem = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "主页 / X - High memory usage - 1.2 GB - Google Chrome - Work",
+                url: "https://x.com/home",
+                idleSeconds: 0
+            )
+            let inputXMem = SemanticPayloadSanitizer.buildInput(
+                sample: xHighMem,
+                ocrText: nil,
+                recentSpans: [],
+                budgets: budgets,
+                sendOCRSnippet: true,
+                privacyConfig: .default
+            )
+            try checkEqual(inputXMem?.windowTitle, "主页 / X", "buildInput must strip Chrome memory usage, browser, and profile suffixes")
+            try checkEqual(
+                SemanticPayloadSanitizer.semanticContextKey(for: xHighMem),
+                SemanticPayloadSanitizer.semanticContextKey(for: xNormal),
+                "High memory usage suffix must not fragment semanticContextKey"
+            )
+            try checkEqual(
+                SemanticPayloadSanitizer.semanticContextKey(for: xEnglishMem),
+                SemanticPayloadSanitizer.semanticContextKey(for: xNormal),
+                "English high memory usage and profile difference must share semanticContextKey"
+            )
+
+            // 4. Fuzzy stripTopChromeNoise: OCR-typo menu bars, DayHelm pills, tab strips & www-stripped omnibox
+            let typoChromeOCR = [
+                "Chrome 文件 燴辑 显示 历史记承 书签 窗口 帮助",
+                "FeEdit ViewWindow History Bookmarks",
+                "开发构建 32m  11:24",
+                "沟通杂务 18m",
+                "GitHub × Composio × 新标签页 +",
+                "正文第一行 电商选品与研发需求"
+            ].joined(separator: "\n")
+            let denoisedTypo = SemanticPayloadSanitizer.stripTopChromeNoise(from: typoChromeOCR)
+            try check(!denoisedTypo.contains("燴辑"), "stripTopChromeNoise must remove OCR-typo Chinese menu bar line")
+            try check(!denoisedTypo.contains("FeEdit"), "stripTopChromeNoise must remove glued English menu bar line")
+            try check(!denoisedTypo.contains("开发构建"), "stripTopChromeNoise must remove DayHelm mode pill line")
+            try check(!denoisedTypo.contains("沟通杂务"), "stripTopChromeNoise must remove DayHelm comms_admin pill line")
+            try check(!denoisedTypo.contains("新标签页"), "stripTopChromeNoise must remove Chrome tab strip noise")
+            try check(denoisedTypo.contains("电商选品与研发需求"), "stripTopChromeNoise must preserve body text")
+
+            // www.-omitted Chrome address bar anchoring
+            let wwwOmniboxOCR = [
+                "Tab A × Tab B",
+                "example.com/dashboard",
+                "真实页面正文内容"
+            ].joined(separator: "\n")
+            let denoisedOmnibox = SemanticPayloadSanitizer.stripTopChromeNoise(from: wwwOmniboxOCR, url: "https://www.example.com/dashboard")
+            try check(!denoisedOmnibox.contains("Tab A"), "www-stripped omnibox anchor must strip background tabs")
+            try check(denoisedOmnibox.contains("真实页面正文内容"), "www-stripped omnibox anchor must keep body text")
+
+            // Do not false-positive on normal prose containing menu words
+            let normalProse = "历史记录显示昨天成交 12 笔\n第二行详细数据"
+            try checkEqual(SemanticPayloadSanitizer.stripTopChromeNoise(from: normalProse), normalProse, "Normal prose must not be stripped by menu bar heuristic")
+        }
     }
 
     private static func waitUntil(
@@ -4687,6 +4848,84 @@ struct DayHelmChecksMain {
 
         guard let cgImage = ctx.makeImage() else {
             throw CheckFailure(description: "Failed to finalize synthetic CGImage")
+        }
+        return cgImage
+    }
+
+    private static func makeSyntheticMenuBarAndBodyImage(menuBarText: String, bodyText: String, width: Int = 1280, height: Int = 800) throws -> CGImage {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        guard let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            throw CheckFailure(description: "Failed to create CGContext for menu-bar synthetic OCR image")
+        }
+        ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+        let menuFont = CTFontCreateWithName("PingFangSC-Regular" as CFString, 18, nil)
+        let bodyFont = CTFontCreateWithName("Helvetica-Bold" as CFString, 42, nil)
+        let fgColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+
+        let menuAttr = CFAttributedStringCreate(kCFAllocatorDefault, menuBarText as CFString, [
+            kCTFontAttributeName: menuFont,
+            kCTForegroundColorAttributeName: fgColor
+        ] as CFDictionary)!
+        let menuLine = CTLineCreateWithAttributedString(menuAttr)
+        // Top 3% in CG bottom-left coordinates (y = 0.972 * height)
+        ctx.textPosition = CGPoint(x: 24, y: CGFloat(height) * 0.972)
+        CTLineDraw(menuLine, ctx)
+
+        let bodyAttr = CFAttributedStringCreate(kCFAllocatorDefault, bodyText as CFString, [
+            kCTFontAttributeName: bodyFont,
+            kCTForegroundColorAttributeName: fgColor
+        ] as CFDictionary)!
+        let bodyLine = CTLineCreateWithAttributedString(bodyAttr)
+        ctx.textPosition = CGPoint(x: 40, y: CGFloat(height) * 0.48)
+        CTLineDraw(bodyLine, ctx)
+
+        guard let cgImage = ctx.makeImage() else {
+            throw CheckFailure(description: "Failed to finalize menu-bar synthetic CGImage")
+        }
+        return cgImage
+    }
+
+    private static func makeSyntheticTopTextBanner(text: String, width: Int = 960, height: Int = 240) throws -> CGImage {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        guard let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            throw CheckFailure(description: "Failed to create CGContext for top-text synthetic banner")
+        }
+        ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+        let font = CTFontCreateWithName("Helvetica-Bold" as CFString, 28, nil)
+        let fgColor = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
+        let attr = CFAttributedStringCreate(kCFAllocatorDefault, text as CFString, [
+            kCTFontAttributeName: font,
+            kCTForegroundColorAttributeName: fgColor
+        ] as CFDictionary)!
+        let line = CTLineCreateWithAttributedString(attr)
+        // Draw near top of small 240px banner (~90% height)
+        ctx.textPosition = CGPoint(x: 32, y: CGFloat(height) * 0.85)
+        CTLineDraw(line, ctx)
+
+        guard let cgImage = ctx.makeImage() else {
+            throw CheckFailure(description: "Failed to finalize top-text synthetic banner")
         }
         return cgImage
     }

@@ -303,29 +303,95 @@ public enum SemanticPayloadSanitizer {
         "", "/", "/index.html", "/home", "/app", "/inbox"
     ]
 
-    private static func stripBrowserTitleSuffix(_ title: String, appName: String) -> String {
+    private static let browserSuffixGroups: [(family: String, tokens: [String])] = [
+        ("chrome", ["google chrome canary", "google chrome beta", "google chrome dev", "google chrome", "chrome"]),
+        ("edge", ["microsoft edge canary", "microsoft edge beta", "microsoft edge dev", "microsoft edge", "edge"]),
+        ("safari", ["safari technology preview", "safari"]),
+        ("firefox", ["mozilla firefox", "firefox developer edition", "firefox nightly", "firefox"]),
+        ("brave", ["brave browser", "brave"]),
+        ("arc", ["arc"]),
+        ("dia", ["dia browser", "dia"]),
+        ("vivaldi", ["vivaldi"]),
+        ("opera", ["opera gx", "opera"]),
+        ("orion", ["orion"]),
+        ("comet", ["comet"]),
+        ("sigmaos", ["sigmaos"])
+    ]
+
+    private static let browserSeparators: [String] = [" - ", " — ", " – ", " | "]
+
+    private static let browserMemorySuffixRegex = try! NSRegularExpression(
+        pattern: #"(?:\s+[-—–|]\s+)(?:内存用量高|内存用量|High\s+memory\s+usage|Memory\s+usage)(?:\s*[-—–|:：]\s*|\s+)\d+(?:\.\d+)?\s*[KMGT]?i?B\s*$"#,
+        options: [.caseInsensitive]
+    )
+
+    /// Normalizes a browser window title by stripping trailing `<Browser>[ - <Profile>]`
+    /// and volatile memory-usage indicators (e.g. `- 内存用量高 - 883 MB`), leaving the page title intact.
+    public static func cleanBrowserWindowTitle(_ title: String, appName: String = "") -> String {
         var result = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !result.isEmpty else { return result }
-        var suffixes = [
-            "google chrome", "chrome", "safari technology preview", "safari",
-            "microsoft edge", "edge", "arc", "dia", "firefox", "brave",
-            "vivaldi", "opera", "orion", "comet", "sigmaos"
-        ]
+
         let trimmedApp = appName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if !trimmedApp.isEmpty && !suffixes.contains(trimmedApp) {
-            suffixes.insert(trimmedApp, at: 0)
+        var candidateSuffixes: [String] = []
+        if !trimmedApp.isEmpty {
+            candidateSuffixes.append(trimmedApp)
+            var matchedFamily = false
+            for group in browserSuffixGroups {
+                if trimmedApp == group.family
+                    || trimmedApp.contains(group.family)
+                    || group.tokens.contains(where: { trimmedApp == $0 }) {
+                    candidateSuffixes.append(contentsOf: group.tokens)
+                    matchedFamily = true
+                }
+            }
+            if !matchedFamily {
+                candidateSuffixes.append(contentsOf: browserSuffixGroups.flatMap { $0.tokens })
+            }
+        } else {
+            candidateSuffixes.append(contentsOf: browserSuffixGroups.flatMap { $0.tokens })
         }
-        let lower = result.lowercased()
-        for suffix in suffixes {
-            for sep in [" - ", " — ", " – ", " | "] {
-                let tail = sep + suffix
-                if lower.hasSuffix(tail) {
-                    result = String(result.dropLast(tail.count))
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    return result
+
+        // Deduplicate while keeping longer suffixes first so "google chrome" beats "chrome".
+        var seenSuffixes = Set<String>()
+        let uniqueSuffixes = candidateSuffixes
+            .filter { !$0.isEmpty && seenSuffixes.insert($0).inserted }
+            .sorted { $0.count > $1.count }
+
+        var bestCutIndex: String.Index?
+        for suffix in uniqueSuffixes {
+            for sep in browserSeparators {
+                let needle = sep + suffix
+                var searchStart = result.startIndex
+                while let range = result.range(of: needle, options: [.caseInsensitive], range: searchStart..<result.endIndex) {
+                    let tail = result[range.upperBound...]
+                    let validTail = tail.isEmpty || browserSeparators.contains(where: { tail.hasPrefix($0) && tail.count > $0.count })
+                    if validTail, range.lowerBound > result.startIndex {
+                        if bestCutIndex == nil || range.lowerBound > bestCutIndex! {
+                            bestCutIndex = range.lowerBound
+                        }
+                    }
+                    searchStart = range.upperBound
                 }
             }
         }
+
+        if let cutIndex = bestCutIndex {
+            let stripped = String(result[..<cutIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !stripped.isEmpty {
+                result = stripped
+            }
+        }
+
+        let nsRange = NSRange(result.startIndex..<result.endIndex, in: result)
+        if let match = browserMemorySuffixRegex.firstMatch(in: result, options: [], range: nsRange),
+           let swiftRange = Range(match.range, in: result),
+           swiftRange.lowerBound > result.startIndex {
+            let stripped = String(result[..<swiftRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !stripped.isEmpty {
+                result = stripped
+            }
+        }
+
         return result
     }
 
@@ -361,27 +427,76 @@ public enum SemanticPayloadSanitizer {
         options: [.caseInsensitive]
     )
 
+    private static let dayHelmMenuBarPillRegex = try! NSRegularExpression(
+        pattern: #"(?:开发构建|内容创作|业务运营|研究规划|沟通杂务|休息分心|其他事务|分心中|开发|创作|运营|研究|杂务|分心)\s*\d+(?:\s*/\s*\d+)?\s*m(?:[▲!·|\s]|$)"#,
+        options: []
+    )
+
+    private static let statusBarCompanionRegex = try! NSRegularExpression(
+        pattern: #"(?:\b\d{1,2}:\d{2}(?::\d{2})?\b|\b\d{1,3}\s*%|周[一二三四五六日天]|\d{1,2}月\d{1,2}日|DayHelm)"#,
+        options: [.caseInsensitive]
+    )
+
+    private static let cjkMenuBarFamilies: [(tokens: [String], isTypoMarker: Bool)] = [
+        (["文件", "文伴"], false),
+        (["编辑", "编缉", "編辑", "編輯"], false),
+        (["燴辑", "绘辑"], true),
+        (["显示", "顯示", "显式", "视图", "視圖"], false),
+        (["历史记录", "歷史記錄", "历史记"], false),
+        (["历史记承"], true),
+        (["书签", "書籤"], false),
+        (["书簽", "书簦"], true),
+        (["个人资料", "個人資料", "个人资科"], false),
+        (["标签页", "標籤頁", "标簽页"], false),
+        (["标答页"], true),
+        (["窗口", "视窗"], false),
+        (["窗ロ"], true),
+        (["帮助", "幫助"], false),
+        (["帮肋", "帮动"], true),
+        (["前往", "格式"], false)
+    ]
+
+    private static let englishMenuBarTokens: [String] = [
+        "file", "edit", "view", "window", "history", "bookmarks", "bookmark",
+        "profiles", "profile", "tab", "help", "format", "selection", "shell", "terminal"
+    ]
+
+    private static let englishMenuGluedPairs: [String] = [
+        "feedit", "fileedit", "viewwindow", "file edit", "edit view", "view window",
+        "history bookmark", "window help", "bookmarks profiles", "tab window"
+    ]
+
+    private static let englishProseStopwords: [String] = [
+        " the ", " and ", " for ", " with ", " this ", " that ", " from ", " please ", " is ", " are "
+    ]
+
     /// Fine-grained semantic context key used for Jev caching & dwell tracking.
     /// Unlike SwitchClassifier's domain-level key, browser tabs keep their normalized title
-    /// so different channels/dashboards/pages on the same host (e.g. discord.com, x.com, localhost)
-    /// do not collide in the 5-minute semantic cache.
+    /// (after stripping browser/Profile/memory suffixes) so different channels/dashboards/pages
+    /// on the same host do not collide while Profile names & memory warnings share the cache.
     public static func semanticContextKey(for sample: ActivitySample) -> String {
+        let isBrowser = ActivityClassifier.isBrowser(appName: sample.appName, bundleId: sample.bundleId)
+        let cleanedBrowserTitle: String? = (!sample.redacted && isBrowser)
+            ? sample.windowTitle.flatMap { raw -> String? in
+                let cleaned = cleanBrowserWindowTitle(raw, appName: sample.appName)
+                return cleaned.isEmpty ? nil : cleaned
+            }
+            : sample.windowTitle
         let probeSpan = EnrichedSpan(
             startedAt: sample.timestamp,
             endedAt: sample.timestamp,
             appName: sample.appName,
             bundleId: sample.bundleId,
-            windowTitle: sample.windowTitle,
+            windowTitle: cleanedBrowserTitle,
             url: sample.url,
             declaredTaskId: nil,
             redacted: sample.redacted
         )
         let baseKey = SwitchClassifier.canonicalContextKey(for: probeSpan)
-        guard !sample.redacted,
-              ActivityClassifier.isBrowser(appName: sample.appName, bundleId: sample.bundleId) else {
+        guard !sample.redacted, isBrowser else {
             return baseKey
         }
-        guard let normTitle = SwitchClassifier.switchNormalizedTitle(sample.windowTitle),
+        guard let normTitle = SwitchClassifier.switchNormalizedTitle(cleanedBrowserTitle),
               !normTitle.isEmpty else {
             return baseKey
         }
@@ -427,7 +542,7 @@ public enum SemanticPayloadSanitizer {
         // Self-hosted / custom web apps & workbenches with short/generic titles or root-level URLs
         let isWebContext = !lowerURL.isEmpty || ActivityClassifier.isBrowser(appName: appName, bundleId: nil)
         if isWebContext {
-            let cleanedTitle = stripBrowserTitleSuffix(rawTitle, appName: appName)
+            let cleanedTitle = cleanBrowserWindowTitle(rawTitle, appName: appName)
             let cleanedLower = cleanedTitle.lowercased()
             if cleanedTitle.isEmpty
                 || weakExactTitles.contains(cleanedLower)
@@ -494,7 +609,7 @@ public enum SemanticPayloadSanitizer {
             }
             let rawTitle = sample.windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let titleLower = rawTitle.lowercased()
-            let cleanedTitleLower = stripBrowserTitleSuffix(rawTitle, appName: sample.appName).lowercased()
+            let cleanedTitleLower = cleanBrowserWindowTitle(rawTitle, appName: sample.appName).lowercased()
             if cleanedTitleLower == "新标签页"
                 || cleanedTitleLower == "new tab"
                 || cleanedTitleLower == "起始页"
@@ -525,47 +640,133 @@ public enum SemanticPayloadSanitizer {
         return false
     }
 
-    /// Strips leading macOS menu-bar and browser tab-bar/address-bar noise from full-screen OCR text,
-    /// returning the actual page/app body text.
+    private static func isMenuBarNoiseLine(_ line: String) -> Bool {
+        let range = NSRange(line.startIndex..<line.endIndex, in: line)
+        if menuBarNoiseRegex.firstMatch(in: line, options: [], range: range) != nil {
+            return true
+        }
+        guard line.count <= 160 else { return false }
+
+        // Fuzzy Chinese menu bar detection (supports OCR typos like 燴辑, 历史记承)
+        var cjkMatchedCount = 0
+        var hasCJKTypo = false
+        for family in cjkMenuBarFamilies {
+            if family.tokens.contains(where: { line.contains($0) }) {
+                cjkMatchedCount += 1
+                if family.isTypoMarker {
+                    hasCJKTypo = true
+                }
+            }
+        }
+        if cjkMatchedCount >= 2 {
+            let wsTokens = line.split(whereSeparator: { $0.isWhitespace })
+            let wsMenuTokens = wsTokens.filter { token in
+                cjkMenuBarFamilies.contains { family in family.tokens.contains(where: { token.contains($0) }) }
+            }.count
+            if wsMenuTokens >= 2 || hasCJKTypo || cjkMatchedCount >= 3 {
+                return true
+            }
+        }
+
+        // Fuzzy English menu bar detection (supports glued OCR like FeEdit ViewWindow)
+        let lower = " " + line.lowercased() + " "
+        let hasProseStopword = englishProseStopwords.contains(where: { lower.contains($0) })
+        if !hasProseStopword {
+            var engMatchedCount = 0
+            for token in englishMenuBarTokens where lower.contains(token) {
+                engMatchedCount += 1
+            }
+            if lower.contains("feedit") {
+                engMatchedCount += 1
+            }
+            let hasGluedPair = englishMenuGluedPairs.contains(where: { lower.contains($0) })
+            if engMatchedCount >= 3 || (engMatchedCount >= 2 && hasGluedPair) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func isDayHelmMenuBarPillLine(_ line: String) -> Bool {
+        guard line.count <= 100 else { return false }
+        let fullRange = NSRange(line.startIndex..<line.endIndex, in: line)
+        guard dayHelmMenuBarPillRegex.firstMatch(in: line, options: [], range: fullRange) != nil else {
+            return false
+        }
+        var stripped = dayHelmMenuBarPillRegex.stringByReplacingMatches(in: line, options: [], range: fullRange, withTemplate: " ")
+        let companionRange = NSRange(stripped.startIndex..<stripped.endIndex, in: stripped)
+        stripped = statusBarCompanionRegex.stringByReplacingMatches(in: stripped, options: [], range: companionRange, withTemplate: " ")
+        let remainingMeaningfulChars = stripped.unicodeScalars.filter { scalar in
+            CharacterSet.alphanumerics.contains(scalar) || (0x4E00...0x9FFF).contains(scalar.value)
+        }.count
+        return remainingMeaningfulChars <= 12
+    }
+
+    private static func isBrowserTabStripNoiseLine(_ line: String) -> Bool {
+        guard line.count <= 180 else { return false }
+        let closeCount = line.filter { $0 == "×" || $0 == "✕" }.count
+        if closeCount >= 2 {
+            return true
+        }
+        let hasNewTabMarker = line.contains("新标签页") || line.lowercased().contains("new tab")
+        if closeCount >= 1 && (line.hasSuffix("+") || hasNewTabMarker) {
+            return true
+        }
+        if hasNewTabMarker && (line.contains("|") || line.contains("·")) {
+            return true
+        }
+        return false
+    }
+
+    /// Strips leading macOS menu-bar (including OCR-typo variants & DayHelm's own status pill)
+    /// and browser tab-bar/address-bar noise from OCR text, returning the actual page/app body text.
     public static func stripTopChromeNoise(from text: String, url: String? = nil) -> String {
         let rawLines = text.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        guard rawLines.count > 1 else { return text }
+        guard !rawLines.isEmpty else { return text }
 
         var startIdx = 0
 
         // 1. Browser address-bar anchor: everything above and including the address bar
         // is macOS menu bar + Chrome/Safari background tab strip.
-        let urlHost = url.flatMap { URLComponents(string: $0)?.host?.lowercased() }
+        let rawHost = url.flatMap { URLComponents(string: $0)?.host?.lowercased() }
+        let bareHost = rawHost.map { $0.hasPrefix("www.") ? String($0.dropFirst(4)) : $0 }
         let searchLimit = min(24, max(4, Int(Double(rawLines.count) * 0.45)))
-        if rawLines.count >= 4 {
+        if rawLines.count >= 2 {
             for i in 0..<min(searchLimit, rawLines.count - 1) {
                 let lower = rawLines[i].lowercased()
-                let isAddressLine = lower.hasPrefix("http://")
+                let isSchemeOrLocal = lower.hasPrefix("http://")
                     || lower.hasPrefix("https://")
                     || lower.hasPrefix("localhost:")
                     || lower.hasPrefix("127.0.0.1:")
-                    || (urlHost != nil && !urlHost!.isEmpty && lower.contains(urlHost!) && rawLines[i].count <= 140)
-                if isAddressLine {
+                let matchesTargetHost = (bareHost != nil && !bareHost!.isEmpty && lower.contains(bareHost!) && rawLines[i].count <= 140)
+                if (isSchemeOrLocal && rawLines[i].count <= 140) || matchesTargetHost {
                     startIdx = i + 1
                     break
                 }
             }
         }
 
-        // 2. Strip any remaining leading macOS menu-bar lines from startIdx onward.
-        while startIdx < min(startIdx + 3, rawLines.count - 1) {
+        // 2. Strip leading macOS menu-bar lines (exact + OCR-typo fuzzy), DayHelm mode/duration pills,
+        // and Chrome background tab-strip lines.
+        var strippedCount = 0
+        while startIdx < rawLines.count && strippedCount < 8 {
             let line = rawLines[startIdx]
-            let range = NSRange(line.startIndex..<line.endIndex, in: line)
-            if menuBarNoiseRegex.firstMatch(in: line, options: [], range: range) != nil {
+            if isMenuBarNoiseLine(line)
+                || isDayHelmMenuBarPillLine(line)
+                || isBrowserTabStripNoiseLine(line) {
                 startIdx += 1
+                strippedCount += 1
             } else {
                 break
             }
         }
 
-        if startIdx > 0 && startIdx < rawLines.count {
+        if startIdx >= rawLines.count {
+            return ""
+        }
+        if startIdx > 0 {
             return rawLines[startIdx...].joined(separator: " ")
         }
         return text
@@ -593,8 +794,10 @@ public enum SemanticPayloadSanitizer {
             sanitizedURL = nil
             sanitizedOCR = nil
         } else {
+            let isBrowser = ActivityClassifier.isBrowser(appName: cleanSample.appName, bundleId: cleanSample.bundleId)
             sanitizedTitle = cleanSample.windowTitle.flatMap { raw in
-                let scrubbed = PrivacyRedactor.sanitizeMetadataValue(raw)
+                let cleaned = isBrowser ? cleanBrowserWindowTitle(raw, appName: cleanSample.appName) : raw
+                let scrubbed = PrivacyRedactor.sanitizeMetadataValue(cleaned)
                 return collapseAndTruncate(scrubbed, maxChars: maxTitleChars)
             }
             sanitizedURL = cleanSample.url.flatMap { raw in
@@ -638,8 +841,10 @@ public enum SemanticPayloadSanitizer {
                 histTitle = nil
                 histDomain = nil
             } else {
-                histTitle = cleanHist.windowTitle.flatMap {
-                    collapseAndTruncate(PrivacyRedactor.sanitizeMetadataValue($0), maxChars: 120)
+                let histIsBrowser = ActivityClassifier.isBrowser(appName: cleanHist.appName, bundleId: cleanHist.bundleId)
+                histTitle = cleanHist.windowTitle.flatMap { raw in
+                    let cleaned = histIsBrowser ? cleanBrowserWindowTitle(raw, appName: cleanHist.appName) : raw
+                    return collapseAndTruncate(PrivacyRedactor.sanitizeMetadataValue(cleaned), maxChars: 120)
                 }
                 histDomain = SwitchClassifier.registrableDomain(from: cleanHist.url)
             }
