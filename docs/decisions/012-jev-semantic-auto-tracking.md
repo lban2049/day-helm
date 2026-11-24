@@ -39,8 +39,9 @@
    - 离线/静态规则下，非浏览器 `distinctContexts` 按应用级聚合（不因 IDE 内切文件膨胀），并将主流 AI 助手/截图/DayHelm 自身纳入协作/辅助白名单，且重启后给予 `120s` 启动宽限期避免历史 span 立即弹窗。
 4. **OCR 正文提取、切页保鲜与过渡噪声过滤**：
    - 实机采样表明整屏 OCR 顶部常混入 macOS 菜单栏（含 DayHelm 自身胶囊）与浏览器标签栏；因此通过精确匹配同 `window_title` 避免串页，并借助地址栏/菜单栏锚点（扫描前 24 行）剥离顶部 Chrome/系统栏噪声、提取 **≤600 字页面正文**。对弱标题及多用途工作台/看板/聊天/AI/本地页面（如 Hermes Agent Dashboard、Discord、Vikunja、Notion、飞书、localhost 等）均附带正文 OCR；若首轮调用在 OCR 落盘前完成，待同窗口新 OCR 帧就绪后自动穿透无-OCR 缓存重判一次。
-   - 实测发现同浏览器切换标签页走非 `app_focus` 触发时容易命中 `25s` OCR 冷却且等待 `10s/12s` 周期截屏，导致弱标题/多用途新标签页首轮无 OCR、十几秒后才重判；调整为：仅对**同窗口标题**维持 `25s` 冷却，切至不同窗口/标签页标题且命中 `shouldAttachOCR` 且无 180s 内新 OCR 时，停留 `0.35s`（等待页面绘制完成）后触发一次受 `3s` 冷却与去重门控的按需截屏 + OCR，完成后立刻唤醒 Jev 评估，既避免盲目全页面截屏，又把多用途页面响应压入 ~1.5–2s。
-   - 调用 Jev 前直接过滤辅助浮层（`DayHelm` / `Xnip` / `Stats` / `Spotlight` / `Raycast` / `Alfred` 等）与浏览器空白新标签页（`新标签页` / `New Tab` / `chrome://newtab` / `about:blank`），保持当前任务不变、消除无意义低置信调用；对隐私脱敏的即时通讯/邮件/系统应用（如 `微信 redacted=true`）提示词明确确定性归入 `comms_admin`，避免因隐藏标题导致低置信忽略。
+   - 实测发现同浏览器切换标签页走非 `app_focus` 触发时容易命中 `25s` OCR 冷却且等待 `10s/12s` 周期截屏，导致弱标题/多用途新标签页首轮无 OCR、十几秒后才重判；调整为：仅对**同窗口标题**维持 `25s` 冷却，切至不同窗口/标签页标题且命中 `shouldAttachOCR` 且无 180s 内新 OCR 时，停留 `0.35s`（等待页面绘制完成）后触发一次受 `3s` 冷却与去重门控的按需截屏 + OCR，完成后立刻唤醒 Jev 评估。
+   - 进一步在实机日志（2026-11-23/24）中发现两类长尾误判与双发问题：（1）`maus-bot.lban2049.xyz | MausBot`、`memo.lban2049.xyz | Memo Inbox` 等短标题自建 Web 工作台未命中多用途关键词，全程 `noOCR` 漂移；因此在 `shouldAttachOCR` 中对清洗浏览器后缀后标题较短（CJK=2/ASCII=1 权重 `≤ 12`）或通用、或无明确路径语义的自定义域名/子域名工作台（排除知名内容/开发/电商站点）自动触发 OCR。（2）`minDwellBeforeClassifySeconds = 0.65s` 早于按需截屏 + Vision OCR 完成（~0.75–1.1s），导致 1 秒内 `noOCR → OCR` 连续双发；因此在具备按需 OCR 条件且 `needsOCR && ocrText == nil` 时，引入 `onDemandOCRWaitSeconds = 1.4s` 短等待上限：OCR 在窗口内落地（且停留 `>= 0.65s`）时立即收敛为**单次带 OCR 请求**，超时或无有效 OCR 时降级发 `noOCR` 不阻塞分类。
+   - 调用 Jev 前直接过滤辅助浮层（`DayHelm` / `Xnip` / `Stats` / `Spotlight` / `Raycast` / `Alfred` 等）、浏览器空白新标签页（`新标签页` / `New Tab` / `chrome://newtab` / `about:blank`）、加载中 `无标题` / `Untitled` 页面以及无 URL/`chrome://` 的 Chrome `账号和同步` 弹窗，保持当前任务不变、消除无意义低置信与 1–3s 过场切换；对隐私脱敏的即时通讯/邮件/系统应用（如 `微信 redacted=true`）提示词明确确定性归入 `comms_admin`，并校准 `break` 边界（排除 SheerID/Google One 订阅认证与开源项目 Discord 技术频道）、IDE 内容创作例外（如 `obsidian`/`Podcast Draft` 归 `create`）及未打包本地 `Electron` 进程优先归 `build`。
 
 在 41 条基准用例（38 条核心真实/合成用例 + 3 条实机低置信/漏检回归用例：脱敏微信、`Vikunja My Open Tasks`、带正文 OCR 的 `Hermes Agent Dashboard`）上实测：
 - **零项目模式（v1 优先）**：第 1 层大类准确率 **41/41（100.0%）**，脱敏微信 `1.00`、Vikunja `1.00`、Hermes 看板 `0.96`，同任务 vs 切换 **26/27（96.3%，切换召回 13/13 = 100%）**，延迟 p50 **226ms**；
@@ -56,7 +57,7 @@
    - `minConfidenceToSwitch = 0.70`：已有归属时要求更高置信度才发起切换候选，防止弱信号引起菜单栏抖动。
    - `immediateSwitchConfidence = 0.80`（且 `same_task <= 0.60`）：高置信明确切换在首次 Jev 返回后**立即切换**（热连接端到端 ~0.9–1.0s，冷 TLS 重连仍 `<= 2.0s`），无需再进入二次等待；若 `same_task > 0.60`（跨应用同任务协作），仍阻止立即切换以防闪烁。
    - `fastSwitchConfirmSeconds = 1.2`（`confidence >= 0.75` 且 `same_task <= 0.65`）/ `minSwitchConfirmSeconds = 2.5`（中置信 `0.70–0.75` 或高 `same_task`）：仅在信号存在歧义时通过一次性精确定时器进入短暂自动**防抖观察**（全自动，绝不弹窗要求用户确认），彻底告别 2s 轮询对齐导致的 4–6s 拖尾。
-   - `contextOCRDelaySeconds = 0.35` / `minWindowChangeOCRIntervalSeconds = 3.0`：仅当新页面命中 `shouldAttachOCR` 且无 180s 内 OCR 帧时在 `0.35s` 后按需抓帧 OCR（跳过普通清晰标题页，且受 `3s` 冷却与视觉去重保护），避免推高 CPU/内存或惊扰 `__ocr-worker`。
+   - `contextOCRDelaySeconds = 0.35` / `minWindowChangeOCRIntervalSeconds = 3.0` / `onDemandOCRWaitSeconds = 1.4`：仅当新页面命中 `shouldAttachOCR` 且无 180s 内 OCR 帧时在 `0.35s` 后按需抓帧 OCR（跳过普通清晰标题页，且受 `3s` 冷却与视觉去重保护），避免推高 CPU/内存或惊扰 `__ocr-worker`；具备按需 OCR 条件时，将首次 Jev 分类等待上限由 `0.65s` 短暂放宽至 `1.4s`（`0.35s` 绘制稳定 + `0.4–1.0s` 截屏与 Vision OCR），OCR 就绪且停留 `>= 0.65s` 后立即发单次带 OCR 请求，超时或无有效 OCR 则在 `1.4s` 降级发 `noOCR`，消除 1 秒内 `noOCR → OCR` 连续双发。
    - `contextCacheTTLSeconds = 300.0`：按细粒度语义上下文键（浏览器包含归一化窗口标题，区分 Discord 不同频道、X 发帖页与首页、localhost 不同看板）在 5 分钟内缓存；若缓存记录无 OCR 且同窗口新 OCR 就绪，允许单次升级重判。
    - `maxOCRSnippetChars = 600`：剥离顶栏/标签栏噪声后提取 ≤600 字正文，覆盖 Hermes 看板、飞书文档、聊天频道与终端内容，同时保持单次请求延迟 ~220ms、极低 token 成本。
    - `manualOverrideCooldownSeconds = 600.0`：用户手工点选纠偏时，将该上下文记入当日局部覆写表并在当前上下文锁定 10 分钟；切去其它窗口后自动追踪照常生效。

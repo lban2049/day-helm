@@ -95,9 +95,12 @@ public final class HybridActivityCoordinator: ObservableObject {
     private var jevClassifyTask: Task<Void, Never>?
     private var jevDwellTask: Task<Void, Never>?
     private var jevDwellTargetContextKey: String?
+    private var jevDwellScheduledAt: Date?
+    private var jevDwellScheduledDelay: TimeInterval?
     private var jevPendingConfirmTask: Task<Void, Never>?
     private var jevContextOCRTask: Task<Void, Never>?
     private var jevContextOCRTargetKey: String?
+    private var jevContextOCRCompletedForContextKey: String?
     private var lastAlmaEventMs: Int64?
     private var latestAlmaBrowserSample: ActivitySample?
     private var lastAlmaInputAt: Date?
@@ -1661,32 +1664,47 @@ public final class HybridActivityCoordinator: ObservableObject {
         jevDwellTask?.cancel()
         jevDwellTask = nil
         jevDwellTargetContextKey = nil
+        jevDwellScheduledAt = nil
+        jevDwellScheduledDelay = nil
         jevPendingConfirmTask?.cancel()
         jevPendingConfirmTask = nil
         jevContextOCRTask?.cancel()
         jevContextOCRTask = nil
         jevContextOCRTargetKey = nil
+        jevContextOCRCompletedForContextKey = nil
     }
 
-    private func scheduleJevDwellTimerIfNeeded(for contextKey: String, after delaySeconds: TimeInterval) {
+    private func scheduleJevDwellTimerIfNeeded(for contextKey: String, after delaySeconds: TimeInterval, now: Date) {
         guard shouldScheduleEventTimers, !isSyntheticDemo, settings.jevAutoTrackingEnabled else { return }
-        if jevDwellTargetContextKey == contextKey, jevDwellTask != nil {
-            return
+        let clampedDelay = max(0.02, delaySeconds)
+        let targetFireAt = now.addingTimeInterval(clampedDelay)
+        if jevDwellTargetContextKey == contextKey,
+           jevDwellTask != nil,
+           let scheduledAt = jevDwellScheduledAt,
+           let scheduledDelay = jevDwellScheduledDelay {
+            let existingFireAt = scheduledAt.addingTimeInterval(scheduledDelay)
+            if existingFireAt <= targetFireAt.addingTimeInterval(0.05) {
+                return
+            }
         }
         jevDwellTask?.cancel()
         jevDwellTargetContextKey = contextKey
-        let sleepNanos = UInt64(max(0.02, delaySeconds) * 1_000_000_000) + 15_000_000
+        jevDwellScheduledAt = now
+        jevDwellScheduledDelay = clampedDelay
+        let sleepNanos = UInt64(clampedDelay * 1_000_000_000) + 15_000_000
         jevDwellTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: sleepNanos)
             guard !Task.isCancelled, let self else { return }
             guard self.jevDwellTargetContextKey == contextKey else { return }
             self.jevDwellTask = nil
             self.jevDwellTargetContextKey = nil
+            self.jevDwellScheduledAt = nil
+            self.jevDwellScheduledDelay = nil
             guard self.observedContextKey == contextKey else { return }
-            let now = self.clock.now()
-            let sample = self.inspectPatchedSample(now: now)
-            self.evaluateJevAutoTrackingIfNeeded(sample: sample, now: now)
-            _ = self.refreshPublishedState(now: now)
+            let fireNow = self.clock.now()
+            let sample = self.inspectPatchedSample(now: fireNow)
+            self.evaluateJevAutoTrackingIfNeeded(sample: sample, now: fireNow)
+            _ = self.refreshPublishedState(now: fireNow)
         }
     }
 
@@ -1771,6 +1789,7 @@ public final class HybridActivityCoordinator: ObservableObject {
               observedContextKey == expectedContextKey else {
             return
         }
+        jevContextOCRCompletedForContextKey = expectedContextKey
         let now = clock.now()
         let sample = inspectPatchedSample(now: now)
         guard !sample.screenLocked, !sample.redacted else { return }
@@ -1812,11 +1831,14 @@ public final class HybridActivityCoordinator: ObservableObject {
             jevDwellTask?.cancel()
             jevDwellTask = nil
             jevDwellTargetContextKey = nil
+            jevDwellScheduledAt = nil
+            jevDwellScheduledDelay = nil
             jevPendingConfirmTask?.cancel()
             jevPendingConfirmTask = nil
             jevContextOCRTask?.cancel()
             jevContextOCRTask = nil
             jevContextOCRTargetKey = nil
+            jevContextOCRCompletedForContextKey = nil
         } else if observedContextSince == nil {
             observedContextSince = now
         }
@@ -1936,7 +1958,8 @@ public final class HybridActivityCoordinator: ObservableObject {
             if !isColdStart && !isSameCategory && dwellSeconds < semanticTracker.config.cacheSwitchDwellSeconds {
                 scheduleJevDwellTimerIfNeeded(
                     for: contextKey,
-                    after: semanticTracker.config.cacheSwitchDwellSeconds - dwellSeconds
+                    after: semanticTracker.config.cacheSwitchDwellSeconds - dwellSeconds,
+                    now: now
                 )
                 return
             }
@@ -1955,19 +1978,41 @@ public final class HybridActivityCoordinator: ObservableObject {
             return
         }
 
-        // For weak-title / multi-purpose pages without recent OCR, trigger an on-demand capture+OCR after 0.35s paint settle.
-        if needsOCR && ocrText == nil {
+        // For weak-title / multi-purpose / self-hosted web pages without recent OCR, trigger an on-demand capture+OCR
+        // after 0.35s paint settle and defer the first Jev request up to onDemandOCRWaitSeconds (1.4s) so OCR
+        // lands before dispatch, eliminating 1s noOCR -> OCR double-fires. If OCR times out or produces no text,
+        // fallback cleanly to noOCR.
+        let canCaptureOnDemandOCR = needsOCR
+            && ocrText == nil
+            && settings.activityRecorderEnabled
+            && deepRecordingEnabled
+            && settings.visionOCREnabled
+            && (screenRecorder?.isScreenCaptureTrusted ?? false)
+            && database != nil
+        if canCaptureOnDemandOCR {
             scheduleContextOCRCaptureIfNeeded(sample: sample, contextKey: contextKey)
         }
 
-        // 4. Enforce >= 0.65s precision dwell gate before calling Jev (filters Cmd+Tab blips & page-load title churn while keeping cold-TLS switches <= 2.0s).
-        guard dwellSeconds >= semanticTracker.config.minDwellBeforeClassifySeconds else {
+        let awaitingOnDemandOCR = canCaptureOnDemandOCR
+            && jevContextOCRCompletedForContextKey != contextKey
+        let requiredDwellSeconds = awaitingOnDemandOCR
+            ? max(semanticTracker.config.minDwellBeforeClassifySeconds, semanticTracker.config.onDemandOCRWaitSeconds)
+            : semanticTracker.config.minDwellBeforeClassifySeconds
+
+        // 4. Enforce precision dwell gate before calling Jev.
+        guard dwellSeconds >= requiredDwellSeconds else {
             scheduleJevDwellTimerIfNeeded(
                 for: contextKey,
-                after: semanticTracker.config.minDwellBeforeClassifySeconds - dwellSeconds
+                after: requiredDwellSeconds - dwellSeconds,
+                now: now
             )
             return
         }
+        jevDwellTask?.cancel()
+        jevDwellTask = nil
+        jevDwellTargetContextKey = nil
+        jevDwellScheduledAt = nil
+        jevDwellScheduledDelay = nil
 
         // Error backoff (15s) to avoid hammering on offline/invalid-key states.
         if let lastErr = lastJevErrorAt, now.timeIntervalSince(lastErr) < 15.0 {

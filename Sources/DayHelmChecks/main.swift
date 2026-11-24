@@ -3150,6 +3150,7 @@ struct DayHelmChecksMain {
 
             // 0. Calibrated sub-2s defaults (0.65s dwell ensures cold-TLS ~1.1s RTT stays <= 2.0s)
             try checkApprox(tracker.config.minDwellBeforeClassifySeconds, 0.65, "Default pre-classify dwell should be 0.65s")
+            try checkApprox(tracker.config.onDemandOCRWaitSeconds, 1.4, "Default on-demand OCR wait deadline should be 1.4s")
             try checkApprox(tracker.config.cacheSwitchDwellSeconds, 0.45, "Default cached-switch anti-flicker dwell should be 0.45s")
             try checkApprox(tracker.config.immediateSwitchConfidence, 0.80, "Default immediate switch confidence should be 0.80")
             try checkApprox(tracker.config.fastSwitchConfirmSeconds, 1.2, "Default fast anti-flicker confirm should be 1.2s")
@@ -4115,6 +4116,431 @@ struct DayHelmChecksMain {
             }
             let elapsed4 = Date().timeIntervalSince(tSwitch4)
             try check(elapsed4 >= 1.8 && elapsed4 < 3.0, "Ambiguous switch should respect 0.65s dwell + 0.22s RTT + 1.2s confirm (actual: \(String(format: "%.2f", elapsed4))s)")
+        }
+
+        try await runCheck("70. Calibrated Jev prompt criteria, self-hosted web OCR gating, transient Chrome skip & single-shot on-demand OCR wait") {
+            let t0 = baseDate()
+
+            // 1. JevActivityClient.buildRequestPayload prompt calibration
+            let payload = JevActivityClient.buildRequestPayload(
+                input: SemanticClassificationInput(
+                    timestamp: t0,
+                    contextKey: "app|electron|doujia",
+                    appName: "Electron",
+                    windowTitle: "豆荚 — 抖店多店智能运营工作台",
+                    budgets: []
+                ),
+                model: "jev-latest"
+            )
+            let questions = payload["questions"] as? [String: Any]
+            let modeQ = questions?["activity_mode"] as? [String: Any]
+            let modeInstructions = modeQ?["instructions"] as? String ?? ""
+            let modeCriteria = modeQ?["criteria"] as? [String: String] ?? [:]
+
+            let buildText = modeCriteria[ActivityMode.build.rawValue] ?? ""
+            let createText = modeCriteria[ActivityMode.create.rawValue] ?? ""
+            let researchText = modeCriteria[ActivityMode.research.rawValue] ?? ""
+            let commsText = modeCriteria[ActivityMode.commsAdmin.rawValue] ?? ""
+            let breakText = modeCriteria[ActivityMode.breakTime.rawValue] ?? ""
+
+            try check(
+                (commsText.contains("SheerID") || modeInstructions.contains("SheerID"))
+                    && (breakText.contains("SheerID") || modeInstructions.contains("NEVER 'break'") || modeInstructions.contains("不归入此类")),
+                "activity_mode must route SheerID/subscription verification to comms_admin/research and never break"
+            )
+            try check(
+                modeInstructions.contains("OpenMausBot") || (researchText.contains("Discord") && modeInstructions.contains("#general")),
+                "activity_mode must keep open-source project Discord channels (e.g. #general | OpenMausBot) in research/build, not break"
+            )
+            try check(
+                (createText.contains("Podcast Draft") || modeInstructions.contains("Podcast Draft"))
+                    && (createText.contains("obsidian") || modeInstructions.contains("obsidian")),
+                "activity_mode must route IDE/AI coding tool content review (obsidian / Podcast Draft) to create"
+            )
+            try check(
+                modeInstructions.contains("Electron") && (modeInstructions.contains("运营工作台") || buildText.contains("Electron")),
+                "activity_mode must prioritize unbundled local Electron dev process as build regardless of business title words"
+            )
+
+            // 2. Self-hosted / short-title web workbench OCR gating (preserving known sites & normal multi-clause titles)
+            try checkEqual(
+                SemanticPayloadSanitizer.shouldAttachOCR(
+                    appName: "Google Chrome",
+                    windowTitle: "MausBot - Google Chrome",
+                    url: "https://maus-bot.lban2049.xyz/"
+                ),
+                true,
+                "Short-title self-hosted web workbench MausBot must attach OCR"
+            )
+            try checkEqual(
+                SemanticPayloadSanitizer.shouldAttachOCR(
+                    appName: "Google Chrome",
+                    windowTitle: "MausBot",
+                    url: "https://maus-bot.lban2049.xyz/chat"
+                ),
+                true,
+                "Short-title MausBot even with subpath must attach OCR"
+            )
+            try checkEqual(
+                SemanticPayloadSanitizer.shouldAttachOCR(
+                    appName: "Google Chrome",
+                    windowTitle: "Memo Inbox - Google Chrome",
+                    url: "https://memo.lban2049.xyz/"
+                ),
+                true,
+                "Short/generic self-hosted web app Memo Inbox must attach OCR"
+            )
+            try checkEqual(
+                SemanticPayloadSanitizer.shouldAttachOCR(
+                    appName: "Google Chrome",
+                    windowTitle: "入站 - Google Chrome",
+                    url: "https://maus-bot.lban2049.xyz/inbound"
+                ),
+                true,
+                "Short generic CJK web title 入站 must attach OCR"
+            )
+            try checkEqual(
+                SemanticPayloadSanitizer.shouldAttachOCR(
+                    appName: "Google Chrome",
+                    windowTitle: "My Custom Workbench Overview",
+                    url: "https://app.lban2049.xyz/"
+                ),
+                true,
+                "Custom subdomain root workbench without explicit path semantics must attach OCR"
+            )
+            try checkEqual(
+                SemanticPayloadSanitizer.shouldAttachOCR(
+                    appName: "Google Chrome",
+                    windowTitle: "商品上货-抖店妙手",
+                    url: "https://shop.example.com/move"
+                ),
+                false,
+                "Clear CJK two-clause title with explicit path must continue skipping OCR"
+            )
+            try checkEqual(
+                SemanticPayloadSanitizer.shouldAttachOCR(
+                    appName: "Google Chrome",
+                    windowTitle: "focus-guard Pull Request - Google Chrome",
+                    url: "https://github.com/org/focus-guard/pull/1"
+                ),
+                false,
+                "Known dev site GitHub PR page must skip OCR"
+            )
+            try checkEqual(
+                SemanticPayloadSanitizer.shouldAttachOCR(
+                    appName: "Google Chrome",
+                    windowTitle: "Hacker News",
+                    url: "https://news.ycombinator.com/"
+                ),
+                false,
+                "Known content site Hacker News must skip OCR"
+            )
+
+            // 3. Transient Chrome loading & account-sync overlays skip semantic classification
+            let untitledChrome = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "无标题 - Google Chrome",
+                url: nil,
+                idleSeconds: 0
+            )
+            let untitledLoadingURL = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Untitled - Google Chrome",
+                url: "https://example.com/loading",
+                idleSeconds: 0
+            )
+            let chromeSyncPopup = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "账号和同步",
+                url: nil,
+                idleSeconds: 0
+            )
+            let chromeSyncPopupWithSuffix = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "账号和同步 - Google Chrome",
+                url: nil,
+                idleSeconds: 0
+            )
+            let realSyncArticle = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "账号和同步机制解析 - Google Chrome",
+                url: "https://docs.example.com/sync-guide",
+                idleSeconds: 0
+            )
+            try checkEqual(SemanticPayloadSanitizer.shouldSkipSemanticClassification(sample: untitledChrome), true, "Chrome 无标题 loading window must skip Jev")
+            try checkEqual(SemanticPayloadSanitizer.shouldSkipSemanticClassification(sample: untitledLoadingURL), true, "Chrome Untitled loading window must skip Jev")
+            try checkEqual(SemanticPayloadSanitizer.shouldSkipSemanticClassification(sample: chromeSyncPopup), true, "Chrome 账号和同步 popup without URL must skip Jev")
+            try checkEqual(SemanticPayloadSanitizer.shouldSkipSemanticClassification(sample: chromeSyncPopupWithSuffix), true, "Chrome 账号和同步 - Google Chrome popup without URL must skip Jev")
+            try checkEqual(SemanticPayloadSanitizer.shouldSkipSemanticClassification(sample: realSyncArticle), false, "Real web article with URL must NOT be skipped")
+
+            // 4. On-demand OCR wait window eliminates noOCR->OCR double-fire & degrades cleanly on timeout
+            // 4a. Clock-injected deterministic timeout fallback + single OCR-ready dispatch (no GUI, no network)
+            let clock = ManualClock(now: t0)
+            let tmpDirA = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-70a-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDirA, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDirA) }
+
+            let storeA = DayHelmStore(directory: tmpDirA)
+            let keyStoreA = JevAPIKeyStore(directory: tmpDirA, environment: [:], dotEnvSearchPaths: [])
+            try keyStoreA.saveKey("synthetic_ocr_wait_key")
+
+            let dbA = try ActivityDatabase(databaseURL: storeA.databaseURL)
+            let imgMaus = try makeSyntheticTextImage(text: "MausBot Local Agent Terminal", backgroundWhite: true)
+            let imgMemo = try makeSyntheticTextImage(text: "Memo Inbox Podcast Notes", backgroundWhite: false)
+            let capturerA = MockScreenCapturer(image: imgMaus, isScreenCaptureTrusted: true)
+            let recorderA = NativeScreenRecorder(
+                database: dbA,
+                snapshotsRootDir: storeA.snapshotsDirectory,
+                capturer: capturerA,
+                clock: clock
+            )
+
+            let capturedOCRFlagsA = LockedBox<[Bool]>([])
+            let mockTransportA = MockJevTransport { request in
+                let obj = try? JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+                let state = obj?["state"] as? [String: Any]
+                let current = state?["current"] as? [String: Any]
+                let hasOCR = (current?["ocr_snippet"] as? String)?.isEmpty == false
+                capturedOCRFlagsA.modify { $0.append(hasOCR) }
+
+                let json = """
+                {
+                  "model": "jev-1.14.0",
+                  "answers": {
+                    "activity_mode": { "type": "choice", "choice": "build", "confidence": 0.94, "probabilities": { "build": 0.94 } },
+                    "same_task": { "type": "noul", "noul": 0.15 }
+                  },
+                  "usage": { "input_tokens": 550, "output_tokens": 25 }
+                }
+                """
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (Data(json.utf8), resp)
+            }
+
+            let engineA = DayHelmEngine(budgets: [], clock: clock)
+            let mausSample0 = ActivitySample(
+                timestamp: t0,
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "MausBot - Google Chrome",
+                url: "https://maus-bot.lban2049.xyz/",
+                idleSeconds: 0
+            )
+            let inspectorA = MockInspector(currentSample: mausSample0)
+            let coordA = await MainActor.run {
+                HybridActivityCoordinator(
+                    engine: engineA,
+                    store: storeA,
+                    almaClient: AlmaActivityClient(baseURL: URL(string: "http://127.0.0.1:1")!, transport: MockAlmaTransport { _ in throw URLError(.cannotConnectToHost) }),
+                    inspector: inspectorA,
+                    clock: clock,
+                    database: dbA,
+                    screenRecorder: recorderA,
+                    jevClient: JevActivityClient(transport: mockTransportA),
+                    jevAPIKeyStore: keyStoreA
+                )
+            }
+
+            await MainActor.run {
+                var s = coordA.recorderSettings
+                s.jevAutoTrackingEnabled = true
+                s.jevSendOCRSnippet = true
+                s.activityRecorderEnabled = true
+                s.deepRecordingEnabled = true
+                s.visionOCREnabled = true
+                coordA.updateRecorderSettings(s)
+                coordA.handleWindowContextChangedForTesting()
+            }
+
+            // Past 0.65s minDwellBeforeClassifySeconds, still inside ~1.4s on-demand OCR wait window -> 0 Jev calls
+            clock.advance(by: 0.70)
+            await MainActor.run {
+                inspectorA.currentSample = ActivitySample(
+                    timestamp: clock.now(),
+                    appName: "Google Chrome",
+                    bundleId: "com.google.Chrome",
+                    windowTitle: "MausBot - Google Chrome",
+                    url: "https://maus-bot.lban2049.xyz/",
+                    idleSeconds: 0
+                )
+                coordA.pollOnce()
+            }
+            try checkEqual(capturedOCRFlagsA.get().count, 0, "Inside on-demand OCR wait window (0.70s < 1.4s), must defer noOCR call")
+
+            // Past 1.4s timeout without OCR landing -> degrades to noOCR once
+            clock.advance(by: 0.75)
+            await MainActor.run {
+                inspectorA.currentSample = ActivitySample(
+                    timestamp: clock.now(),
+                    appName: "Google Chrome",
+                    bundleId: "com.google.Chrome",
+                    windowTitle: "MausBot - Google Chrome",
+                    url: "https://maus-bot.lban2049.xyz/",
+                    idleSeconds: 0
+                )
+                coordA.pollOnce()
+            }
+            try await waitUntil("On-demand OCR timeout degrades to noOCR Jev call") {
+                capturedOCRFlagsA.get().count == 1
+            }
+            try checkEqual(capturedOCRFlagsA.get(), [false], "Timeout fallback must send exactly 1 noOCR request")
+
+            // Switch to Memo Inbox: defer at 0.70s, then OCR lands at 0.85s -> single OCR request only
+            clock.advance(by: 5.0)
+            let memoStart = clock.now()
+            await MainActor.run {
+                inspectorA.currentSample = ActivitySample(
+                    timestamp: memoStart,
+                    appName: "Google Chrome",
+                    bundleId: "com.google.Chrome",
+                    windowTitle: "Memo Inbox - Google Chrome",
+                    url: "https://memo.lban2049.xyz/",
+                    idleSeconds: 0
+                )
+                coordA.handleWindowContextChangedForTesting()
+            }
+            clock.advance(by: 0.70)
+            await MainActor.run {
+                inspectorA.currentSample = ActivitySample(
+                    timestamp: clock.now(),
+                    appName: "Google Chrome",
+                    bundleId: "com.google.Chrome",
+                    windowTitle: "Memo Inbox - Google Chrome",
+                    url: "https://memo.lban2049.xyz/",
+                    idleSeconds: 0
+                )
+                coordA.pollOnce()
+            }
+            try checkEqual(capturedOCRFlagsA.get().count, 1, "Memo Inbox at 0.70s must still wait for OCR without sending noOCR")
+
+            clock.advance(by: 0.15) // 0.85s total dwell
+            let memoOCRSample = ActivitySample(
+                timestamp: clock.now(),
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Memo Inbox - Google Chrome",
+                url: "https://memo.lban2049.xyz/",
+                idleSeconds: 0
+            )
+            let savedMemoOCR = try await recorderA.processCapturedImage(
+                imgMemo,
+                sample: memoOCRSample,
+                trigger: "window_change",
+                declaredTaskId: nil,
+                runOCR: true
+            )
+            try checkEqual(savedMemoOCR, true, "Synthetic Memo Inbox image should save & OCR")
+            await MainActor.run {
+                inspectorA.currentSample = memoOCRSample
+                coordA.pollOnce()
+            }
+            try await waitUntil("Memo Inbox classifies once with landed OCR") {
+                capturedOCRFlagsA.get().count == 2
+            }
+            try checkEqual(capturedOCRFlagsA.get(), [false, true], "Memo Inbox must send exactly 1 OCR-enriched request and skip noOCR")
+
+            // 4b. Live timer E2E (no pollOnce!): on-demand 0.35s OCR trigger completes inside wait window -> 1 single OCR request
+            let tmpDirB = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-check-70b-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: tmpDirB, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tmpDirB) }
+
+            let storeB = DayHelmStore(directory: tmpDirB)
+            let keyStoreB = JevAPIKeyStore(directory: tmpDirB, environment: [:], dotEnvSearchPaths: [])
+            try keyStoreB.saveKey("synthetic_live_ocr_wait_key")
+
+            let sysClock = SystemClock()
+            let dbB = try ActivityDatabase(databaseURL: storeB.databaseURL)
+            let capturerB = MockScreenCapturer(image: imgMaus, isScreenCaptureTrusted: true)
+            let recorderB = NativeScreenRecorder(
+                database: dbB,
+                snapshotsRootDir: storeB.snapshotsDirectory,
+                capturer: capturerB,
+                clock: sysClock
+            )
+            let capturedOCRFlagsB = LockedBox<[Bool]>([])
+            let mockTransportB = MockJevTransport { request in
+                let obj = try? JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+                let state = obj?["state"] as? [String: Any]
+                let current = state?["current"] as? [String: Any]
+                let hasOCR = (current?["ocr_snippet"] as? String)?.isEmpty == false
+                capturedOCRFlagsB.modify { $0.append(hasOCR) }
+
+                let json = """
+                {
+                  "model": "jev-1.14.0",
+                  "answers": {
+                    "activity_mode": { "type": "choice", "choice": "build", "confidence": 0.95, "probabilities": { "build": 0.95 } },
+                    "same_task": { "type": "noul", "noul": 0.12 }
+                  },
+                  "usage": { "input_tokens": 580, "output_tokens": 25 }
+                }
+                """
+                let resp = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (Data(json.utf8), resp)
+            }
+
+            let engineB = DayHelmEngine(budgets: [], clock: sysClock)
+            let inspectorB = MockInspector(currentSample: ActivitySample(
+                timestamp: sysClock.now(),
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "MausBot - Google Chrome",
+                url: "https://maus-bot.lban2049.xyz/",
+                idleSeconds: 0
+            ))
+            let coordB = await MainActor.run {
+                let c = HybridActivityCoordinator(
+                    engine: engineB,
+                    store: storeB,
+                    almaClient: AlmaActivityClient(baseURL: URL(string: "http://127.0.0.1:1")!, transport: MockAlmaTransport { _ in throw URLError(.cannotConnectToHost) }),
+                    inspector: inspectorB,
+                    clock: sysClock,
+                    database: dbB,
+                    screenRecorder: recorderB,
+                    jevClient: JevActivityClient(transport: mockTransportB),
+                    jevAPIKeyStore: keyStoreB
+                )
+                c.enableLiveTimersForTesting = true
+                var s = c.recorderSettings
+                s.jevAutoTrackingEnabled = true
+                s.jevSendOCRSnippet = true
+                s.activityRecorderEnabled = true
+                s.deepRecordingEnabled = true
+                s.visionOCREnabled = true
+                c.updateRecorderSettings(s)
+                return c
+            }
+            defer {
+                Task { @MainActor in coordB.stop() }
+            }
+
+            await MainActor.run {
+                inspectorB.currentSample = ActivitySample(
+                    timestamp: sysClock.now(),
+                    appName: "Google Chrome",
+                    bundleId: "com.google.Chrome",
+                    windowTitle: "MausBot - Google Chrome",
+                    url: "https://maus-bot.lban2049.xyz/",
+                    idleSeconds: 0
+                )
+                coordB.handleWindowContextChangedForTesting()
+            }
+            try await waitUntil("Live timer on-demand OCR completes and sends single OCR-enriched Jev request", timeoutSeconds: 4.0) {
+                capturedOCRFlagsB.get().count >= 1
+            }
+            // Wait past the fallback deadline (1.5s) to ensure no duplicate second Jev request fires
+            try await Task.sleep(nanoseconds: 1_500_000_000)
+            try checkEqual(capturedOCRFlagsB.get(), [true], "Live timer on-demand OCR must emit exactly 1 OCR request and 0 noOCR double-fires")
         }
     }
 
