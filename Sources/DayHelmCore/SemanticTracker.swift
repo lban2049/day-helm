@@ -279,6 +279,78 @@ public enum SemanticPayloadSanitizer {
         "terminal", "ghostty", "iterm", "warp"
     ]
 
+    private static let knownContentDomains: Set<String> = [
+        "github.com", "gitlab.com", "bitbucket.org", "stackoverflow.com",
+        "ycombinator.com", "reddit.com", "medium.com", "substack.com",
+        "wikipedia.org", "zhihu.com", "juejin.cn", "cnblogs.com",
+        "csdn.net", "segmentfault.com", "v2ex.com", "bilibili.com",
+        "youtube.com", "youtu.be", "x.com", "twitter.com", "weibo.com",
+        "xiaohongshu.com", "douyin.com", "tiktok.com", "google.com",
+        "bing.com", "baidu.com", "duckduckgo.com", "jinritemai.com",
+        "taobao.com", "tmall.com", "jd.com", "1688.com", "pinduoduo.com",
+        "shopify.com", "amazon.com", "aliyun.com", "tencent.com",
+        "cloudflare.com", "vercel.com", "netlify.com", "apple.com",
+        "swift.org", "anthropic.com", "openai.com", "x.ai"
+    ]
+
+    private static let genericWebTitleWords: Set<String> = [
+        "inbox", "memo", "memo inbox", "home", "index", "overview",
+        "workspace", "panel", "portal", "console", "admin", "app",
+        "入站", "收件箱", "概览", "首页", "控制台", "面板", "工作台"
+    ]
+
+    private static let rootWorkbenchPaths: Set<String> = [
+        "", "/", "/index.html", "/home", "/app", "/inbox"
+    ]
+
+    private static func stripBrowserTitleSuffix(_ title: String, appName: String) -> String {
+        var result = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !result.isEmpty else { return result }
+        var suffixes = [
+            "google chrome", "chrome", "safari technology preview", "safari",
+            "microsoft edge", "edge", "arc", "dia", "firefox", "brave",
+            "vivaldi", "opera", "orion", "comet", "sigmaos"
+        ]
+        let trimmedApp = appName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !trimmedApp.isEmpty && !suffixes.contains(trimmedApp) {
+            suffixes.insert(trimmedApp, at: 0)
+        }
+        let lower = result.lowercased()
+        for suffix in suffixes {
+            for sep in [" - ", " — ", " – ", " | "] {
+                let tail = sep + suffix
+                if lower.hasSuffix(tail) {
+                    result = String(result.dropLast(tail.count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    return result
+                }
+            }
+        }
+        return result
+    }
+
+    private static func isKnownContentHost(_ host: String) -> Bool {
+        let lower = host.lowercased()
+        for domain in knownContentDomains {
+            if lower == domain || lower.hasSuffix("." + domain) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func titleVisualUnits(_ title: String) -> Int {
+        var units = 0
+        for scalar in title.unicodeScalars {
+            let v = scalar.value
+            let isCJK = (0x4E00...0x9FFF).contains(v)
+                || (0x3400...0x4DBF).contains(v)
+                || (0xF900...0xFAFF).contains(v)
+            units += isCJK ? 2 : 1
+        }
+        return units
+    }
+
     private static let dateOnlyTitleRegex = try! NSRegularExpression(
         pattern: #"^\d{4}-\d{2}-\d{2}(?:\s*[-—|]\s*.{1,30})?$"#,
         options: []
@@ -351,6 +423,40 @@ public enum SemanticPayloadSanitizer {
                 return true
             }
         }
+
+        // Self-hosted / custom web apps & workbenches with short/generic titles or root-level URLs
+        let isWebContext = !lowerURL.isEmpty || ActivityClassifier.isBrowser(appName: appName, bundleId: nil)
+        if isWebContext {
+            let cleanedTitle = stripBrowserTitleSuffix(rawTitle, appName: appName)
+            let cleanedLower = cleanedTitle.lowercased()
+            if cleanedTitle.isEmpty
+                || weakExactTitles.contains(cleanedLower)
+                || cleanedLower.hasPrefix("无标题")
+                || cleanedLower.hasPrefix("untitled") {
+                return true
+            }
+
+            let urlComponents = (lowerURL.hasPrefix("http://") || lowerURL.hasPrefix("https://"))
+                ? URLComponents(string: lowerURL)
+                : nil
+            let host = urlComponents?.host?.lowercased()
+            let knownSite = host.map { isKnownContentHost($0) } ?? false
+
+            if !knownSite {
+                if titleVisualUnits(cleanedTitle) <= 12 || genericWebTitleWords.contains(cleanedLower) {
+                    return true
+                }
+                if let host {
+                    let trimmedHost = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+                    let isCustomSubdomain = trimmedHost.split(separator: ".").count >= 3
+                    let pathLower = urlComponents?.path.lowercased() ?? ""
+                    let hasNoQuery = (urlComponents?.query?.isEmpty ?? true)
+                    if isCustomSubdomain && rootWorkbenchPaths.contains(pathLower) && hasNoQuery {
+                        return true
+                    }
+                }
+            }
+        }
         return false
     }
 
@@ -386,15 +492,33 @@ public enum SemanticPayloadSanitizer {
                 || urlLower == "about:newtab" {
                 return true
             }
-            let titleLower = sample.windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
-            if titleLower == "新标签页"
+            let rawTitle = sample.windowTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let titleLower = rawTitle.lowercased()
+            let cleanedTitleLower = stripBrowserTitleSuffix(rawTitle, appName: sample.appName).lowercased()
+            if cleanedTitleLower == "新标签页"
+                || cleanedTitleLower == "new tab"
+                || cleanedTitleLower == "起始页"
+                || cleanedTitleLower == "start page"
+                || cleanedTitleLower == "无标题"
+                || cleanedTitleLower == "untitled"
+                || cleanedTitleLower == "正在加载"
+                || cleanedTitleLower == "loading"
+                || cleanedTitleLower == "loading..."
+                || cleanedTitleLower == "loading…"
                 || titleLower.hasPrefix("新标签页 -")
                 || titleLower.hasPrefix("新标签页 —")
-                || titleLower == "new tab"
                 || titleLower.hasPrefix("new tab -")
                 || titleLower.hasPrefix("new tab —")
-                || titleLower == "起始页"
-                || titleLower == "start page" {
+                || titleLower.hasPrefix("无标题 -")
+                || titleLower.hasPrefix("无标题 —")
+                || titleLower.hasPrefix("untitled -")
+                || titleLower.hasPrefix("untitled —") {
+                return true
+            }
+            if (urlLower.isEmpty || urlLower.hasPrefix("chrome://"))
+                && (cleanedTitleLower.hasPrefix("账号和同步")
+                    || cleanedTitleLower.hasPrefix("accounts and sync")
+                    || cleanedTitleLower.hasPrefix("turn on sync")) {
                 return true
             }
         }
@@ -558,6 +682,7 @@ public enum SemanticPayloadSanitizer {
 
 public struct SemanticTrackerConfig: Sendable, Equatable {
     public var minDwellBeforeClassifySeconds: TimeInterval
+    public var onDemandOCRWaitSeconds: TimeInterval
     public var cacheSwitchDwellSeconds: TimeInterval
     public var coldStartConfidence: Double
     public var minConfidenceToSwitch: Double
@@ -574,6 +699,7 @@ public struct SemanticTrackerConfig: Sendable, Equatable {
 
     public init(
         minDwellBeforeClassifySeconds: TimeInterval = 0.65,
+        onDemandOCRWaitSeconds: TimeInterval = 1.4,
         cacheSwitchDwellSeconds: TimeInterval = 0.45,
         coldStartConfidence: Double = 0.55,
         minConfidenceToSwitch: Double = 0.70,
@@ -587,6 +713,7 @@ public struct SemanticTrackerConfig: Sendable, Equatable {
         manualPinCooldownSeconds: TimeInterval = 600.0
     ) {
         self.minDwellBeforeClassifySeconds = minDwellBeforeClassifySeconds
+        self.onDemandOCRWaitSeconds = onDemandOCRWaitSeconds
         self.cacheSwitchDwellSeconds = cacheSwitchDwellSeconds
         self.coldStartConfidence = coldStartConfidence
         self.minConfidenceToSwitch = minConfidenceToSwitch
