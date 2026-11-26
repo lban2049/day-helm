@@ -244,12 +244,11 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 - **一体化工具栏导航（Unified Toolbar）**：窗口采用标准非重叠标题栏（不使用 `.fullSizeContentView` 透明穿透，确保内容区向上滚动严格裁切在工具栏下方、绝不与导航栏重叠）+ `titleVisibility = .hidden` + `.unified` 工具栏，红黄绿窗口控制钮右侧依次排列会话侧栏折叠按钮（仅「历史会话」显示）、DayHelm Logo 与名称、平级导航项（`事项与配额` ｜ `每日统计` ｜ `Jev 识别` ｜ `活动采集` ｜ `隐私与存储` ｜ `历史会话`；其中 `isSettingsSection` 排除 `每日统计` 与 `历史会话`，确保菜单栏「设置」入口始终落入设置分区），右侧展示采集状态胶囊与刷新按钮：
   - **「事项与配额」**：专注管理今日可选焦点项目与菜单栏显示密度——包含事项新增/编辑弹窗（名称、短名、一句话说明、6 色语义色点、保底目标与封顶上限滑块/直输联动控件、折叠式高级离线匹配规则）、上下排序、删除确认，修改立即生效并同步至悬浮窗；不配置项目时亦可完全依赖 Jev Layer-1 活动大类运行。
   - **「每日统计」**（`DailyStatsView`）：按天预计算历史统计看板与本地 Agent 深度分析提示词生成器（**仅查看前一天及更早历史日期，不在主线程或切换 Tab 时实时计算当天**）：
-    1. **后台预计算与异步非阻塞加载**：App 启动与每日跨天切换（`rollover`）时，在后台 `.utility` 串行队列通过 `DailyStatsMaterializer` 自动扫描缺失的 `< today` 历史日期并原子落盘至 `stats/YYYY-MM-DD.json`；切换 Tab 或切换日期时仅异步读取已持久化报表（若该天仍在后台生成则展示非阻塞加载占位并在完成后自动刷新），默认定位到最近一个有数据的历史日期（通常为昨天），无历史数据时展示清晰空状态提示；支持异步后台触发单日重算。
-    2. **顶部日期切换与主操作栏**：`< 前一天` / 日期下拉菜单（仅列历史日期）/ `后一天 >` / `最新一天`、起止跨度标签、可选单日异步重算按钮以及「一键复制 Agent 提示词」主按钮。
-    3. **4 格核心遥测卡（带近 7 日均值微对比 `baseline7d`）**：总活跃时长（含起止跨度）、中位/最长连续块与 `≥12m` 有效块数、有效跨任务切换数/每小时切换热度与高频乱切累计时长/段数、键鼠输入密度（`clickCount`/`keypressCount`/`inputEventsPerMinute`）与会话/会议/快照/OCR 计数。
-    4. **放大版日时间光谱条** + **时间分配双卡**（事项配额与 6 大活动大类分布 ｜ Top 应用与 Top 浏览器站点切换）。
-    5. **24 小时分时节律图**（单小时活跃分钟/有效切换/乱切分布，支持悬停查看单小时详情）+ **行为习惯双卡**（`<1m`、`1–3m`、`3–10m`、`10–25m`、`≥25m` 5 档连续停留时长分布 ｜ 高频切换路径 Top N `A → B` 频次与切入后平均停留秒数）。
-    6. **本地 Agent 深度分析提示词卡片**：支持切换「每日复盘与习惯诊断」「工作产出与日报草稿」预设、展开只读预览与一键复制，内嵌动态本地数据路径（`stats/YYYY-MM-DD.json`、`days/YYYY-MM-DD.json`、`activity.sqlite`）、`dayhelm` CLI 下钻命令、`sqlite3 -readonly` 只读查询示例、轻量统计骨架及只读/隐私脱敏护栏。
+    1. **后台预计算与异步非阻塞加载**：App 启动与每日跨天切换（`rollover`）时，在后台 `.utility` 串行队列通过 `DailyStatsMaterializer` 自动扫描缺失（或 `schemaVersion` 过期）的 `< today` 历史日期并原子落盘至 `stats/YYYY-MM-DD.json`；切换 Tab 或切换日期时仅异步读取已持久化报表（若该天仍在后台生成则展示非阻塞加载占位并在完成后自动刷新），默认定位到最近一个有数据的历史日期（通常为昨天），无历史数据时展示清晰空状态提示；支持异步后台触发单日重算。
+    2. **顶部日期切换与主操作栏（防换行单行设计）**：左侧紧凑切换组（`<` 图标钮 + 日期下拉菜单 + `>` 图标钮 + `最新` 胶囊 + 异步重算刷新图标，按钮统一 `.lineLimit(1)` 与 `.fixedSize(horizontal: true, vertical: false)`），中部展示起止活跃时段与跨度（或加载状态胶囊），右侧主操作按钮「复制 Agent 提示词」，在 720–900pt 窄宽下均保持单行不折行。
+    3. **4 格等宽等高核心遥测卡（带近 7 日均值微对比 `baseline7d`）**：严格 4 等宽等高且标题/主数值/对比胶囊/副指标基线对齐：总活跃时长（含起止跨度）、**持续专注占比**（`≥3m` 连续工作块占比 + `pp vs 7d` 百分点微对比，副行展示时长加权 `典型连续块 X.Xm` / `最长 Ym` / `≥12m 有效块 Z 个`，悬停 `.help` 解释口径）、有效跨任务切换数/每小时切换热度与高频乱切累计时长/段数、键鼠输入密度（`clickCount`/`keypressCount`/`inputEventsPerMinute`）与会话/会议/快照/OCR 计数。
+    4. **放大版日时间光谱条** + **等高对齐双栏布局**：全页卡片统一内边距（`14pt`）、圆角（`10pt`）与标准标题栏（图标 + 标题 + 右侧图例/切换开关）；「时间分配双卡」（事项配额与 6 大活动大类 ｜ Top 应用与 Top 浏览器站点）与「行为习惯双卡」（5 档连续停留时长分布 ｜ 高频切换路径 Top 8）采用等高双栏行，左右卡片顶底边严格齐平，列表内所有数字列（段数/次数、时长、占比、均停秒数）固定宽右对齐 `.monospacedDigit()`。
+    5. **24 小时分时节律图**（单小时活跃分钟/有效切换/乱切分布，支持悬停查看单小时详情）与 **本地 Agent 深度分析提示词卡片**（等宽等高双预设按钮「每日复盘与习惯诊断」「工作产出与日报草稿」、展开只读预览与一键复制，内嵌动态本地路径、`dayhelm` CLI 命令、`sqlite3 -readonly` 示例、轻量统计骨架及只读/隐私脱敏护栏）。
   - **「Jev 识别」**：独立承载所有 Jev System One 智能自动识别配置与判断历史：
     1. **智能自动识别配置卡片**：开关、API Key 状态/录入/连通性测试、发送脱敏本机 OCR 摘要开关（弱标题门控）。未配置 API Key 且已开启时，标题栏该 Tab 显示琥珀色提醒圆点，菜单栏悬浮窗横幅亦直达此页。
     2. **Jev 判断记录卡片**：今日调用统计摘要（总次数、自动切换次数、平均耗时、累计输入 Token）、按状态过滤（全部/已切换/待确认或忽略/异常）、清空按钮与完整记录列表（每条展示时间、决策结果、`[活动大类]`、`→ 焦点项目`、置信度/同任务概率/分心概率、耗时与输入 Token、脱敏后窗口上下文与 OCR 预览）。
@@ -296,14 +295,14 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 
 ### 3. 单日确定性聚合、后台预计算与本地 Agent 提示词（`DailyStats.swift`）
 
-- **`DailyStatsAggregator`**（`DayHelmCore`，无 `AppKit` 依赖）：
-  - **单一真源口径**：时间分配、日时间光谱、连续块（中位/最长/`≥12m` 有效块）与跨任务切换指标以 `DayHelmDaySnapshot`（`days/YYYY-MM-DD.json` 或指定 `today.json`）为准，输入密度（`clickCount`/`keypressCount`/`inputEventsPerMinute`）及会话/会议/快照/OCR 计数由 `ActivityDatabase` 按日补齐；自动读取 `stats/YYYY-MM-DD.json`（优先）或 `days/YYYY-MM-DD.json` 中目标日期之前最多 7 个历史日计算 `baseline7d` 均值基线。
+- **`DailyStatsAggregator`**（`DayHelmCore`，无 `AppKit` 依赖，`schemaVersion = 2`）：
+  - **单一真源口径**：时间分配、日时间光谱、连续块（**持续专注占比** `sustainedFocusShare` = `≥3m` 非乱切、非休息连续工作块累计时长 / 总活跃时长、**时长加权中位块时长** `weightedMedianBlockMinutes`、最长连续块与 `≥12m` 有效块；保留 `medianBlockMinutes` 兼容字段）与跨任务切换指标以 `DayHelmDaySnapshot`（`days/YYYY-MM-DD.json` 或指定 `today.json`）为准，输入密度（`clickCount`/`keypressCount`/`inputEventsPerMinute`）及会话/会议/快照/OCR 计数由 `ActivityDatabase` 按日补齐；自动读取 `stats/YYYY-MM-DD.json`（优先且校验 `schemaVersion == DailyStatsReport.currentSchemaVersion`）或 `days/YYYY-MM-DD.json` 中目标日期之前最多 7 个历史日计算 `baseline7d` 均值基线（含 `avgWeightedMedianBlockMinutes` 与 `avgSustainedFocusShare`）。
   - **站点与隐私脱敏规则**：Top 浏览器站点从 `http(s)` URL 解析 Host，统一小写、剥离前导 `www.` 并保留非默认端口（剥离 `http:80` / `https:443`）；`redacted == true` 记录绝不泄露窗口标题或域名至 Top 站点、高频切换路径 `A → B`、`stats/*.json` 或 Prompt 骨架。
 - **`DailyStatsMaterializer`**（`DayHelmCore`，无 `AppKit` 依赖）：
-  - 扫描 `days/YYYY-MM-DD.json` 与 `activity.sqlite` 中的历史会话日期，**严格跳过当天（`todayDateString`）及未来日期**；对尚未生成 `stats/YYYY-MM-DD.json` 的历史日期按时间升序调用 `DailyStatsAggregator` 计算并原子写入（幂等，已存在文件直接跳过，不重复聚合）。
+  - 扫描 `days/YYYY-MM-DD.json` 与 `activity.sqlite` 中的历史会话日期，**严格跳过当天（`todayDateString`）及未来日期**；对尚未生成 `stats/YYYY-MM-DD.json` 或落盘 `schemaVersion < DailyStatsReport.currentSchemaVersion` 的历史日期按时间升序调用 `DailyStatsAggregator` 计算并原子写入（同版本幂等跳过，旧版本平滑升级重建）。
   - `HybridActivityCoordinator` 在启动后及每次跨天 `rollover` 时，通过专用串行后台 `.utility` 队列调用 `DailyStatsMaterializer` 补齐历史报表，并在完成后刷新可用历史日期列表通知 UI。
 - **`DailyStatsMarkdownRenderer` & `AgentAnalysisPromptBuilder`**：
-  - `DailyStatsMarkdownRenderer` 将 `DailyStatsReport` 渲染为紧凑 Markdown 骨架，同时供 `dayhelm stats --format md` 与 Prompt 复用；
+  - `DailyStatsMarkdownRenderer` 将 `DailyStatsReport` 渲染为紧凑 Markdown 骨架（输出持续专注占比、时长加权典型连续块、最长块、`≥12m` 有效块及 7 日均值对照），同时供 `dayhelm stats --format md` 与 Prompt 复用；
   - `AgentAnalysisPromptBuilder` 根据 `AgentAnalysisPromptPreset`（`dailyReview` / `workOutputDraft`）动态填充目标日期、本地数据目录（`stats/YYYY-MM-DD.json`、`days/YYYY-MM-DD.json` / `today.json`、`activity.sqlite`）、推荐 `dayhelm` CLI 下钻命令、`sqlite3 -readonly` 只读查询示例及隐私脱敏护栏。
 
 ### 4. Agent CLI 接口（`DayHelm`）

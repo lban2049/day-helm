@@ -5,6 +5,9 @@ import Foundation
 public struct DailyStatsCoreMetrics: Sendable, Equatable, Codable {
     public let activeMinutes: Double
     public let medianBlockMinutes: Double
+    public let weightedMedianBlockMinutes: Double
+    public let sustainedFocusMinutes: Double
+    public let sustainedFocusShare: Double
     public let longestBlockMinutes: Double
     public let solidBlocksCount: Int
     public let crossTaskSwitchCount: Int
@@ -22,6 +25,9 @@ public struct DailyStatsCoreMetrics: Sendable, Equatable, Codable {
     public init(
         activeMinutes: Double,
         medianBlockMinutes: Double,
+        weightedMedianBlockMinutes: Double = 0,
+        sustainedFocusMinutes: Double = 0,
+        sustainedFocusShare: Double = 0,
         longestBlockMinutes: Double,
         solidBlocksCount: Int,
         crossTaskSwitchCount: Int,
@@ -38,6 +44,9 @@ public struct DailyStatsCoreMetrics: Sendable, Equatable, Codable {
     ) {
         self.activeMinutes = activeMinutes
         self.medianBlockMinutes = medianBlockMinutes
+        self.weightedMedianBlockMinutes = weightedMedianBlockMinutes
+        self.sustainedFocusMinutes = sustainedFocusMinutes
+        self.sustainedFocusShare = sustainedFocusShare
         self.longestBlockMinutes = longestBlockMinutes
         self.solidBlocksCount = solidBlocksCount
         self.crossTaskSwitchCount = crossTaskSwitchCount
@@ -52,12 +61,36 @@ public struct DailyStatsCoreMetrics: Sendable, Equatable, Codable {
         self.snapshotCount = snapshotCount
         self.ocrFrameCount = ocrFrameCount
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.activeMinutes = try c.decode(Double.self, forKey: .activeMinutes)
+        self.medianBlockMinutes = try c.decode(Double.self, forKey: .medianBlockMinutes)
+        self.weightedMedianBlockMinutes = try c.decodeIfPresent(Double.self, forKey: .weightedMedianBlockMinutes) ?? 0
+        self.sustainedFocusMinutes = try c.decodeIfPresent(Double.self, forKey: .sustainedFocusMinutes) ?? 0
+        self.sustainedFocusShare = try c.decodeIfPresent(Double.self, forKey: .sustainedFocusShare) ?? 0
+        self.longestBlockMinutes = try c.decode(Double.self, forKey: .longestBlockMinutes)
+        self.solidBlocksCount = try c.decode(Int.self, forKey: .solidBlocksCount)
+        self.crossTaskSwitchCount = try c.decode(Int.self, forKey: .crossTaskSwitchCount)
+        self.switchesPerHour = try c.decode(Double.self, forKey: .switchesPerHour)
+        self.thrashingMinutes = try c.decode(Double.self, forKey: .thrashingMinutes)
+        self.thrashingSegmentCount = try c.decode(Int.self, forKey: .thrashingSegmentCount)
+        self.clickCount = try c.decode(Int.self, forKey: .clickCount)
+        self.keypressCount = try c.decode(Int.self, forKey: .keypressCount)
+        self.inputEventsPerMinute = try c.decode(Double.self, forKey: .inputEventsPerMinute)
+        self.sessionCount = try c.decode(Int.self, forKey: .sessionCount)
+        self.meetingCount = try c.decode(Int.self, forKey: .meetingCount)
+        self.snapshotCount = try c.decode(Int.self, forKey: .snapshotCount)
+        self.ocrFrameCount = try c.decode(Int.self, forKey: .ocrFrameCount)
+    }
 }
 
 public struct DailyStatsBaseline7d: Sendable, Equatable, Codable {
     public let sampleDays: Int
     public let avgActiveMinutes: Double
     public let avgMedianBlockMinutes: Double
+    public let avgWeightedMedianBlockMinutes: Double
+    public let avgSustainedFocusShare: Double
     public let avgLongestBlockMinutes: Double
     public let avgSolidBlocksCount: Double
     public let avgCrossTaskSwitchCount: Double
@@ -68,6 +101,8 @@ public struct DailyStatsBaseline7d: Sendable, Equatable, Codable {
         sampleDays: Int,
         avgActiveMinutes: Double,
         avgMedianBlockMinutes: Double,
+        avgWeightedMedianBlockMinutes: Double = 0,
+        avgSustainedFocusShare: Double = 0,
         avgLongestBlockMinutes: Double,
         avgSolidBlocksCount: Double,
         avgCrossTaskSwitchCount: Double,
@@ -77,11 +112,27 @@ public struct DailyStatsBaseline7d: Sendable, Equatable, Codable {
         self.sampleDays = sampleDays
         self.avgActiveMinutes = avgActiveMinutes
         self.avgMedianBlockMinutes = avgMedianBlockMinutes
+        self.avgWeightedMedianBlockMinutes = avgWeightedMedianBlockMinutes
+        self.avgSustainedFocusShare = avgSustainedFocusShare
         self.avgLongestBlockMinutes = avgLongestBlockMinutes
         self.avgSolidBlocksCount = avgSolidBlocksCount
         self.avgCrossTaskSwitchCount = avgCrossTaskSwitchCount
         self.avgSwitchesPerHour = avgSwitchesPerHour
         self.avgThrashingMinutes = avgThrashingMinutes
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.sampleDays = try c.decode(Int.self, forKey: .sampleDays)
+        self.avgActiveMinutes = try c.decode(Double.self, forKey: .avgActiveMinutes)
+        self.avgMedianBlockMinutes = try c.decode(Double.self, forKey: .avgMedianBlockMinutes)
+        self.avgWeightedMedianBlockMinutes = try c.decodeIfPresent(Double.self, forKey: .avgWeightedMedianBlockMinutes) ?? 0
+        self.avgSustainedFocusShare = try c.decodeIfPresent(Double.self, forKey: .avgSustainedFocusShare) ?? 0
+        self.avgLongestBlockMinutes = try c.decode(Double.self, forKey: .avgLongestBlockMinutes)
+        self.avgSolidBlocksCount = try c.decode(Double.self, forKey: .avgSolidBlocksCount)
+        self.avgCrossTaskSwitchCount = try c.decode(Double.self, forKey: .avgCrossTaskSwitchCount)
+        self.avgSwitchesPerHour = try c.decode(Double.self, forKey: .avgSwitchesPerHour)
+        self.avgThrashingMinutes = try c.decode(Double.self, forKey: .avgThrashingMinutes)
     }
 }
 
@@ -214,6 +265,8 @@ public struct DailyTransitionStat: Sendable, Equatable, Codable, Identifiable {
 }
 
 public struct DailyStatsReport: Sendable, Equatable, Codable {
+    public static let currentSchemaVersion: Int = 2
+
     public let schemaVersion: Int
     public let date: String
     public let isToday: Bool
@@ -233,7 +286,7 @@ public struct DailyStatsReport: Sendable, Equatable, Codable {
     public let topTransitions: [DailyTransitionStat]
 
     public init(
-        schemaVersion: Int = 1,
+        schemaVersion: Int = DailyStatsReport.currentSchemaVersion,
         date: String,
         isToday: Bool,
         hasData: Bool,
@@ -299,6 +352,9 @@ public enum AgentAnalysisPromptPreset: String, Sendable, Equatable, Codable, Cas
 // MARK: - Aggregator
 
 public enum DailyStatsAggregator {
+    /// Minimum continuous work block length (minutes) counted toward sustained focus share.
+    public static let sustainedBlockMinimumMinutes: Double = 3.0
+
     public struct SyntheticRecorderTotals: Sendable, Equatable {
         public let sessions: Int
         public let meetings: Int
@@ -400,7 +456,7 @@ public enum DailyStatsAggregator {
         let primaryMetrics = snapshot.metrics.activeMinutes > 0 ? snapshot.metrics : built.metrics
         let segments = built.segments
 
-        // Work block durations for median block (consistent with SpectrumBuilder longestBlock/solidBlocks).
+        // Work block durations for continuity metrics (consistent with SpectrumBuilder longestBlock/solidBlocks).
         let workBlockDurations = segments.compactMap { seg -> Double? in
             switch seg.kind {
             case .task, .unassigned:
@@ -413,6 +469,15 @@ public enum DailyStatsAggregator {
             }
         }
         let medianBlockMinutes = median(of: workBlockDurations)
+        let weightedMedianBlockMinutes = weightedMedian(of: workBlockDurations)
+        let sustainedFocusMinutes = workBlockDurations.reduce(0.0) { acc, d in
+            acc + (d >= sustainedBlockMinimumMinutes ? d : 0.0)
+        }
+        let workBlockTotalMinutes = workBlockDurations.reduce(0.0, +)
+        let focusShareDenominator = primaryMetrics.activeMinutes > 0 ? primaryMetrics.activeMinutes : workBlockTotalMinutes
+        let sustainedFocusShare = focusShareDenominator > 0
+            ? min(1.0, max(0.0, sustainedFocusMinutes / focusShareDenominator))
+            : 0.0
 
         // Thrashing aggregates
         var thrashingMinutes = 0.0
@@ -535,6 +600,9 @@ public enum DailyStatsAggregator {
         let core = DailyStatsCoreMetrics(
             activeMinutes: primaryMetrics.activeMinutes,
             medianBlockMinutes: medianBlockMinutes,
+            weightedMedianBlockMinutes: weightedMedianBlockMinutes,
+            sustainedFocusMinutes: sustainedFocusMinutes,
+            sustainedFocusShare: sustainedFocusShare,
             longestBlockMinutes: primaryMetrics.longestBlockMinutes,
             solidBlocksCount: primaryMetrics.solidBlocksCount,
             crossTaskSwitchCount: crossTaskSwitchCount,
@@ -556,7 +624,7 @@ public enum DailyStatsAggregator {
             || dbStats.sessionCount > 0
 
         return DailyStatsReport(
-            schemaVersion: 1,
+            schemaVersion: DailyStatsReport.currentSchemaVersion,
             date: dateString,
             isToday: isToday,
             hasData: hasData,
@@ -1003,6 +1071,8 @@ public enum DailyStatsAggregator {
 
         var sumActive = 0.0
         var sumMedian = 0.0
+        var sumWeightedMedian = 0.0
+        var sumSustainedShare = 0.0
         var sumLongest = 0.0
         var sumSolid = 0.0
         var sumSwitches = 0.0
@@ -1022,7 +1092,8 @@ public enum DailyStatsAggregator {
                     clock: clock,
                     includeBaseline: false
                 )
-            } else if let persisted = try? store?.loadDailyStats(dateString: day) {
+            } else if let persisted = try? store?.loadDailyStats(dateString: day),
+                      persisted.schemaVersion == DailyStatsReport.currentSchemaVersion {
                 report = persisted
             } else if let archSnap = try? store?.loadDay(dateString: day) {
                 report = aggregate(
@@ -1040,6 +1111,8 @@ public enum DailyStatsAggregator {
             guard let report else { continue }
             sumActive += report.core.activeMinutes
             sumMedian += report.core.medianBlockMinutes
+            sumWeightedMedian += report.core.weightedMedianBlockMinutes
+            sumSustainedShare += report.core.sustainedFocusShare
             sumLongest += report.core.longestBlockMinutes
             sumSolid += Double(report.core.solidBlocksCount)
             sumSwitches += Double(report.core.crossTaskSwitchCount)
@@ -1054,6 +1127,8 @@ public enum DailyStatsAggregator {
             sampleDays: count,
             avgActiveMinutes: sumActive / d,
             avgMedianBlockMinutes: sumMedian / d,
+            avgWeightedMedianBlockMinutes: sumWeightedMedian / d,
+            avgSustainedFocusShare: sumSustainedShare / d,
             avgLongestBlockMinutes: sumLongest / d,
             avgSolidBlocksCount: sumSolid / d,
             avgCrossTaskSwitchCount: sumSwitches / d,
@@ -1087,6 +1162,9 @@ public enum DailyStatsAggregator {
         let core = DailyStatsCoreMetrics(
             activeMinutes: activeMinutes,
             medianBlockMinutes: 0,
+            weightedMedianBlockMinutes: 0,
+            sustainedFocusMinutes: 0,
+            sustainedFocusShare: 0,
             longestBlockMinutes: 0,
             solidBlocksCount: 0,
             crossTaskSwitchCount: 0,
@@ -1103,7 +1181,7 @@ public enum DailyStatsAggregator {
         )
 
         return DailyStatsReport(
-            schemaVersion: 1,
+            schemaVersion: DailyStatsReport.currentSchemaVersion,
             date: dateString,
             isToday: isToday,
             hasData: hasData,
@@ -1132,6 +1210,24 @@ public enum DailyStatsAggregator {
         }
         return (sorted[mid - 1] + sorted[mid]) / 2.0
     }
+
+    /// Time-weighted P50 block duration: the smallest block length `d` such that blocks `<= d`
+    /// cover at least 50% of total block minutes (equivalently, 50% of work time lies in blocks `>= d`).
+    private static func weightedMedian(of values: [Double]) -> Double {
+        let positives = values.filter { $0 > 0 }.sorted()
+        guard !positives.isEmpty else { return 0.0 }
+        let total = positives.reduce(0.0, +)
+        guard total > 0 else { return 0.0 }
+        let half = total * 0.5
+        var cumulative = 0.0
+        for d in positives {
+            cumulative += d
+            if cumulative >= half {
+                return d
+            }
+        }
+        return positives.last ?? 0.0
+    }
 }
 
 // MARK: - Markdown Renderer
@@ -1157,8 +1253,10 @@ public enum DailyStatsMarkdownRenderer {
         }
         lines.append("- 总活跃时长：\(formatDuration(minutes: report.core.activeMinutes))\(spanText)")
         lines.append(String(
-            format: "- 连续度：中位连续块 %.1fm · 最长连续块 %.0fm · ≥12m 有效块 %d 个",
-            report.core.medianBlockMinutes,
+            format: "- 专注连续度：持续专注占比 %.0f%%（≥3m 连续块 %.0fm）· 典型连续块 %.1fm（时长加权）· 最长 %.0fm · ≥12m 有效块 %d 个",
+            report.core.sustainedFocusShare * 100.0,
+            report.core.sustainedFocusMinutes,
+            report.core.weightedMedianBlockMinutes,
             report.core.longestBlockMinutes,
             report.core.solidBlocksCount
         ))
@@ -1182,10 +1280,11 @@ public enum DailyStatsMarkdownRenderer {
 
         if let b = report.baseline7d {
             lines.append(String(
-                format: "- 近 %d 日均值基线：活跃 %.0fm · 中位块 %.1fm · 最长块 %.0fm · 有效块 %.1f 个 · 切换 %.1f/h · 乱切 %.1fm",
+                format: "- 近 %d 日均值基线：活跃 %.0fm · 持续专注 %.0f%% · 典型块 %.1fm · 最长块 %.0fm · 有效块 %.1f 个 · 切换 %.1f/h · 乱切 %.1fm",
                 b.sampleDays,
                 b.avgActiveMinutes,
-                b.avgMedianBlockMinutes,
+                b.avgSustainedFocusShare * 100.0,
+                b.avgWeightedMedianBlockMinutes,
                 b.avgLongestBlockMinutes,
                 b.avgSolidBlocksCount,
                 b.avgSwitchesPerHour,
@@ -1275,9 +1374,11 @@ public enum DailyStatsMarkdownRenderer {
             lines.append("- 起止跨度：\(formatHHMM(first))–\(formatHHMM(last))（\(formatDuration(minutes: report.spanMinutes))）")
         }
         lines.append(String(
-            format: "- 活跃与连续度：总活跃 %.0fm · 中位块 %.1fm · 最长块 %.0fm · ≥12m 有效块 %d 个",
+            format: "- 活跃与连续度：总活跃 %.0fm · 持续专注占比 %.0f%%（≥3m %.0fm）· 典型连续块 %.1fm · 最长 %.0fm · ≥12m 有效块 %d 个",
             report.core.activeMinutes,
-            report.core.medianBlockMinutes,
+            report.core.sustainedFocusShare * 100.0,
+            report.core.sustainedFocusMinutes,
+            report.core.weightedMedianBlockMinutes,
             report.core.longestBlockMinutes,
             report.core.solidBlocksCount
         ))
@@ -1300,10 +1401,11 @@ public enum DailyStatsMarkdownRenderer {
         ))
         if let b = report.baseline7d {
             lines.append(String(
-                format: "- 近 %d 日均值：活跃 %.0fm · 中位块 %.1fm · 最长块 %.0fm · 切换 %.1f/h · 乱切 %.1fm",
+                format: "- 近 %d 日均值：活跃 %.0fm · 持续专注 %.0f%% · 典型块 %.1fm · 最长 %.0fm · 切换 %.1f/h · 乱切 %.1fm",
                 b.sampleDays,
                 b.avgActiveMinutes,
-                b.avgMedianBlockMinutes,
+                b.avgSustainedFocusShare * 100.0,
+                b.avgWeightedMedianBlockMinutes,
                 b.avgLongestBlockMinutes,
                 b.avgSwitchesPerHour,
                 b.avgThrashingMinutes
@@ -1430,7 +1532,9 @@ public enum DailyStatsMaterializer {
         var skippedExisting: [String] = []
 
         for date in candidateDates {
-            if !forceRebuild, (try? store.loadDailyStats(dateString: date)) != nil {
+            if !forceRebuild,
+               let existing = try? store.loadDailyStats(dateString: date),
+               existing.schemaVersion == DailyStatsReport.currentSchemaVersion {
                 skippedExisting.append(date)
                 continue
             }
@@ -1480,7 +1584,9 @@ public enum DailyStatsMaterializer {
             return nil
         }
 
-        if !forceRebuild, let cached = try? store.loadDailyStats(dateString: dateString) {
+        if !forceRebuild,
+           let cached = try? store.loadDailyStats(dateString: dateString),
+           cached.schemaVersion == DailyStatsReport.currentSchemaVersion {
             return (cached, true)
         }
 
@@ -1526,7 +1632,7 @@ public enum AgentAnalysisPromptBuilder {
             goalSection = """
             ## 分析任务：\(preset.title)（\(report.date)）
             请结合下方客观统计骨架，通过本地 `dayhelm` CLI 与只读 SQLite 查询下钻当天会话、事件与（如有）OCR 上下文，完成以下复盘：
-            1. **专注结构与连续度诊断**：对比当日中位/最长连续块、5 档停留时长分布与近 7 日均值，指出真正进入深度推进的时段，以及碎片化高发的时段与诱因。
+            1. **专注结构与连续度诊断**：对比当日持续专注占比（≥3m 连续块占比）、时长加权典型连续块、5 档停留时长分布与近 7 日均值，指出真正进入深度推进的时段，以及碎片化高发的时段与诱因。
             2. **高频切换路径解剖**：针对高频切换路径（`A → B`）与乱切时段，结合该时段前后 `activity_events` 窗口标题/URL 区分「同一任务的合理多应用协同」与「无意识跑偏/打断」。
             3. **双向配额执行检查**：评估保底目标是否完成、封顶事务是否及时换挡（若无焦点项目，则基于 6 大活动大类比例分析）。
             4. **明日可执行的 2–3 条微调建议**：必须具体到时间段、事项边界或切换触发器，避免空泛说教；**不要输出主观“生产力评分”**。

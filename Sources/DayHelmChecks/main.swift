@@ -5513,6 +5513,193 @@ struct DayHelmChecksMain {
             let demoReport = await demo.loadHistoricalDailyStats(for: demoDates[0])
             try check(demoReport != nil && demoReport?.hasData == true, "Synthetic demo historical report loads immediately with data")
         }
+
+        try await runCheck("79. Sustained focus share, time-weighted median block & schemaVersion v1->v2 migration") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-focus-metric-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let todayStr = "2026-11-18"
+            let now = DayHelmDateFormatting.parseISO8601("2026-11-18T10:00:00+08:00")!
+            let clock = ManualClock(now: now)
+            let budgets = sampleBudgets()
+
+            // Preceding day (2026-11-16): pure 20m sustained block -> 100% sustained focus, weighted P50 = 20m
+            let prevDate = "2026-11-16"
+            let prevStart = DayHelmDateFormatting.parseISO8601("2026-11-16T09:00:00+08:00")!
+            let prevSpan = EnrichedSpan(
+                startedAt: prevStart,
+                endedAt: prevStart.addingTimeInterval(1200),
+                appName: "Xcode",
+                bundleId: "com.apple.dt.Xcode",
+                windowTitle: "Core.swift",
+                declaredTaskId: "ecommerce",
+                semanticGroup: "mode:build"
+            )
+            let prevBuilt = SpectrumBuilder.build(spans: [prevSpan], focusSessions: [], budgets: budgets, now: prevStart.addingTimeInterval(1200))
+            try store.archiveDay(DayHelmDaySnapshot(
+                date: prevDate,
+                budgets: [],
+                focusSessions: [],
+                enrichedSpans: [prevSpan],
+                metrics: prevBuilt.metrics
+            ))
+
+            // Target day (2026-11-17): 20 tiny 6s (0.1m) fragments spaced 90s apart (= 2.0m total, non-thrashing)
+            // + one 12.0m block + one 16.0m block (= 28.0m sustained, 30.0m total active).
+            let targetDate = "2026-11-17"
+            let t0 = DayHelmDateFormatting.parseISO8601("2026-11-17T09:00:00+08:00")!
+            var spans: [EnrichedSpan] = []
+            for idx in 0..<20 {
+                let sStart = t0.addingTimeInterval(Double(idx) * 90.0)
+                spans.append(EnrichedSpan(
+                    startedAt: sStart,
+                    endedAt: sStart.addingTimeInterval(6.0),
+                    appName: idx % 2 == 0 ? "Finder" : "Notes",
+                    bundleId: idx % 2 == 0 ? "com.apple.finder" : "com.apple.Notes",
+                    windowTitle: "Quick check \(idx)",
+                    declaredTaskId: nil,
+                    semanticGroup: idx % 2 == 0 ? "mode:comms_admin" : "mode:operate"
+                ))
+            }
+            let block1Start = t0.addingTimeInterval(20 * 90.0 + 120.0)
+            spans.append(EnrichedSpan(
+                startedAt: block1Start,
+                endedAt: block1Start.addingTimeInterval(12 * 60.0),
+                appName: "Xcode",
+                bundleId: "com.apple.dt.Xcode",
+                windowTitle: "Feature.swift",
+                declaredTaskId: "ecommerce",
+                semanticGroup: "mode:build"
+            ))
+            let block2Start = block1Start.addingTimeInterval(12 * 60.0 + 120.0)
+            spans.append(EnrichedSpan(
+                startedAt: block2Start,
+                endedAt: block2Start.addingTimeInterval(16 * 60.0),
+                appName: "Xcode",
+                bundleId: "com.apple.dt.Xcode",
+                windowTitle: "Tests.swift",
+                declaredTaskId: "hermes",
+                semanticGroup: "mode:build"
+            ))
+
+            let built = SpectrumBuilder.build(spans: spans, focusSessions: [], budgets: budgets, now: block2Start.addingTimeInterval(16 * 60.0))
+            let snapshot = DayHelmDaySnapshot(
+                date: targetDate,
+                budgets: [],
+                focusSessions: [],
+                enrichedSpans: spans,
+                metrics: built.metrics
+            )
+            try store.archiveDay(snapshot)
+
+            let report = DailyStatsAggregator.aggregate(
+                dateString: targetDate,
+                liveSnapshot: snapshot,
+                budgets: budgets,
+                store: store,
+                database: nil,
+                clock: clock
+            )
+
+            try checkEqual(report.schemaVersion, DailyStatsReport.currentSchemaVersion, "Report uses currentSchemaVersion >= 2")
+            try check(DailyStatsReport.currentSchemaVersion >= 2, "Schema version bumped to >= 2")
+            // Unweighted median is dragged to 0.1m by the 20 tiny fragments, while weighted P50 and sustained share stay intuitive.
+            try check(report.core.medianBlockMinutes < 0.5, "Unweighted median is distorted by <1m fragments")
+            try checkApprox(report.core.weightedMedianBlockMinutes, 16.0, tolerance: 0.15, "Time-weighted median P50 reflects 16.0m block, not 0.1m")
+            try checkApprox(report.core.sustainedFocusMinutes, 28.0, tolerance: 0.15, "Sustained focus (>=3m) sums 12m + 16m = 28m")
+            try checkApprox(report.core.sustainedFocusShare, 28.0 / 30.0, tolerance: 0.02, "Sustained focus share is ~93.3%")
+            try checkApprox(report.baseline7d?.avgWeightedMedianBlockMinutes ?? 0, 20.0, tolerance: 0.15, "7d baseline includes avgWeightedMedianBlockMinutes")
+            try checkApprox(report.baseline7d?.avgSustainedFocusShare ?? 0, 1.0, tolerance: 0.02, "7d baseline includes avgSustainedFocusShare")
+
+            let md = DailyStatsMarkdownRenderer.render(report)
+            let skeleton = DailyStatsMarkdownRenderer.renderCompactSkeleton(report)
+            try check(md.contains("持续专注占比"), "Markdown report renders sustained focus share")
+            try check(md.contains("典型连续块"), "Markdown report renders weighted median typical block")
+            try check(skeleton.contains("持续专注占比") && skeleton.contains("典型连续块"), "Compact skeleton includes sustained focus metrics")
+
+            // Legacy schemaVersion=1 cache file on disk must decode safely and trigger automatic rebuild.
+            let legacyV1JSON = """
+            {
+              "schemaVersion": 1,
+              "date": "\(targetDate)",
+              "isToday": false,
+              "hasData": true,
+              "spanMinutes": 60.0,
+              "core": {
+                "activeMinutes": 77.0,
+                "medianBlockMinutes": 0.1,
+                "longestBlockMinutes": 16.0,
+                "solidBlocksCount": 2,
+                "crossTaskSwitchCount": 1,
+                "switchesPerHour": 1.0,
+                "thrashingMinutes": 0.0,
+                "thrashingSegmentCount": 0,
+                "clickCount": 0,
+                "keypressCount": 0,
+                "inputEventsPerMinute": 0.0,
+                "sessionCount": 0,
+                "meetingCount": 0,
+                "snapshotCount": 0,
+                "ocrFrameCount": 0
+              },
+              "baseline7d": {
+                "sampleDays": 1,
+                "avgActiveMinutes": 20.0,
+                "avgMedianBlockMinutes": 20.0,
+                "avgLongestBlockMinutes": 20.0,
+                "avgSolidBlocksCount": 1.0,
+                "avgCrossTaskSwitchCount": 0.0,
+                "avgSwitchesPerHour": 0.0,
+                "avgThrashingMinutes": 0.0
+              },
+              "spectrumSegments": [],
+              "budgets": [],
+              "activityModes": [],
+              "topApps": [],
+              "topSites": [],
+              "hourlyRhythm": [],
+              "dwellBuckets": [],
+              "topTransitions": []
+            }
+            """
+            try FileManager.default.createDirectory(at: store.statsDirectory, withIntermediateDirectories: true)
+            try Data(legacyV1JSON.utf8).write(to: store.statsFileURL(for: targetDate))
+
+            let decodedLegacy = try store.loadDailyStats(dateString: targetDate)
+            try checkEqual(decodedLegacy?.schemaVersion, 1, "Legacy v1 cache decodes safely without crashing")
+
+            let loaded = DailyStatsMaterializer.loadOrMaterializeHistoricalStats(
+                dateString: targetDate,
+                store: store,
+                database: nil,
+                budgets: budgets,
+                clock: clock
+            )
+            try check(loaded?.loadedFromCache == false, "Stale schemaVersion=1 cache must trigger automatic rebuild")
+            try checkEqual(loaded?.report.schemaVersion, DailyStatsReport.currentSchemaVersion, "Rebuilt cache upgrades to currentSchemaVersion")
+            try checkApprox(loaded?.report.core.weightedMedianBlockMinutes ?? 0, 16.0, tolerance: 0.15, "Rebuilt report restores accurate weightedMedianBlockMinutes")
+            try checkApprox(loaded?.report.core.sustainedFocusShare ?? 0, 28.0 / 30.0, tolerance: 0.02, "Rebuilt report restores accurate sustainedFocusShare")
+
+            // Write legacy v1 back to test batch materializer upgrade & subsequent v2 idempotency.
+            try Data(legacyV1JSON.utf8).write(to: store.statsFileURL(for: targetDate))
+            let batchUpgrade = DailyStatsMaterializer.materializeMissingHistoricalStats(
+                store: store,
+                database: nil,
+                budgets: budgets,
+                clock: clock
+            )
+            try check(batchUpgrade.generatedDates.contains(targetDate), "Batch materializer upgrades stale schemaVersion=1 cache")
+            let batchIdempotent = DailyStatsMaterializer.materializeMissingHistoricalStats(
+                store: store,
+                database: nil,
+                budgets: budgets,
+                clock: clock
+            )
+            try check(!batchIdempotent.generatedDates.contains(targetDate), "Upgraded v2 cache is skipped idempotently")
+            try check(batchIdempotent.skippedExistingDates.contains(targetDate), "Upgraded v2 cache appears in skippedExistingDates")
+            _ = todayStr
+        }
     }
 
     private static func waitUntil(

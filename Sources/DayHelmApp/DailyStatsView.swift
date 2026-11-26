@@ -87,98 +87,107 @@ struct DailyStatsView: View {
         let yesterdayString = yesterdayDateString
 
         return HStack(spacing: 10) {
-            HStack(spacing: 4) {
-                Button {
-                    stepDate(older: true)
-                } label: {
-                    HStack(spacing: 3) {
+            // Compact date stepper cluster — locked to single-line intrinsic width
+            HStack(spacing: 6) {
+                HStack(spacing: 0) {
+                    Button {
+                        stepDate(older: true)
+                    } label: {
                         Image(systemName: "chevron.left")
                             .font(.system(size: 10.5, weight: .semibold))
-                        Text("前一天")
-                            .font(.system(size: 11.5, weight: .medium))
+                            .frame(width: 26, height: 26)
+                            .contentShape(Rectangle())
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                }
-                .buttonStyle(.plain)
-                .disabled(!canStepOlder)
-                .opacity(canStepOlder ? 1.0 : 0.4)
+                    .buttonStyle(.plain)
+                    .disabled(!canStepOlder)
+                    .opacity(canStepOlder ? 1.0 : 0.35)
+                    .help("前一天")
 
-                Menu {
-                    ForEach(availableDates, id: \.self) { date in
-                        Button {
-                            selectedDate = date
-                        } label: {
-                            HStack {
-                                Text(date == yesterdayString ? "\(date)（昨天）" : date)
-                                if date == selectedDate {
-                                    Image(systemName: "checkmark")
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.09))
+                        .frame(width: 1, height: 14)
+
+                    Menu {
+                        ForEach(availableDates, id: \.self) { date in
+                            Button {
+                                selectedDate = date
+                            } label: {
+                                HStack {
+                                    Text(date == yesterdayString ? "\(date)（昨天）" : date)
+                                    if date == selectedDate {
+                                        Image(systemName: "checkmark")
+                                    }
                                 }
                             }
                         }
-                    }
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "calendar")
-                            .font(.system(size: 11))
-                            .foregroundStyle(DayHelmColors.primaryBlue)
-                        Text(selectedDate.isEmpty ? "暂无历史报表" : selectedDate)
-                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                            .monospacedDigit()
-                        if !selectedDate.isEmpty && selectedDate == yesterdayString {
-                            Text("昨天")
-                                .font(.system(size: 9.5, weight: .semibold))
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "calendar")
+                                .font(.system(size: 11))
                                 .foregroundStyle(DayHelmColors.primaryBlue)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1.5)
-                                .background(DayHelmColors.primaryBlue.opacity(0.14), in: Capsule())
+                            Text(selectedDate.isEmpty ? "暂无历史报表" : selectedDate)
+                                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                                .monospacedDigit()
+                                .lineLimit(1)
+                            if !selectedDate.isEmpty && selectedDate == yesterdayString {
+                                Text("昨天")
+                                    .font(.system(size: 9.5, weight: .semibold))
+                                    .foregroundStyle(DayHelmColors.primaryBlue)
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(DayHelmColors.primaryBlue.opacity(0.14), in: Capsule())
+                            }
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8.5, weight: .semibold))
+                                .foregroundStyle(.secondary)
                         }
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.secondary)
+                        .padding(.horizontal, 9)
+                        .frame(height: 26)
+                        .contentShape(Rectangle())
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .strokeBorder(Color.primary.opacity(0.09), lineWidth: 0.5)
-                    )
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .disabled(availableDates.isEmpty)
+                    .menuStyle(.borderlessButton)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .disabled(availableDates.isEmpty)
 
-                Button {
-                    stepDate(older: false)
-                } label: {
-                    HStack(spacing: 3) {
-                        Text("后一天")
-                            .font(.system(size: 11.5, weight: .medium))
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.09))
+                        .frame(width: 1, height: 14)
+
+                    Button {
+                        stepDate(older: false)
+                    } label: {
                         Image(systemName: "chevron.right")
                             .font(.system(size: 10.5, weight: .semibold))
+                            .frame(width: 26, height: 26)
+                            .contentShape(Rectangle())
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .buttonStyle(.plain)
+                    .disabled(!canStepNewer)
+                    .opacity(canStepNewer ? 1.0 : 0.35)
+                    .help("后一天")
                 }
-                .buttonStyle(.plain)
-                .disabled(!canStepNewer)
-                .opacity(canStepNewer ? 1.0 : 0.4)
+                .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.09), lineWidth: 0.5)
+                )
 
                 if let latestHistorical, !selectedDate.isEmpty, selectedDate != latestHistorical {
                     Button {
                         selectedDate = latestHistorical
                     } label: {
-                        Text("最新一天")
+                        Text("最新")
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(DayHelmColors.primaryBlue)
+                            .lineLimit(1)
                             .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(DayHelmColors.primaryBlue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .frame(height: 26)
+                            .background(DayHelmColors.primaryBlue.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                     }
                     .buttonStyle(.plain)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .help("跳转到最新历史日期（\(latestHistorical)）")
                 }
 
                 if !selectedDate.isEmpty && !coordinator.isSyntheticDemo {
@@ -188,8 +197,12 @@ struct DailyStatsView: View {
                         Image(systemName: "arrow.triangle.2.circlepath")
                             .font(.system(size: 10.5, weight: .semibold))
                             .foregroundStyle(.secondary)
-                            .padding(6)
-                            .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                            .frame(width: 26, height: 26)
+                            .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                            )
                     }
                     .buttonStyle(.plain)
                     .disabled(isLoadingReport)
@@ -197,6 +210,8 @@ struct DailyStatsView: View {
                     .help("在后台重新计算并更新 \(selectedDate) 的持久化统计报表")
                 }
             }
+            .fixedSize(horizontal: true, vertical: false)
+            .layoutPriority(2)
 
             if coordinator.isMaterializingHistoricalStats || isLoadingReport {
                 HStack(spacing: 5) {
@@ -206,12 +221,15 @@ struct DailyStatsView: View {
                     Text(coordinator.isMaterializingHistoricalStats ? "后台预计算中…" : "读取中…")
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
                 .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+                .frame(height: 24)
                 .background(Color.primary.opacity(0.045), in: Capsule())
+                .fixedSize(horizontal: true, vertical: false)
+                .layoutPriority(0)
             } else if let report, let first = report.firstActiveAt, let last = report.lastActiveAt {
-                HStack(spacing: 4) {
+                HStack(spacing: 5) {
                     Image(systemName: "clock")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
@@ -219,13 +237,16 @@ struct DailyStatsView: View {
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+                .padding(.horizontal, 9)
+                .frame(height: 24)
                 .background(Color.primary.opacity(0.04), in: Capsule())
+                .layoutPriority(0)
             }
 
-            Spacer()
+            Spacer(minLength: 4)
 
             Button {
                 if let report {
@@ -235,18 +256,21 @@ struct DailyStatsView: View {
                 HStack(spacing: 5) {
                     Image(systemName: copiedFeedback ? "checkmark.circle.fill" : "doc.on.doc")
                         .font(.system(size: 11, weight: .semibold))
-                    Text(copiedFeedback ? "已复制提示词 ✓" : "一键复制 Agent 提示词")
+                    Text(copiedFeedback ? "已复制提示词 ✓" : "复制 Agent 提示词")
                         .font(.system(size: 11.5, weight: .semibold))
+                        .lineLimit(1)
                 }
                 .foregroundStyle(.white)
                 .padding(.horizontal, 11)
-                .padding(.vertical, 6)
+                .frame(height: 28)
                 .background(
                     copiedFeedback ? DayHelmColors.successEmerald : DayHelmColors.primaryBlue,
                     in: RoundedRectangle(cornerRadius: 7, style: .continuous)
                 )
             }
             .buttonStyle(.plain)
+            .fixedSize(horizontal: true, vertical: false)
+            .layoutPriority(2)
             .disabled(report == nil)
             .help("复制「\(promptPreset.title)」提示词到剪贴板，粘贴给本地 Claude Code / Codex / Hermes")
         }
@@ -260,11 +284,14 @@ struct DailyStatsView: View {
     private func coreTelemetryGrid(report: DailyStatsReport) -> some View {
         let c = report.core
         let b = report.baseline7d
+        let focusPct = c.sustainedFocusShare * 100.0
+        let focusColor: Color = {
+            if c.sustainedFocusShare >= 0.50 { return DayHelmColors.successEmerald }
+            if c.sustainedFocusShare >= 0.30 { return DayHelmColors.primaryBlue }
+            return DayHelmColors.warningAmber
+        }()
 
-        return LazyVGrid(
-            columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 4),
-            spacing: 10
-        ) {
+        return HStack(alignment: .top, spacing: 10) {
             telemetryCard(
                 icon: "clock.fill",
                 iconColor: DayHelmColors.primaryBlue,
@@ -272,17 +299,33 @@ struct DailyStatsView: View {
                 primaryValue: formatDuration(minutes: c.activeMinutes),
                 deltaText: b.flatMap { formatDelta(current: c.activeMinutes, baseline: $0.avgActiveMinutes, unit: "m", sampleDays: $0.sampleDays) },
                 deltaPositiveIsGood: true,
-                subtitle: spanSummaryText(report)
+                subtitle: spanSummaryText(report),
+                helpText: "当日有效工作与活跃切换累计总时长（不含锁屏与空闲离开）。"
             )
 
             telemetryCard(
-                icon: "rectangle.compress.vertical",
-                iconColor: DayHelmColors.successEmerald,
-                title: "中位 / 最长连续块",
-                primaryValue: String(format: "%.1fm", c.medianBlockMinutes),
-                deltaText: b.flatMap { formatDelta(current: c.medianBlockMinutes, baseline: $0.avgMedianBlockMinutes, unit: "m", decimals: 1, sampleDays: $0.sampleDays) },
+                icon: "target",
+                iconColor: focusColor,
+                title: "持续专注占比",
+                primaryValue: String(format: "%.0f%%", focusPct),
+                primaryColor: focusColor,
+                deltaText: b.flatMap {
+                    formatDelta(
+                        current: focusPct,
+                        baseline: $0.avgSustainedFocusShare * 100.0,
+                        unit: "pp",
+                        decimals: 0,
+                        sampleDays: $0.sampleDays
+                    )
+                },
                 deltaPositiveIsGood: true,
-                subtitle: String(format: "最长 %.0fm · ≥12m 有效块 %d 个", c.longestBlockMinutes, c.solidBlocksCount)
+                subtitle: String(
+                    format: "典型连续块 %.1fm\n最长 %.0fm · ≥12m %d 个",
+                    c.weightedMedianBlockMinutes,
+                    c.longestBlockMinutes,
+                    c.solidBlocksCount
+                ),
+                helpText: "持续专注占比 = 连续 ≥3m 工作块累计时长 ÷ 总活跃时长（排除乱切与休息）；典型连续块为时长加权中位数（P50），表示有一半活跃工作时间处于 ≥ 该长度的连续块中，不会被大量瞬时切窗拉低至 0.1m。"
             )
 
             telemetryCard(
@@ -293,7 +336,8 @@ struct DailyStatsView: View {
                 primaryColor: c.thrashingSegmentCount > 0 ? DayHelmColors.destructiveRed : .primary,
                 deltaText: b.flatMap { formatDelta(current: c.switchesPerHour, baseline: $0.avgSwitchesPerHour, unit: "/h", decimals: 1, sampleDays: $0.sampleDays) },
                 deltaPositiveIsGood: false,
-                subtitle: String(format: "%.1f/h · 乱切 %.0fm (%d 段)", c.switchesPerHour, c.thrashingMinutes, c.thrashingSegmentCount)
+                subtitle: String(format: "切换热度 %.1f/h\n乱切 %.0fm（%d 段）", c.switchesPerHour, c.thrashingMinutes, c.thrashingSegmentCount),
+                helpText: "跨任务切换统计不同语义任务/站点间的有效切换次数（过滤同一任务内多应用协同与瞬时路过）；乱切指 10 分钟内 ≥10 次跨上下文切换且平均停留 <45s 的碎片时段。"
             )
 
             telemetryCard(
@@ -303,9 +347,11 @@ struct DailyStatsView: View {
                 primaryValue: String(format: "%.1f/min", c.inputEventsPerMinute),
                 deltaText: nil,
                 deltaPositiveIsGood: true,
-                subtitle: "点击 \(c.clickCount) · 敲击 \(c.keypressCount) · 会话 \(c.sessionCount)\(c.meetingCount > 0 ? "(会\(c.meetingCount))" : "") · OCR \(c.ocrFrameCount)"
+                subtitle: "点击 \(c.clickCount) · 敲击 \(c.keypressCount)\n会话 \(c.sessionCount)\(c.meetingCount > 0 ? "(会\(c.meetingCount))" : "") · OCR \(c.ocrFrameCount)",
+                helpText: "仅记录键鼠计次频率与会话/屏幕 OCR 采集数量，不读取具体按键内容。"
             )
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private func telemetryCard(
@@ -316,9 +362,10 @@ struct DailyStatsView: View {
         primaryColor: Color = .primary,
         deltaText: (text: String, isHigher: Bool)?,
         deltaPositiveIsGood: Bool,
-        subtitle: String
+        subtitle: String,
+        helpText: String
     ) -> some View {
-        StatsSectionCard {
+        StatsSectionCard(fillHeight: true) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 5) {
                     Image(systemName: icon)
@@ -330,34 +377,45 @@ struct DailyStatsView: View {
                         .lineLimit(1)
                     Spacer(minLength: 0)
                 }
+                .frame(height: 16)
 
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(primaryValue)
-                        .font(.system(size: 20, weight: .bold, design: .monospaced))
+                        .font(.system(size: 19.5, weight: .bold, design: .monospaced))
                         .monospacedDigit()
                         .foregroundStyle(primaryColor)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .fixedSize(horizontal: true, vertical: false)
 
                     if let deltaText {
                         let isGood = deltaPositiveIsGood ? deltaText.isHigher : !deltaText.isHigher
                         Text(deltaText.text)
-                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                            .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                             .monospacedDigit()
                             .foregroundStyle(isGood ? DayHelmColors.successEmerald : DayHelmColors.warningAmber)
-                            .padding(.horizontal, 5)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .padding(.horizontal, 5.5)
                             .padding(.vertical, 1.5)
                             .background((isGood ? DayHelmColors.successEmerald : DayHelmColors.warningAmber).opacity(0.12), in: Capsule())
-                            .lineLimit(1)
                     }
+                    Spacer(minLength: 0)
                 }
+                .frame(height: 26, alignment: .leading)
 
                 Text(subtitle)
                     .font(.system(size: 10, design: .monospaced))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
+                    .lineSpacing(2)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
+
+                Spacer(minLength: 0)
             }
         }
+        .help(helpText)
     }
 
     // MARK: - 3. Magnified Day Spectrum Ribbon
@@ -367,32 +425,29 @@ struct DailyStatsView: View {
         let totalMins = max(1.0, segments.reduce(0.0) { $0 + max(0.0, $1.durationMinutes) })
 
         return StatsSectionCard {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    HStack(spacing: 6) {
-                        Image(systemName: "waveform.path")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(DayHelmColors.primaryBlue)
-                        Text("日时间光谱")
-                            .font(.system(size: 12.5, weight: .bold))
-                    }
-
-                    Spacer()
-
+            VStack(alignment: .leading, spacing: 9) {
+                statsCardHeader(
+                    icon: "waveform.path",
+                    iconColor: DayHelmColors.primaryBlue,
+                    title: "日时间光谱"
+                ) {
                     if let hoveredId = hoveredSegmentId,
                        let seg = segments.first(where: { $0.id == hoveredId }) {
                         Text(segmentSummaryLabel(seg))
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                             .monospacedDigit()
                             .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 2.5)
                             .background(Color.primary.opacity(0.06), in: Capsule())
                     } else if let first = segments.first, let last = segments.last {
-                        Text("\(formatHHMM(first.startedAt)) – \(formatHHMM(last.endedAt)) · \(segments.count) 段（悬停光谱条查看分段详情）")
+                        Text("\(formatHHMM(first.startedAt)) – \(formatHHMM(last.endedAt)) · \(segments.count) 段（悬停查看分段详情）")
                             .font(.system(size: 10.5, design: .monospaced))
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                 }
 
@@ -404,6 +459,7 @@ struct DailyStatsView: View {
                             Text("暂无光谱分段数据")
                                 .font(.system(size: 11))
                                 .foregroundStyle(.tertiary)
+                                .lineLimit(1)
                         )
                 } else {
                     GeometryReader { geo in
@@ -509,7 +565,7 @@ struct DailyStatsView: View {
         }
 
         return ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
+            HStack(spacing: 12) {
                 ForEach(taskItems, id: \.id) { item in
                     legendDot(color: Color(hex: item.hex), label: item.name)
                 }
@@ -526,7 +582,9 @@ struct DailyStatsView: View {
                     Text("高频乱切")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
+                .fixedSize(horizontal: true, vertical: false)
                 legendDot(color: Color.secondary.opacity(0.28), label: "空闲")
             }
         }
@@ -542,22 +600,27 @@ struct DailyStatsView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
-    // MARK: - 4. Time Allocation Dual Cards
+    // MARK: - 4. Time Allocation Dual Cards (Equal Height)
 
     private func allocationDualCards(report: DailyStatsReport) -> some View {
         HStack(alignment: .top, spacing: 12) {
             // Left: Task Budgets + 6 Activity Modes
-            StatsSectionCard {
+            StatsSectionCard(fillHeight: true) {
                 VStack(alignment: .leading, spacing: 10) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "chart.pie.fill")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(DayHelmColors.primaryBlue)
-                        Text("事项配额与活动大类")
-                            .font(.system(size: 12.5, weight: .bold))
-                        Spacer()
+                    statsCardHeader(
+                        icon: "chart.pie.fill",
+                        iconColor: DayHelmColors.primaryBlue,
+                        title: report.budgets.isEmpty ? "6 大活动大类" : "事项配额与活动大类"
+                    ) {
+                        if report.budgets.isEmpty {
+                            Text("时长 · 占比")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
                     }
 
                     if !report.budgets.isEmpty {
@@ -565,6 +628,7 @@ struct DailyStatsView: View {
                             Text("事项配额进度")
                                 .font(.system(size: 10.5, weight: .semibold))
                                 .foregroundStyle(.secondary)
+                                .lineLimit(1)
 
                             ForEach(report.budgets, id: \.taskId) { budget in
                                 budgetProgressRow(budget: budget)
@@ -572,20 +636,21 @@ struct DailyStatsView: View {
                         }
 
                         Divider()
-                    }
 
-                    VStack(alignment: .leading, spacing: 7) {
                         Text("6 大活动大类")
                             .font(.system(size: 10.5, weight: .semibold))
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
 
-                        let hasModeTime = report.activityModes.contains { $0.minutes >= 0.05 }
-                        if !hasModeTime {
-                            Text("当天未记录 Jev 活动大类分布（仅手动事项或未启用自动识别）")
-                                .font(.system(size: 10.5))
-                                .foregroundStyle(.tertiary)
-                                .padding(.vertical, 6)
-                        } else {
+                    let hasModeTime = report.activityModes.contains { $0.minutes >= 0.05 }
+                    if !hasModeTime {
+                        Text("当天未记录 Jev 活动大类分布（仅手动事项或未启用自动识别）")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.tertiary)
+                            .padding(.vertical, 8)
+                    } else {
+                        VStack(spacing: 7) {
                             ForEach(report.activityModes.sorted { $0.minutes > $1.minutes }) { item in
                                 distributionBarRow(
                                     label: item.displayName,
@@ -597,24 +662,20 @@ struct DailyStatsView: View {
                             }
                         }
                     }
+
+                    Spacer(minLength: 0)
                 }
             }
 
             // Right: Top Apps / Top Sites
-            StatsSectionCard {
+            StatsSectionCard(fillHeight: true) {
                 VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        HStack(spacing: 6) {
-                            Image(systemName: rankingTab == .apps ? "macwindow" : "globe")
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(DayHelmColors.successEmerald)
-                            Text(rankingTab.rawValue)
-                                .font(.system(size: 12.5, weight: .bold))
-                        }
-
-                        Spacer()
-
-                        HStack(spacing: 3) {
+                    statsCardHeader(
+                        icon: rankingTab == .apps ? "macwindow" : "globe",
+                        iconColor: DayHelmColors.successEmerald,
+                        title: rankingTab.rawValue
+                    ) {
+                        HStack(spacing: 2) {
                             ForEach(TopRankingTab.allCases, id: \.self) { tab in
                                 let active = rankingTab == tab
                                 Button {
@@ -623,6 +684,7 @@ struct DailyStatsView: View {
                                     Text(tab == .apps ? "应用" : "浏览器站点")
                                         .font(.system(size: 10, weight: active ? .semibold : .medium))
                                         .foregroundStyle(active ? .primary : .secondary)
+                                        .lineLimit(1)
                                         .padding(.horizontal, 8)
                                         .padding(.vertical, 3.5)
                                         .background(
@@ -631,6 +693,7 @@ struct DailyStatsView: View {
                                         )
                                 }
                                 .buttonStyle(.plain)
+                                .fixedSize(horizontal: true, vertical: false)
                             }
                         }
                         .padding(2)
@@ -676,9 +739,12 @@ struct DailyStatsView: View {
                             }
                         }
                     }
+
+                    Spacer(minLength: 0)
                 }
             }
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private func budgetProgressRow(budget: BudgetSnapshot) -> some View {
@@ -707,16 +773,24 @@ struct DailyStatsView: View {
 
         return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
+                Circle()
+                    .fill(barColor)
+                    .frame(width: 6, height: 6)
                 Text(budget.displayName)
                     .font(.system(size: 11, weight: .medium))
                     .lineLimit(1)
-                Spacer()
+                    .truncationMode(.tail)
+                Spacer(minLength: 6)
                 Text(statusTag)
                     .font(.system(size: 9.5, weight: .semibold))
                     .foregroundStyle(barColor)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 Text(String(format: "%.0fm", budget.focusedMinutes))
                     .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
                     .monospacedDigit()
+                    .lineLimit(1)
+                    .frame(width: 48, alignment: .trailing)
             }
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
@@ -747,17 +821,27 @@ struct DailyStatsView: View {
                     .font(.system(size: 11, weight: .medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Spacer(minLength: 4)
+                Spacer(minLength: 6)
                 if let trailingNote {
                     Text(trailingNote)
                         .font(.system(size: 9.5, design: .monospaced))
                         .monospacedDigit()
                         .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .frame(width: 44, alignment: .trailing)
                 }
-                Text(String(format: "%.1fm · %.0f%%", minutes, share * 100.0))
+                Text(String(format: "%.1fm", minutes))
                     .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(width: 48, alignment: .trailing)
+                Text(String(format: "%.0f%%", share * 100.0))
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                    .monospacedDigit()
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .frame(width: 32, alignment: .trailing)
             }
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
@@ -780,17 +864,11 @@ struct DailyStatsView: View {
 
         return StatsSectionCard {
             VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    HStack(spacing: 6) {
-                        Image(systemName: "chart.bar.fill")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(DayHelmColors.primaryBlue)
-                        Text("24 小时分时节律")
-                            .font(.system(size: 12.5, weight: .bold))
-                    }
-
-                    Spacer()
-
+                statsCardHeader(
+                    icon: "chart.bar.fill",
+                    iconColor: DayHelmColors.primaryBlue,
+                    title: "24 小时分时节律"
+                ) {
                     if let b = activeBucket {
                         Text(String(
                             format: "%02d:00–%02d:59 · 活跃 %.1fm · 跨任务切换 %d 次 · 乱切 %.1fm",
@@ -799,6 +877,7 @@ struct DailyStatsView: View {
                         .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
                         .monospacedDigit()
                         .foregroundStyle(.primary)
+                        .lineLimit(1)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 2.5)
                         .background(Color.primary.opacity(0.06), in: Capsule())
@@ -806,6 +885,7 @@ struct DailyStatsView: View {
                         Text("蓝条=活跃分钟 · 红段=高频乱切 · 悬停查看单小时详情")
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
                 }
 
@@ -840,6 +920,7 @@ struct DailyStatsView: View {
                                 .font(.system(size: 9, design: .monospaced))
                                 .monospacedDigit()
                                 .foregroundStyle(isHovered ? .primary : .tertiary)
+                                .lineLimit(1)
                                 .frame(height: 11)
                         }
                         .frame(maxWidth: .infinity)
@@ -857,98 +938,125 @@ struct DailyStatsView: View {
         }
     }
 
-    // MARK: - 6. Behavioral Habits Dual Cards
+    // MARK: - 6. Behavioral Habits Dual Cards (Equal Height)
 
     private func habitsDualCards(report: DailyStatsReport) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        let totalDwellCount = report.dwellBuckets.reduce(0) { $0 + $1.count }
+
+        return HStack(alignment: .top, spacing: 12) {
             // Left: 5-tier Dwell Distribution
-            StatsSectionCard {
-                VStack(alignment: .leading, spacing: 9) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "timer")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(DayHelmColors.violetAccent)
-                        Text("连续停留时长分布（5 档）")
-                            .font(.system(size: 12.5, weight: .bold))
-                        Spacer()
+            StatsSectionCard(fillHeight: true) {
+                VStack(alignment: .leading, spacing: 10) {
+                    statsCardHeader(
+                        icon: "timer",
+                        iconColor: DayHelmColors.violetAccent,
+                        title: "连续停留时长分布（5 档）"
+                    ) {
+                        if totalDwellCount > 0 {
+                            Text("共 \(totalDwellCount) 段")
+                                .font(.system(size: 10, design: .monospaced))
+                                .monospacedDigit()
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
                     }
 
-                    let totalCount = report.dwellBuckets.reduce(0) { $0 + $1.count }
-                    if totalCount == 0 {
+                    if totalDwellCount == 0 {
                         Text("当日暂无连续停留片段")
                             .font(.system(size: 11))
                             .foregroundStyle(.tertiary)
-                            .frame(maxWidth: .infinity, minHeight: 100)
+                            .frame(maxWidth: .infinity, minHeight: 110)
                     } else {
-                        ForEach(report.dwellBuckets) { bucket in
-                            distributionBarRow(
-                                label: bucket.label,
-                                color: dwellBucketColor(id: bucket.id),
-                                minutes: bucket.minutes,
-                                share: bucket.share,
-                                trailingNote: "\(bucket.count)段"
-                            )
+                        VStack(spacing: 8) {
+                            ForEach(report.dwellBuckets) { bucket in
+                                distributionBarRow(
+                                    label: bucket.label,
+                                    color: dwellBucketColor(id: bucket.id),
+                                    minutes: bucket.minutes,
+                                    share: bucket.share,
+                                    trailingNote: "\(bucket.count)段"
+                                )
+                            }
                         }
                     }
+
+                    Spacer(minLength: 0)
                 }
             }
 
             // Right: Top Switch Transitions
-            StatsSectionCard {
-                VStack(alignment: .leading, spacing: 9) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrow.left.arrow.right")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(DayHelmColors.warningAmber)
-                        Text("高频切换路径 Top \(max(1, report.topTransitions.count))")
-                            .font(.system(size: 12.5, weight: .bold))
-                        Spacer()
+            StatsSectionCard(fillHeight: true) {
+                VStack(alignment: .leading, spacing: 10) {
+                    statsCardHeader(
+                        icon: "arrow.left.arrow.right",
+                        iconColor: DayHelmColors.warningAmber,
+                        title: "高频切换路径 Top \(max(1, report.topTransitions.count))"
+                    ) {
+                        if !report.topTransitions.isEmpty {
+                            Text("频次 · 切入均停")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .lineLimit(1)
+                        }
                     }
 
                     if report.topTransitions.isEmpty {
                         Text("当日暂无高频跨任务切换路径")
                             .font(.system(size: 11))
                             .foregroundStyle(.tertiary)
-                            .frame(maxWidth: .infinity, minHeight: 100)
+                            .frame(maxWidth: .infinity, minHeight: 110)
                     } else {
-                        VStack(spacing: 6) {
-                            ForEach(report.topTransitions) { t in
+                        VStack(spacing: 4) {
+                            ForEach(Array(report.topTransitions.enumerated()), id: \.element.id) { idx, t in
                                 HStack(spacing: 6) {
-                                    Text(t.fromLabel)
-                                        .font(.system(size: 11, weight: .medium))
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                    Image(systemName: "arrow.right")
-                                        .font(.system(size: 9, weight: .semibold))
-                                        .foregroundStyle(.tertiary)
-                                    Text(t.toLabel)
-                                        .font(.system(size: 11, weight: .medium))
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-
-                                    Spacer(minLength: 4)
+                                    HStack(spacing: 4) {
+                                        Text(t.fromLabel)
+                                            .font(.system(size: 11, weight: .medium))
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Image(systemName: "arrow.right")
+                                            .font(.system(size: 8.5, weight: .semibold))
+                                            .foregroundStyle(.tertiary)
+                                            .fixedSize()
+                                        Text(t.toLabel)
+                                            .font(.system(size: 11, weight: .medium))
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
 
                                     Text("\(t.count) 次")
                                         .font(.system(size: 10, weight: .semibold, design: .monospaced))
                                         .monospacedDigit()
                                         .foregroundStyle(DayHelmColors.warningAmber)
-                                        .padding(.horizontal, 6)
+                                        .lineLimit(1)
+                                        .frame(width: 44, alignment: .center)
                                         .padding(.vertical, 2)
                                         .background(DayHelmColors.warningAmber.opacity(0.12), in: Capsule())
+                                        .fixedSize(horizontal: true, vertical: false)
 
                                     Text(String(format: "均停 %.0fs", t.avgTargetDwellSeconds))
                                         .font(.system(size: 10, design: .monospaced))
                                         .monospacedDigit()
                                         .foregroundStyle(.secondary)
-                                        .frame(width: 68, alignment: .trailing)
+                                        .lineLimit(1)
+                                        .frame(width: 62, alignment: .trailing)
+                                        .fixedSize(horizontal: true, vertical: false)
                                 }
-                                .padding(.vertical, 2)
+                                .padding(.vertical, 2.5)
+
+                                if idx + 1 < report.topTransitions.count {
+                                    Divider().opacity(0.45)
+                                }
                             }
                         }
                     }
+
+                    Spacer(minLength: 0)
                 }
             }
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: - 7. Local Agent Analysis Prompt Card
@@ -958,7 +1066,7 @@ struct DailyStatsView: View {
 
         return StatsSectionCard {
             VStack(alignment: .leading, spacing: 10) {
-                HStack(alignment: .top, spacing: 10) {
+                HStack(alignment: .center, spacing: 10) {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
                             Image(systemName: "terminal.fill")
@@ -966,13 +1074,16 @@ struct DailyStatsView: View {
                                 .foregroundStyle(DayHelmColors.primaryBlue)
                             Text("本地 Agent 深度分析提示词")
                                 .font(.system(size: 13, weight: .bold))
+                                .lineLimit(1)
                         }
                         Text("纯本地只读下钻指令（无 API Key、不传网页端）：一键复制给本机 Claude Code / Codex / Hermes 自行查阅 dayhelm CLI 与只读 SQLite。")
                             .font(.system(size: 10.5))
                             .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
 
-                    Spacer()
+                    Spacer(minLength: 8)
 
                     Button {
                         copyPromptToClipboard(report: report)
@@ -982,6 +1093,7 @@ struct DailyStatsView: View {
                                 .font(.system(size: 10.5, weight: .semibold))
                             Text(copiedFeedback ? "已复制 ✓" : "复制提示词")
                                 .font(.system(size: 11, weight: .semibold))
+                                .lineLimit(1)
                         }
                         .foregroundStyle(.white)
                         .padding(.horizontal, 10)
@@ -992,9 +1104,10 @@ struct DailyStatsView: View {
                         )
                     }
                     .buttonStyle(.plain)
+                    .fixedSize(horizontal: true, vertical: false)
                 }
 
-                HStack(spacing: 8) {
+                HStack(alignment: .top, spacing: 10) {
                     ForEach(AgentAnalysisPromptPreset.allCases) { preset in
                         let selected = (promptPreset == preset)
                         Button {
@@ -1004,14 +1117,16 @@ struct DailyStatsView: View {
                                 Text(preset.title)
                                     .font(.system(size: 11.5, weight: .semibold))
                                     .foregroundStyle(selected ? DayHelmColors.primaryBlue : .primary)
+                                    .lineLimit(1)
                                 Text(preset.subtitle)
                                     .font(.system(size: 10))
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
+                                    .truncationMode(.tail)
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                             .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
+                            .padding(.vertical, 8)
                             .background(
                                 selected ? DayHelmColors.primaryBlue.opacity(0.10) : Color.primary.opacity(0.04),
                                 in: RoundedRectangle(cornerRadius: 7, style: .continuous)
@@ -1027,6 +1142,7 @@ struct DailyStatsView: View {
                         .buttonStyle(.plain)
                     }
                 }
+                .fixedSize(horizontal: false, vertical: true)
 
                 HStack {
                     Button {
@@ -1039,10 +1155,12 @@ struct DailyStatsView: View {
                                 .font(.system(size: 9.5, weight: .semibold))
                             Text(isPromptExpanded ? "收起只读预览" : "展开只读预览")
                                 .font(.system(size: 10.5, weight: .medium))
+                                .lineLimit(1)
                         }
                         .foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain)
+                    .fixedSize(horizontal: true, vertical: false)
 
                     Spacer()
 
@@ -1050,6 +1168,7 @@ struct DailyStatsView: View {
                         .font(.system(size: 10, design: .monospaced))
                         .monospacedDigit()
                         .foregroundStyle(.tertiary)
+                        .lineLimit(1)
                 }
 
                 if isPromptExpanded {
@@ -1070,6 +1189,30 @@ struct DailyStatsView: View {
                 }
             }
         }
+    }
+
+    private func statsCardHeader<Trailing: View>(
+        icon: String,
+        iconColor: Color,
+        title: String,
+        @ViewBuilder trailing: () -> Trailing = { EmptyView() }
+    ) -> some View {
+        HStack(alignment: .center, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(iconColor)
+                Text(title)
+                    .font(.system(size: 12.5, weight: .bold))
+                    .lineLimit(1)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+
+            Spacer(minLength: 6)
+
+            trailing()
+        }
+        .frame(minHeight: 22)
     }
 
     private var generatingPlaceholderCard: some View {
@@ -1227,9 +1370,9 @@ struct DailyStatsView: View {
 
     private func spanSummaryText(_ report: DailyStatsReport) -> String {
         if let first = report.firstActiveAt, let last = report.lastActiveAt {
-            return "起止 \(formatHHMM(first))–\(formatHHMM(last)) · 跨度 \(formatDuration(minutes: report.spanMinutes))"
+            return "起止 \(formatHHMM(first))–\(formatHHMM(last))\n全天跨度 \(formatDuration(minutes: report.spanMinutes))"
         }
-        return "历史归档日期（预计算）"
+        return "历史归档日期\n后台预计算"
     }
 
     private func formatDelta(
@@ -1288,12 +1431,13 @@ struct DailyStatsView: View {
 }
 
 private struct StatsSectionCard<Content: View>: View {
+    var fillHeight: Bool = false
     @ViewBuilder let content: Content
 
     var body: some View {
         content
             .padding(14)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: fillHeight ? .infinity : nil, alignment: .topLeading)
             .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
