@@ -14,8 +14,9 @@
 ├─────────────────────────────────────────────────────────────────────────┤
 │ 判定与数据中心层 (DayHelmCore · 纯 Swift，严禁 import AppKit)           │
 │   ├─ EventMerger / QuotaTracker / SpectrumBuilder / SlidingSupervisor   │
+│   ├─ DailyStatsAggregator / AgentAnalysisPromptBuilder (确定性日统计)   │
 │   ├─ ActivityDatabase: 开放 SQLite (SQLite3 WAL)，兼容 Alma 四表模型    │
-│   └─ DayHelmCLI: query / search / sessions / status / purge             │
+│   └─ DayHelmCLI: query / search / sessions / stats / status / purge     │
 ├─────────────────────────────────────────────────────────────────────────┤
 │ 独立原生采集与接口层 (DayHelmCapture)                                   │
 │   ├─ AXWindowInspector: 2s 轮询 NSWorkspace + AX 窗口标题与 URL         │
@@ -226,7 +227,7 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
    - 一条 `22pt` 高的横向彩色分段条（基于单 SwiftUI `Canvas` 绘制，从今日开始工作到当前时刻），直观展示各事项分布与斜纹碎片化段。
 5. **底部三格遥测微指标（Telemetry Footer）** + **精简操作底栏**：
    - 三等分小格：`今日最长连续块 (34m)` ｜ `近期切换热度 (19/h)` ｜ `≥12m 有效块 (3个)`。
-   - 底栏保留高频轻操作：`提醒测试`、`设置`、`历史会话`、配置目录快捷图标、`退出`。
+   - 底栏保留高频轻操作：`提醒测试`、`设置`、`统计`（直达「每日统计」Tab）、`历史会话`、配置目录快捷图标、`退出`。
 
 #### 载体 C：右上角非抢占式监督浮窗（Non-activating HUD Toast，宽 `350pt`）
 - **实现方式**：使用 `NSPanel`，设置 `styleMask: [.nonactivatingPanel, .borderless]`，`level: .floating`，`collectionBehavior: [.canJoinAllSpaces, .fullScreenAuxiliary]`。
@@ -240,8 +241,14 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 
 #### 载体 D：独立设置与活动记录窗口（`ActivityRecorderWindow`）
 - **定位与触发**：从菜单栏 Popover 顶栏设置图标或底部 `设置` / `历史会话`（或引擎状态条）打开，并在打开时自动收起菜单栏 Popover；打开独立窗口期间自动将应用激活策略切为 `.regular`（在底部 Dock 与 `Cmd+Tab` 展示应用图标，点击 Dock 图标可一键唤回），窗口关闭后恢复 `.accessory` 静默菜单栏模式。集中承载所有低频/复杂配置，避免破坏 `330pt` 菜单栏面板一屏免滚动体验；遵循 Precision Telemetry 卡片网格与 `.monospacedDigit()` 规范。
-- **一体化工具栏导航（Unified Toolbar）**：窗口采用标准非重叠标题栏（不使用 `.fullSizeContentView` 透明穿透，确保内容区向上滚动严格裁切在工具栏下方、绝不与导航栏重叠）+ `titleVisibility = .hidden` + `.unified` 工具栏，红黄绿窗口控制钮右侧依次排列会话侧栏折叠按钮（仅「历史会话」显示）、DayHelm Logo 与名称、平级导航项（`事项与配额` ｜ `Jev 识别` ｜ `活动采集` ｜ `隐私与存储` ｜ `历史会话`），右侧展示采集状态胶囊与刷新按钮：
+- **一体化工具栏导航（Unified Toolbar）**：窗口采用标准非重叠标题栏（不使用 `.fullSizeContentView` 透明穿透，确保内容区向上滚动严格裁切在工具栏下方、绝不与导航栏重叠）+ `titleVisibility = .hidden` + `.unified` 工具栏，红黄绿窗口控制钮右侧依次排列会话侧栏折叠按钮（仅「历史会话」显示）、DayHelm Logo 与名称、平级导航项（`事项与配额` ｜ `每日统计` ｜ `Jev 识别` ｜ `活动采集` ｜ `隐私与存储` ｜ `历史会话`；其中 `isSettingsSection` 排除 `每日统计` 与 `历史会话`，确保菜单栏「设置」入口始终落入设置分区），右侧展示采集状态胶囊与刷新按钮：
   - **「事项与配额」**：专注管理今日可选焦点项目与菜单栏显示密度——包含事项新增/编辑弹窗（名称、短名、一句话说明、6 色语义色点、保底目标与封顶上限滑块/直输联动控件、折叠式高级离线匹配规则）、上下排序、删除确认，修改立即生效并同步至悬浮窗；不配置项目时亦可完全依赖 Jev Layer-1 活动大类运行。
+  - **「每日统计」**（`DailyStatsView`）：按天确定性统计看板与本地 Agent 深度分析提示词生成器：
+    1. **顶部日期切换与主操作栏**：`< 前一天` / 日期下拉菜单（含 `回到今天`） / `后一天 >`、起止跨度标签、以及「一键复制 Agent 提示词」主按钮。
+    2. **4 格核心遥测卡（带近 7 日均值微对比 `baseline7d`）**：总活跃时长（含起止跨度）、中位/最长连续块与 `≥12m` 有效块数、有效跨任务切换数/每小时切换热度与高频乱切累计时长/段数、键鼠输入密度（`clickCount`/`keypressCount`/`inputEventsPerMinute`）与会话/会议/快照/OCR 计数。
+    3. **放大版日时间光谱条** + **时间分配双卡**（事项配额与 6 大活动大类分布 ｜ Top 应用与 Top 浏览器站点切换）。
+    4. **24 小时分时节律图**（单小时活跃分钟/有效切换/乱切分布，支持悬停查看单小时详情）+ **行为习惯双卡**（`<1m`、`1–3m`、`3–10m`、`10–25m`、`≥25m` 5 档连续停留时长分布 ｜ 高频切换路径 Top N `A → B` 频次与切入后平均停留秒数）。
+    5. **本地 Agent 深度分析提示词卡片**：支持切换「每日复盘与习惯诊断」「工作产出与日报草稿」预设、展开只读预览与一键复制，内嵌动态本地数据路径、`dayhelm` CLI 下钻命令、`sqlite3 -readonly` 只读查询示例、轻量统计骨架及只读/隐私脱敏护栏。
   - **「Jev 识别」**：独立承载所有 Jev System One 智能自动识别配置与判断历史：
     1. **智能自动识别配置卡片**：开关、API Key 状态/录入/连通性测试、发送脱敏本机 OCR 摘要开关（弱标题门控）。未配置 API Key 且已开启时，标题栏该 Tab 显示琥珀色提醒圆点，菜单栏悬浮窗横幅亦直达此页。
     2. **Jev 判断记录卡片**：今日调用统计摘要（总次数、自动切换次数、平均耗时、累计输入 Token）、按状态过滤（全部/已切换/待确认或忽略/异常）、清空按钮与完整记录列表（每条展示时间、决策结果、`[活动大类]`、`→ 焦点项目`、置信度/同任务概率/分心概率、耗时与输入 Token、脱敏后窗口上下文与 OCR 预览）。
@@ -285,7 +292,16 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 - `activity_ocr_fts`：基于 `FTS5 tokenize='trigram'` 的全文索引虚表（通过触发器自动同步），关键词长度 `>= 3` 走 FTS5 `MATCH`，`< 3` 回退 `LIKE`。
 - **热查询索引与运行态收敛**（见 `docs/decisions/011-cpu-and-memory-performance-convergence.md`）：建表时自动创建 `idx_activity_sessions_open`（部分索引 `WHERE ended_at IS NULL`）、`idx_activity_snapshots_ts`、`idx_activity_snapshots_tier_ts` 与 `idx_activity_ocr_created_at` 消除全表扫描；活跃会话计数在内存中增量缓存，摘要合成对 `(app_name, window_title, url)` 先做 SQL `GROUP BY` 聚合再提取实体与主题；本地 HTTP 运行态快照改为按需懒生成。
 
-### 3. Agent CLI 接口（`DayHelm`）
+### 3. 单日确定性聚合与本地 Agent 提示词（`DailyStats.swift`）
+
+- **`DailyStatsAggregator`**（`DayHelmCore`，无 `AppKit` 依赖）：
+  - **单一真源口径**：时间分配、日时间光谱、连续块（中位/最长/`≥12m` 有效块）与跨任务切换指标以 `DayHelmDaySnapshot`（`today.json` / `days/YYYY-MM-DD.json`）为准，确保与菜单栏实时数字一致；输入密度（`clickCount`/`keypressCount`/`inputEventsPerMinute`）及会话/会议/快照/OCR 计数由 `ActivityDatabase` 按日补齐；自动读取 `DayHelmStore.listArchivedDayStrings()` 中目标日期之前最多 7 个归档日计算 `baseline7d` 均值基线。
+  - **站点与隐私脱敏规则**：Top 浏览器站点从 `http(s)` URL 解析 Host，统一小写、剥离前导 `www.` 并保留非默认端口（剥离 `http:80` / `https:443`）；`redacted == true` 记录绝不泄露窗口标题或域名至 Top 站点、高频切换路径 `A → B` 或 Prompt 骨架。
+- **`DailyStatsMarkdownRenderer` & `AgentAnalysisPromptBuilder`**：
+  - `DailyStatsMarkdownRenderer` 将 `DailyStatsReport` 渲染为紧凑 Markdown 骨架，同时供 `dayhelm stats --format md` 与 Prompt 复用；
+  - `AgentAnalysisPromptBuilder` 根据 `AgentAnalysisPromptPreset`（`dailyReview` / `workOutputDraft`）动态填充目标日期、本地数据目录（`today.json` / `days/YYYY-MM-DD.json` / `activity.sqlite`）、推荐 `dayhelm` CLI 下钻命令、`sqlite3 -readonly` 只读查询示例及隐私脱敏护栏。
+
+### 4. Agent CLI 接口（`DayHelm`）
 
 任意 AI Agent 可直接通过命令行读取或检索当日活动上下文（支持 `md` 与 `json`）：
 
@@ -293,13 +309,14 @@ public enum FocusSessionState: Sendable, Equatable, Codable {
 dayhelm query [--today | --since <2h|30m|YYYY-MM-DD>] [--format json|md] [--store-dir <path>]
 dayhelm search <keyword> [--limit 20] [--format json|md] [--store-dir <path>]
 dayhelm sessions [--date YYYY-MM-DD] [--id <session_id>] [--format json|md] [--store-dir <path>]
+dayhelm stats [--date YYYY-MM-DD] [--format json|md] [--json] [--store-dir <path>]
 dayhelm status [--format json|md] [--store-dir <path>]   # --json 等价于 --format json
 dayhelm purge [--before YYYY-MM-DD] [--store-dir <path>]
 ```
 
 `dayhelm status --format json` 输出 `{schemaVersion, date, focusState, activeTaskId, budgets, metrics, recorder}`；`recorder` 含今日 `sessions/events/snapshots/ocrFrames/clickCount/keypressCount/inputEventsPerMinute`，便于 Agent 直接判定采集是否健康、人在不在场。
 
-### 4. 本地兼容 HTTP API（`127.0.0.1` 环回）
+### 5. 本地兼容 HTTP API（`127.0.0.1` 环回）
 
 由 `LocalActivityHTTPServer`（`Network.NWListener`）仅在 `127.0.0.1` 提供服务，默认端口 **`24001`**（若被占用则在 `24001...24009` 范围内自动选择首个未占用端口；绝不占用 Alma 使用的 `23001`）：
 
@@ -318,7 +335,7 @@ dayhelm purge [--before YYYY-MM-DD] [--store-dir <path>]
 - `GET /api/dayhelm/context?since=...`：面向 AI Agent 的结构化摘要（当前专注状态、今日配额、连续度指标、最近窗口标题/URL 与 OCR 片段）
 - `GET /api/dayhelm/search?q=<kw>&limit=20`：跨窗口标题 / URL / 应用名 / 会话摘要 / OCR（FTS5 加速）的富检索 `{ keyword, total, hits }`
 
-### 5. `today.json` 核心结构示例
+### 6. `today.json` 核心结构示例
 
 ```json
 {
@@ -376,7 +393,7 @@ dayhelm purge [--before YYYY-MM-DD] [--store-dir <path>]
 }
 ```
 
-### 6. 与 `alma-time-audit` 的协同契约
+### 7. 与 `alma-time-audit` 的协同契约
 - **读取配置**：DayHelm 仅在初次初始化时只读读取 `~/.config/alma/time-audit/focus.json` 与 `config.json`。
 - **独立 `2400x` 兼容接口**：DayHelm 在 `127.0.0.1:24001`（`2400x` 段）提供兼容的 `/api/activity-recorder/sessions` 接口，回传已补齐的 `windowTitle`、OCR 文本与 `declaredTaskId`，同时不干扰 Alma 自身的 `23001` 服务；`days/YYYY-MM-DD.json` 中的 `enrichedSpans` 也可被 `time-audit` 直接读取。
 

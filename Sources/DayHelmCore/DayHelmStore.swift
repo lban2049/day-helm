@@ -371,6 +371,29 @@ public final class DayHelmStore: @unchecked Sendable {
         return try decoder.decode(DayHelmDaySnapshot.self, from: data)
     }
 
+    /// Lists valid `YYYY-MM-DD` archived day strings under `days/`, sorted descending.
+    public func listArchivedDayStrings() -> [String] {
+        guard fileManager.fileExists(atPath: daysDirectory.path),
+              let items = try? fileManager.contentsOfDirectory(
+                  at: daysDirectory,
+                  includingPropertiesForKeys: [.isRegularFileKey],
+                  options: [.skipsHiddenFiles]
+              ) else {
+            return []
+        }
+        var dates: [String] = []
+        for item in items where item.pathExtension.lowercased() == "json" {
+            let stem = item.deletingPathExtension().lastPathComponent
+            guard stem.count == 10,
+                  let parsed = DayHelmDateFormatting.parseDayString(stem),
+                  DayHelmDateFormatting.dayString(from: parsed) == stem else {
+                continue
+            }
+            dates.append(stem)
+        }
+        return dates.sorted(by: >)
+    }
+
     private struct DayHelmConfigFileDTO: Codable {
         var budgets: [TaskBudget]?
         var activityRecorderEnabled: Bool?

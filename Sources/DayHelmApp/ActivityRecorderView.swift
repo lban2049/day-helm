@@ -147,6 +147,11 @@ struct ActivityRecorderView: View {
                     searchQuery: $searchQuery,
                     selectedDetail: $selectedDetail
                 )
+            } else if navState.activeSection == .dailyStats {
+                DailyStatsView(
+                    coordinator: coordinator,
+                    refreshNonce: navState.refreshNonce
+                )
             } else {
                 ActivityRecorderSettingsTab(
                     coordinator: coordinator,
@@ -382,7 +387,7 @@ private struct ActivityRecorderSettingsTab: View {
                         captureTimingCard
                         ocrAndInputCard
                         recentSessionsCard
-                    case .privacyStorage, .history:
+                    case .privacyStorage, .history, .dailyStats:
                         sensitiveAppsCard
                         storageQuotaCard
                     }

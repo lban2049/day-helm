@@ -1532,6 +1532,16 @@ public final class ActivityDatabase: @unchecked Sendable {
         return (sessions, events, snapshots, ocr)
     }
 
+    public func countMeetingSessions(dayStartMs: Int64, dayEndMs: Int64) throws -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return try countRowsLocked(
+            sql: "SELECT COUNT(*) FROM activity_sessions WHERE is_meeting = 1 AND started_at >= ? AND started_at <= ?;",
+            sinceMs: dayStartMs,
+            untilMs: dayEndMs
+        )
+    }
+
     public func currentOpenSessionId() throws -> String? {
         lock.lock()
         defer { lock.unlock() }

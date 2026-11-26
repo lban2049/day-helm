@@ -79,6 +79,8 @@ public enum DayHelmCLI {
             return runSearch(args: Array(args.dropFirst()), clock: clock)
         case "sessions":
             return runSessions(args: Array(args.dropFirst()), clock: clock)
+        case "stats":
+            return runStats(args: Array(args.dropFirst()), clock: clock)
         case "purge":
             return runPurge(args: Array(args.dropFirst()))
         case "status":
@@ -111,6 +113,8 @@ public enum DayHelmCLI {
                                                        Search window titles, URLs, sessions & OCR text
           dayhelm sessions [--date YYYY-MM-DD] [--id <session_id>] [--limit 50] [--format json|md] [--store-dir <path>]
                                                        List sessions or inspect full session details
+          dayhelm stats [--date YYYY-MM-DD] [--format json|md] [--json] [--store-dir <path>]
+                                                       Deterministic daily telemetry, allocation & switch stats
           dayhelm status [--format json|md] [--store-dir <path>]
                                                        Print today's budget & telemetry summary (--json alias for --format json)
           dayhelm purge [--before YYYY-MM-DD] [--store-dir <path>]
@@ -482,6 +486,80 @@ public enum DayHelmCLI {
             }
         }
         return DayHelmCLIResult(exitCode: 0, stdout: lines.joined(separator: "\n") + "\n")
+    }
+
+    // MARK: - stats
+
+    private static func runStats(args: [String], clock: any DayHelmClock) -> DayHelmCLIResult {
+        var dateString: String?
+        var format: DayHelmCLIFormat = .md
+        var storeDirPath: String?
+
+        var i = 0
+        while i < args.count {
+            let arg = args[i]
+            switch arg {
+            case "--date":
+                guard i + 1 < args.count else {
+                    return DayHelmCLIResult(exitCode: 1, stderr: "Error: --date requires a YYYY-MM-DD argument.\n")
+                }
+                dateString = args[i + 1]
+                i += 2
+            case "--json":
+                format = .json
+                i += 1
+            case "--format":
+                guard i + 1 < args.count, let parsed = DayHelmCLIFormat(rawValue: args[i + 1].lowercased()) else {
+                    return DayHelmCLIResult(exitCode: 1, stderr: "Error: --format must be 'json' or 'md'.\n")
+                }
+                format = parsed
+                i += 2
+            case "--store-dir":
+                guard i + 1 < args.count else {
+                    return DayHelmCLIResult(exitCode: 1, stderr: "Error: --store-dir requires a directory path.\n")
+                }
+                storeDirPath = args[i + 1]
+                i += 2
+            case "--help", "-h":
+                return DayHelmCLIResult(exitCode: 0, stdout: helpText)
+            default:
+                return DayHelmCLIResult(exitCode: 1, stderr: "Error: Unknown option '\(arg)' for 'stats'.\n")
+            }
+        }
+
+        let targetDate = dateString ?? DayHelmDateFormatting.dayString(from: clock.now())
+        guard targetDate.count == 10,
+              let parsedDate = DayHelmDateFormatting.parseDayString(targetDate),
+              DayHelmDateFormatting.dayString(from: parsedDate) == targetDate else {
+            return DayHelmCLIResult(exitCode: 1, stderr: "Error: Invalid date '\(targetDate)'. Expected YYYY-MM-DD.\n")
+        }
+
+        let directory = resolveDirectory(storeDirPath)
+        let store = DayHelmStore(directory: directory)
+        let budgets = storeDirPath == nil
+            ? TimeAuditConfigLoader.loadBudgets()
+            : TimeAuditConfigLoader.loadBudgets(
+                timeAuditDirectory: store.directory.appendingPathComponent("__none__", isDirectory: true),
+                dayhelmConfigURL: store.configURL
+            )
+        let database: ActivityDatabase? = FileManager.default.fileExists(atPath: store.databaseURL.path)
+            ? (try? ActivityDatabase(databaseURL: store.databaseURL))
+            : nil
+
+        let report = DailyStatsAggregator.aggregate(
+            dateString: targetDate,
+            liveSnapshot: nil,
+            budgets: budgets,
+            store: store,
+            database: database,
+            clock: clock,
+            includeBaseline: true
+        )
+
+        if format == .json {
+            return encodeJSONResult(report)
+        }
+        return DayHelmCLIResult(exitCode: 0, stdout: DailyStatsMarkdownRenderer.render(report))
     }
 
     // MARK: - purge

@@ -33,7 +33,7 @@ struct DayHelmChecksMain {
     static func main() async {
         do {
             try await runAllChecks()
-            print("ALL DAYHELM CHECKS PASSED (71/71)")
+            print("ALL DAYHELM CHECKS PASSED (75/75)")
             exit(0)
         } catch {
             fputs("DAYHELM CHECK FAILED: \(error)\n", stderr)
@@ -5032,6 +5032,308 @@ struct DayHelmChecksMain {
                 try checkEqual(engine.currentSemanticGroup, "proj:ecommerce", "manualOverride must update currentSemanticGroup to proj:ecommerce")
                 try checkEqual(engine.enrichedSpans.last?.semanticGroup, "proj:ecommerce", "manualOverride must stamp current window span with proj:ecommerce")
             }
+        }
+
+        try await runCheck("73. DayHelmStore.listArchivedDayStrings validates and sorts YYYY-MM-DD descending") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-days-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            try checkEqual(store.listArchivedDayStrings(), [String](), "Missing days directory returns empty list")
+
+            try FileManager.default.createDirectory(at: store.daysDirectory, withIntermediateDirectories: true)
+            let emptyMetrics = DayMetrics(activeMinutes: 0, longestBlockMinutes: 0, solidBlocksCount: 0, recentSwitchesPerHour: 0)
+            for date in ["2026-11-12", "2026-11-16", "2026-11-14"] {
+                try store.archiveDay(DayHelmDaySnapshot(date: date, budgets: [], focusSessions: [], enrichedSpans: [], metrics: emptyMetrics))
+            }
+            // Write non-matching / invalid files that must be ignored
+            try "{}".write(to: store.daysDirectory.appendingPathComponent("notes.json"), atomically: true, encoding: .utf8)
+            try "{}".write(to: store.daysDirectory.appendingPathComponent("2026-13-45.json"), atomically: true, encoding: .utf8)
+            try "{}".write(to: store.daysDirectory.appendingPathComponent("2026-11-15.json.tmp"), atomically: true, encoding: .utf8)
+
+            try checkEqual(
+                store.listArchivedDayStrings(),
+                ["2026-11-16", "2026-11-14", "2026-11-12"],
+                "listArchivedDayStrings must filter invalid filenames and sort descending"
+            )
+        }
+
+        try await runCheck("74. DailyStatsAggregator deterministic aggregation, privacy isolation & 7d baseline") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-stats-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let dayStr = "2026-11-17"
+            let t0 = DayHelmDateFormatting.parseISO8601("2026-11-17T09:00:00+08:00")!
+            let clock = ManualClock(now: t0.addingTimeInterval(3 * 3600))
+            let budgets = sampleBudgets()
+
+            // Seed 3 archived days for 7d baseline
+            for (offset, mins) in [(1, 60.0), (2, 90.0), (3, 120.0)] {
+                let dStr = String(format: "2026-11-%02d", 17 - offset)
+                let dStart = DayHelmDateFormatting.parseDayString(dStr)!.addingTimeInterval(9 * 3600)
+                let archSpan = EnrichedSpan(
+                    startedAt: dStart,
+                    endedAt: dStart.addingTimeInterval(mins * 60),
+                    appName: "Xcode",
+                    bundleId: "com.apple.dt.Xcode",
+                    windowTitle: "DayHelm.swift",
+                    declaredTaskId: "ecommerce",
+                    semanticGroup: "proj:ecommerce"
+                )
+                let archMetrics = DayMetrics(activeMinutes: mins, longestBlockMinutes: mins, solidBlocksCount: 1, recentSwitchesPerHour: 0)
+                try store.archiveDay(DayHelmDaySnapshot(
+                    date: dStr,
+                    budgets: [],
+                    focusSessions: [FocusSessionRecord(id: "s_\(offset)", taskId: "ecommerce", startedAt: dStart, endedAt: dStart.addingTimeInterval(mins * 60), minutes: mins)],
+                    enrichedSpans: [archSpan],
+                    metrics: archMetrics
+                ))
+            }
+
+            // Build target day spans covering all 5 dwell tiers, browser hosts, redacted entry, and transitions
+            var spans: [EnrichedSpan] = []
+            // 09:00..09:30 (30m -> >=25m) Chrome github.com (with www. and :443)
+            spans.append(EnrichedSpan(
+                startedAt: t0,
+                endedAt: t0.addingTimeInterval(1800),
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Pull Requests",
+                url: "https://www.github.com:443/acme/dayhelm",
+                declaredTaskId: "ecommerce",
+                redacted: false,
+                semanticGroup: "mode:build"
+            ))
+            // 09:30..09:42 (12m -> 10-25m) Xcode
+            spans.append(EnrichedSpan(
+                startedAt: t0.addingTimeInterval(1800),
+                endedAt: t0.addingTimeInterval(2520),
+                appName: "Xcode",
+                bundleId: "com.apple.dt.Xcode",
+                windowTitle: "DailyStats.swift",
+                url: nil,
+                declaredTaskId: "ecommerce",
+                redacted: false,
+                semanticGroup: "mode:build"
+            ))
+            // 09:42..09:47 (5m -> 3-10m) Chrome localhost:8787 (non-default port kept)
+            spans.append(EnrichedSpan(
+                startedAt: t0.addingTimeInterval(2520),
+                endedAt: t0.addingTimeInterval(2820),
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Local Dev",
+                url: "http://www.localhost:8787/dashboard",
+                declaredTaskId: nil,
+                redacted: false,
+                semanticGroup: "mode:operate"
+            ))
+            // 09:47..09:49 (2m -> 1-3m) Redacted 1Password / Secret Bank site (must NOT leak to topSites or transitions)
+            spans.append(EnrichedSpan(
+                startedAt: t0.addingTimeInterval(2820),
+                endedAt: t0.addingTimeInterval(2940),
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Secret Bank Login",
+                url: "https://secret.bank.example.com/login",
+                declaredTaskId: nil,
+                redacted: true,
+                semanticGroup: "mode:comms_admin"
+            ))
+            // 09:49..09:49:30 (30s -> <1m) WeChat interrupt
+            spans.append(EnrichedSpan(
+                startedAt: t0.addingTimeInterval(2940),
+                endedAt: t0.addingTimeInterval(2970),
+                appName: "WeChat",
+                bundleId: "com.tencent.xinWeChat",
+                windowTitle: nil,
+                url: nil,
+                declaredTaskId: nil,
+                redacted: true,
+                semanticGroup: "break"
+            ))
+            // 09:50..09:55 (5m -> 3-10m) Back to github.com to verify transition repetition
+            spans.append(EnrichedSpan(
+                startedAt: t0.addingTimeInterval(3000),
+                endedAt: t0.addingTimeInterval(3300),
+                appName: "Google Chrome",
+                bundleId: "com.google.Chrome",
+                windowTitle: "Issues",
+                url: "https://github.com/acme/dayhelm/issues",
+                declaredTaskId: "ecommerce",
+                redacted: false,
+                semanticGroup: "mode:build"
+            ))
+
+            let built = SpectrumBuilder.build(spans: spans, focusSessions: [], budgets: budgets, now: t0.addingTimeInterval(3300))
+            let snapshot = DayHelmDaySnapshot(
+                date: dayStr,
+                budgets: [BudgetSnapshot(taskId: "ecommerce", displayName: "电商做深", focusedMinutes: 47.0, targetMinutes: 90, capMinutes: 120, status: .underTarget)],
+                focusSessions: [FocusSessionRecord(id: "f1", taskId: "ecommerce", startedAt: t0, endedAt: t0.addingTimeInterval(2520), minutes: 42.0)],
+                enrichedSpans: spans,
+                metrics: built.metrics,
+                activityModeMinutes: ["build": 47.0, "operate": 5.0, "comms_admin": 2.0, "break": 0.5]
+            )
+            try store.saveToday(snapshot)
+
+            // Seed SQLite with session, meeting, clicks, keypresses, snapshot, OCR
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+            let t0Ms = Int64(t0.timeIntervalSince1970 * 1000)
+            try db.startSession(id: "sess_m1", startedAtMs: t0Ms, triggerKind: "app_focus", appNames: ["zoom.us"])
+            try db.insertEvent(sessionId: "sess_m1", timestampMs: t0Ms + 5_000, kind: "app_focus", appName: "zoom.us", windowTitle: "Zoom Meeting", url: nil)
+            try db.insertEvent(sessionId: "sess_m1", timestampMs: t0Ms + 10_000, kind: "click", appName: "Google Chrome", windowTitle: nil, url: nil, data: ["count": "12"])
+            try db.insertEvent(sessionId: "sess_m1", timestampMs: t0Ms + 20_000, kind: "keypress", appName: "Xcode", windowTitle: nil, url: nil, data: ["count": "120"])
+            try db.closeSession(sessionId: "sess_m1", endedAtMs: t0Ms + 600_000)
+            try db.insertSnapshot(id: "snap_1", sessionId: "sess_m1", timestampMs: t0Ms + 30_000, filePath: tmpDir.appendingPathComponent("s.jpg").path, width: 1280, height: 800, sizeBytes: 1024, trigger: "app_focus", appName: "Xcode", windowTitle: "DailyStats.swift", hashHex: "00", histogram: [], diffPct: 0.1)
+            try db.insertOCRFrame(id: "ocr_1", snapshotId: "snap_1", sessionId: "sess_m1", text: "struct DailyStatsReport", charCount: 23, tokenCount: 3, createdAtMs: t0Ms + 30_000)
+
+            let report = DailyStatsAggregator.aggregate(
+                dateString: dayStr,
+                liveSnapshot: snapshot,
+                budgets: budgets,
+                store: store,
+                database: db,
+                clock: clock
+            )
+
+            try checkEqual(report.date, dayStr, "Report date matches")
+            try check(report.isToday, "Report marks today")
+            try check(report.hasData, "Report hasData")
+            try checkApprox(report.core.activeMinutes, built.metrics.activeMinutes, tolerance: 0.01, "Active minutes matches snapshot.metrics")
+            try check(report.core.medianBlockMinutes > 0, "Median block minutes computed")
+            try checkEqual(report.core.sessionCount, 1, "Session count from SQLite")
+            try checkEqual(report.core.meetingCount, 1, "Meeting count from SQLite")
+            try checkEqual(report.core.clickCount, 12, "Click count from SQLite")
+            try checkEqual(report.core.keypressCount, 120, "Keypress count from SQLite")
+            try checkEqual(report.core.snapshotCount, 1, "Snapshot count from SQLite")
+            try checkEqual(report.core.ocrFrameCount, 1, "OCR frame count from SQLite")
+            try checkEqual(report.hourlyRhythm.count, 24, "24 hourly buckets")
+            try check(report.hourlyRhythm[9].activeMinutes > 40.0, "Hour 09 captures morning active minutes")
+
+            // Top sites: www. stripped, :443 dropped, :8787 preserved, redacted secret.bank.example.com excluded
+            try check(report.topSites.contains { $0.host == "github.com" }, "github.com normalized from www.github.com:443")
+            try check(report.topSites.contains { $0.host == "localhost:8787" }, "localhost:8787 keeps non-default port and strips www.")
+            try check(!report.topSites.contains { $0.host.contains("secret.bank.example.com") }, "Redacted site must never appear in topSites")
+            try check(!report.topTransitions.contains { $0.fromLabel.contains("secret.bank") || $0.toLabel.contains("secret.bank") || $0.fromLabel.contains("Secret Bank") || $0.toLabel.contains("Secret Bank") }, "Redacted title/host must never appear in transitions")
+
+            // 5 dwell buckets present and populated
+            try checkEqual(report.dwellBuckets.count, 5, "Exactly 5 dwell buckets")
+            let totalDwellCount = report.dwellBuckets.reduce(0) { $0 + $1.count }
+            try check(totalDwellCount >= 5, "All 5 dwell tiers represented")
+
+            // 7d baseline averaged over 3 archived days (60, 90, 120 -> avg 90)
+            try checkEqual(report.baseline7d?.sampleDays, 3, "Baseline counts 3 preceding archived days")
+            try checkApprox(report.baseline7d?.avgActiveMinutes ?? 0, 90.0, tolerance: 0.1, "Baseline avgActiveMinutes is 90m")
+        }
+
+        try await runCheck("75. AgentAnalysisPromptBuilder presets, dynamic paths & privacy guardrails") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-prompt-\(UUID().uuidString)")
+            let dayStr = "2026-11-16"
+            let t0 = DayHelmDateFormatting.parseISO8601("2026-11-16T10:00:00+08:00")!
+            let span = EnrichedSpan(
+                startedAt: t0,
+                endedAt: t0.addingTimeInterval(1800),
+                appName: "Xcode",
+                bundleId: "com.apple.dt.Xcode",
+                windowTitle: "DailyStats.swift",
+                url: nil,
+                declaredTaskId: "ecommerce",
+                redacted: false,
+                semanticGroup: "mode:build"
+            )
+            let snap = DayHelmDaySnapshot(
+                date: dayStr,
+                budgets: [BudgetSnapshot(taskId: "ecommerce", displayName: "电商做深", focusedMinutes: 30, targetMinutes: 90, capMinutes: 120, status: .underTarget)],
+                focusSessions: [],
+                enrichedSpans: [span],
+                metrics: DayMetrics(activeMinutes: 30, longestBlockMinutes: 30, solidBlocksCount: 1, recentSwitchesPerHour: 2)
+            )
+            let report = DailyStatsAggregator.aggregate(
+                dateString: dayStr,
+                liveSnapshot: snap,
+                budgets: sampleBudgets(),
+                store: nil,
+                database: nil,
+                clock: ManualClock(now: t0.addingTimeInterval(86400))
+            )
+
+            let reviewPrompt = AgentAnalysisPromptBuilder.build(report: report, preset: .dailyReview, storeDirectory: tmpDir)
+            let draftPrompt = AgentAnalysisPromptBuilder.build(report: report, preset: .workOutputDraft, storeDirectory: tmpDir)
+
+            try check(reviewPrompt != draftPrompt, "Different presets must produce distinct prompts")
+            for prompt in [reviewPrompt, draftPrompt] {
+                try check(prompt.contains(dayStr), "Prompt must include target date")
+                try check(prompt.contains(tmpDir.path), "Prompt must include local store directory path")
+                try check(prompt.contains("days/\(dayStr).json"), "Prompt must reference archived day JSON for historical date")
+                try check(prompt.contains("dayhelm stats --date \(dayStr)"), "Prompt must include dayhelm stats CLI command")
+                try check(prompt.contains("dayhelm sessions --date \(dayStr)"), "Prompt must include dayhelm sessions CLI command")
+                try check(prompt.contains("dayhelm search"), "Prompt must include dayhelm search CLI command")
+                try check(prompt.contains("sqlite3 -readonly"), "Prompt must include sqlite3 -readonly drill-down example")
+                try check(prompt.contains("只读"), "Prompt must state read-only guardrail")
+            }
+            try check(reviewPrompt.contains("复盘") || reviewPrompt.contains("切换"), "Daily review preset includes review focus")
+            try check(draftPrompt.contains("日报") || draftPrompt.contains("产出"), "Work output draft preset includes daily report focus")
+        }
+
+        try await runCheck("76. dayhelm stats CLI (md/json) & HybridActivityCoordinator stats integration") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-cli-stats-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let t0 = DayHelmDateFormatting.parseISO8601("2026-11-17T10:00:00+08:00")!
+            let clock = ManualClock(now: t0.addingTimeInterval(3600))
+            let budgets = sampleBudgets()
+            let engine = DayHelmEngine(budgets: budgets, clock: clock)
+            engine.startFocus(taskId: "ecommerce", at: t0)
+            engine.ingest(ActivitySample(timestamp: t0.addingTimeInterval(1470), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop", url: "https://www.example.com/item", idleSeconds: 0))
+            engine.ingest(ActivitySample(timestamp: t0.addingTimeInterval(1500), appName: "Google Chrome", bundleId: "com.google.Chrome", windowTitle: "Shop", url: "https://www.example.com/item", idleSeconds: 0))
+            try store.saveToday(engine.snapshot(at: t0.addingTimeInterval(1500)))
+
+            let archDate = "2026-11-16"
+            let archStart = DayHelmDateFormatting.parseDayString(archDate)!.addingTimeInterval(10 * 3600)
+            try store.archiveDay(DayHelmDaySnapshot(
+                date: archDate,
+                budgets: [],
+                focusSessions: [],
+                enrichedSpans: [EnrichedSpan(startedAt: archStart, endedAt: archStart.addingTimeInterval(1200), appName: "Terminal", bundleId: "com.apple.Terminal", windowTitle: "zsh")],
+                metrics: DayMetrics(activeMinutes: 20, longestBlockMinutes: 20, solidBlocksCount: 1, recentSwitchesPerHour: 0)
+            ))
+
+            let helpRes = DayHelmCLI.run(arguments: ["dayhelm", "--help"], clock: clock)
+            try check(helpRes?.stdout.contains("dayhelm stats") == true, "--help must document dayhelm stats")
+
+            let mdRes = DayHelmCLI.run(arguments: ["dayhelm", "stats", "--date", "2026-11-17", "--store-dir", tmpDir.path], clock: clock)
+            try checkEqual(mdRes?.exitCode, 0, "dayhelm stats md exits 0")
+            try check(mdRes?.stdout.contains("2026-11-17") == true, "md output contains date")
+            try check(mdRes?.stdout.contains("example.com") == true, "md output contains normalized top site")
+
+            let jsonRes = DayHelmCLI.run(arguments: ["dayhelm", "stats", "--date", archDate, "--json", "--store-dir", tmpDir.path], clock: clock)
+            try checkEqual(jsonRes?.exitCode, 0, "dayhelm stats --json exits 0")
+            let decoded = try DayHelmDateFormatting.makeDecoder().decode(DailyStatsReport.self, from: Data((jsonRes?.stdout ?? "").utf8))
+            try checkEqual(decoded.date, archDate, "JSON report date matches archived day")
+            try check(!decoded.isToday, "Archived day has isToday == false")
+            try checkApprox(decoded.core.activeMinutes, 20.0, tolerance: 0.1, "Archived day activeMinutes matches")
+
+            let badRes = DayHelmCLI.run(arguments: ["dayhelm", "stats", "--date", "not-a-date", "--store-dir", tmpDir.path], clock: clock)
+            try checkEqual(badRes?.exitCode, 1, "Invalid --date must exit 1")
+
+            let coordinator = await MainActor.run {
+                HybridActivityCoordinator(
+                    engine: engine,
+                    store: store,
+                    almaClient: nil,
+                    inspector: MockInspector(currentSample: ActivitySample(timestamp: clock.now(), appName: "Xcode", bundleId: "com.apple.dt.Xcode")),
+                    clock: clock,
+                    syntheticDemo: false
+                )
+            }
+            let availDates = await MainActor.run { coordinator.availableStatsDates() }
+            try checkEqual(availDates, ["2026-11-17", "2026-11-16"], "Coordinator availableStatsDates includes today + archives descending")
+            let coordReport = await MainActor.run { coordinator.loadDailyStats(for: "2026-11-17") }
+            try checkEqual(coordReport.baseline7d?.sampleDays, 1, "Coordinator report includes 7d baseline")
+            let coordPrompt = await MainActor.run { coordinator.buildAgentAnalysisPrompt(for: coordReport, preset: .dailyReview) }
+            try check(coordPrompt.contains(tmpDir.path), "Coordinator prompt builder embeds store directory")
         }
     }
 

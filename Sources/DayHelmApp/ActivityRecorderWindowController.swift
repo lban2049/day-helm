@@ -5,13 +5,14 @@ import SwiftUI
 
 enum ActivityRecorderSection: String, CaseIterable, Hashable {
     case tasks = "事项与配额"
+    case dailyStats = "每日统计"
     case jev = "Jev 识别"
     case capture = "活动采集"
     case privacyStorage = "隐私与存储"
     case history = "历史会话"
 
     var isSettingsSection: Bool {
-        self != .history
+        self != .history && self != .dailyStats
     }
 }
 
@@ -82,7 +83,7 @@ final class ActivityRecorderWindowController: NSObject, NSWindowDelegate, NSTool
             }
         } else {
             let created = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 920, height: 760),
+                contentRect: NSRect(x: 0, y: 0, width: 960, height: 780),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false
@@ -91,7 +92,7 @@ final class ActivityRecorderWindowController: NSObject, NSWindowDelegate, NSTool
             created.titleVisibility = .hidden
             created.titlebarAppearsTransparent = false
             created.toolbarStyle = .unified
-            created.minSize = NSSize(width: 760, height: 620)
+            created.minSize = NSSize(width: 820, height: 620)
             created.isReleasedWhenClosed = false
             created.delegate = self
             created.contentView = NSHostingView(

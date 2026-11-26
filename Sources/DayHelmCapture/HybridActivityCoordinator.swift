@@ -84,6 +84,7 @@ public final class HybridActivityCoordinator: ObservableObject {
     private var windowChangeObserver: AXWindowChangeObserver?
     private var settings: DayHelmSettings
     private var syntheticSessionDetails: [RecordedSessionDetail] = []
+    private var syntheticHistorySnapshots: [String: DayHelmDaySnapshot] = [:]
 
     public var enableLiveTimersForTesting: Bool = false
 
@@ -335,6 +336,7 @@ public final class HybridActivityCoordinator: ObservableObject {
 
         let demoDetails = Self.makeSyntheticSessionDetails(now: now)
         coordinator.syntheticSessionDetails = demoDetails
+        coordinator.syntheticHistorySnapshots = Self.makeSyntheticHistorySnapshots(now: now, budgets: budgets)
         coordinator.recentSessions = demoDetails.map(\.session)
         coordinator.recorderStats = RecorderStorageStats(
             totalSessions: demoDetails.count,
@@ -513,6 +515,162 @@ public final class HybridActivityCoordinator: ObservableObject {
         )
 
         return [d1, d2, d3]
+    }
+
+    // MARK: - Daily Stats & Local Agent Prompt
+
+    public var todayDateString: String {
+        engine.currentDateString
+    }
+
+    public func availableStatsDates() -> [String] {
+        var dates = Set<String>([todayDateString])
+        if isSyntheticDemo {
+            for key in syntheticHistorySnapshots.keys {
+                dates.insert(key)
+            }
+        } else if let store {
+            for key in store.listArchivedDayStrings() {
+                dates.insert(key)
+            }
+        }
+        return dates.sorted(by: >)
+    }
+
+    public func loadDailyStats(for dateString: String) -> DailyStatsReport {
+        let isToday = (dateString == todayDateString)
+        let liveSnap = isToday ? engine.snapshot(at: clock.now()) : nil
+
+        if isSyntheticDemo {
+            let syntheticTotals: DailyStatsAggregator.SyntheticRecorderTotals?
+            if isToday {
+                let clicks = syntheticSessionDetails.reduce(0) { $0 + $1.session.clickCount }
+                let keypresses = syntheticSessionDetails.reduce(0) { $0 + $1.session.keypressCount }
+                let meetings = syntheticSessionDetails.filter { $0.session.isMeeting }.count
+                let totalMs = syntheticSessionDetails.reduce(Int64(0)) { acc, detail in
+                    let dur = detail.session.durationMs ?? max(0, Int64(clock.now().timeIntervalSince1970 * 1000) - detail.session.startedAt)
+                    return acc + dur
+                }
+                syntheticTotals = DailyStatsAggregator.SyntheticRecorderTotals(
+                    sessions: syntheticSessionDetails.count,
+                    meetings: meetings,
+                    clicks: clicks,
+                    keypresses: keypresses,
+                    snapshots: todaySnapshotCount,
+                    ocrFrames: todayOCRCount,
+                    activeSessionMs: totalMs
+                )
+            } else {
+                syntheticTotals = nil
+            }
+            return DailyStatsAggregator.aggregate(
+                dateString: dateString,
+                liveSnapshot: liveSnap,
+                budgets: engine.budgets,
+                store: nil,
+                database: nil,
+                clock: clock,
+                includeBaseline: true,
+                syntheticTotals: syntheticTotals,
+                archivedSnapshots: syntheticHistorySnapshots
+            )
+        }
+
+        return DailyStatsAggregator.aggregate(
+            dateString: dateString,
+            liveSnapshot: liveSnap,
+            budgets: engine.budgets,
+            store: store,
+            database: database,
+            clock: clock,
+            includeBaseline: true
+        )
+    }
+
+    public func buildAgentAnalysisPrompt(
+        for report: DailyStatsReport,
+        preset: AgentAnalysisPromptPreset
+    ) -> String {
+        AgentAnalysisPromptBuilder.build(
+            report: report,
+            preset: preset,
+            storeDirectory: storeDirectoryURL
+        )
+    }
+
+    private static func makeSyntheticHistorySnapshots(
+        now: Date,
+        budgets: [TaskBudget]
+    ) -> [String: DayHelmDaySnapshot] {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = DayHelmDateFormatting.shanghaiTimeZone
+        let todayStart = cal.startOfDay(for: now)
+        var result: [String: DayHelmDaySnapshot] = [:]
+
+        for offset in 1...3 {
+            guard let dayStart = cal.date(byAdding: .day, value: -offset, to: todayStart) else { continue }
+            let dayStr = DayHelmDateFormatting.dayString(from: dayStart)
+            let workStart = dayStart.addingTimeInterval(9.5 * 3600)
+            let dur1 = TimeInterval((75 + offset * 15) * 60)
+            let dur2 = TimeInterval((30 + offset * 5) * 60)
+
+            let spans = [
+                EnrichedSpan(
+                    startedAt: workStart,
+                    endedAt: workStart.addingTimeInterval(dur1),
+                    appName: "Example Browser",
+                    bundleId: "com.example.browser",
+                    windowTitle: "Example Shop — 商品企划",
+                    url: "https://shop.example.com/product/100",
+                    declaredTaskId: "ecommerce",
+                    redacted: false,
+                    semanticGroup: "proj:ecommerce"
+                ),
+                EnrichedSpan(
+                    startedAt: workStart.addingTimeInterval(dur1 + 600),
+                    endedAt: workStart.addingTimeInterval(dur1 + 600 + dur2),
+                    appName: "Example Notes",
+                    bundleId: "com.example.notes",
+                    windowTitle: "Hermes Research Notes",
+                    url: nil,
+                    declaredTaskId: "hermes",
+                    redacted: false,
+                    semanticGroup: "proj:hermes"
+                )
+            ]
+            let sessions = [
+                FocusSessionRecord(id: "hist_s1_\(offset)", taskId: "ecommerce", startedAt: workStart, endedAt: workStart.addingTimeInterval(dur1), minutes: dur1 / 60.0),
+                FocusSessionRecord(id: "hist_s2_\(offset)", taskId: "hermes", startedAt: workStart.addingTimeInterval(dur1 + 600), endedAt: workStart.addingTimeInterval(dur1 + 600 + dur2), minutes: dur2 / 60.0)
+            ]
+            let built = SpectrumBuilder.build(
+                spans: spans,
+                focusSessions: sessions,
+                budgets: budgets,
+                now: workStart.addingTimeInterval(dur1 + 600 + dur2)
+            )
+            let budgetSnapshots = budgets.map { b in
+                let mins: Double
+                if b.taskId == "ecommerce" { mins = dur1 / 60.0 }
+                else if b.taskId == "hermes" { mins = dur2 / 60.0 }
+                else { mins = 0 }
+                return BudgetSnapshot(
+                    taskId: b.taskId,
+                    displayName: b.displayName,
+                    focusedMinutes: mins,
+                    targetMinutes: b.targetMinutes,
+                    capMinutes: b.capMinutes,
+                    status: BudgetStatusCode(from: BudgetStatus.compute(focusedMinutes: mins, targetMinutes: b.targetMinutes, capMinutes: b.capMinutes))
+                )
+            }
+            result[dayStr] = DayHelmDaySnapshot(
+                date: dayStr,
+                budgets: budgetSnapshots,
+                focusSessions: sessions,
+                enrichedSpans: spans,
+                metrics: built.metrics
+            )
+        }
+        return result
     }
 
     // MARK: - Lifecycle

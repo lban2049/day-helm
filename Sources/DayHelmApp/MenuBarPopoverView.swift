@@ -558,7 +558,7 @@ struct MenuBarPopoverView: View {
     // MARK: - 6. Footer
 
     private var footerSection: some View {
-        HStack(spacing: 5) {
+        HStack(spacing: 4) {
             Button {
                 coordinator.triggerDemoAlert()
             } label: {
@@ -569,7 +569,7 @@ struct MenuBarPopoverView: View {
                         .font(.system(size: 10, weight: .semibold))
                 }
                 .foregroundStyle(DayHelmColors.primaryBlue)
-                .padding(.horizontal, 7)
+                .padding(.horizontal, 6)
                 .padding(.vertical, 4)
                 .background(DayHelmColors.primaryBlue.opacity(0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
@@ -577,7 +577,7 @@ struct MenuBarPopoverView: View {
             .fixedSize(horizontal: true, vertical: false)
             .help("模拟触发监督提醒测试")
 
-            Spacer(minLength: 4)
+            Spacer(minLength: 2)
 
             Button {
                 openRecorderWindow(preferSettingsIfOnHistory: true)
@@ -589,7 +589,7 @@ struct MenuBarPopoverView: View {
                         .font(.system(size: 10, weight: .medium))
                 }
                 .foregroundStyle(.primary.opacity(0.85))
-                .padding(.horizontal, 6.5)
+                .padding(.horizontal, 5.5)
                 .padding(.vertical, 4)
                 .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 .overlay(
@@ -601,6 +601,28 @@ struct MenuBarPopoverView: View {
             .fixedSize(horizontal: true, vertical: false)
 
             Button {
+                openRecorderWindow(section: .dailyStats)
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "chart.bar.xaxis")
+                        .font(.system(size: 9.5, weight: .medium))
+                    Text("统计")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .foregroundStyle(.primary.opacity(0.85))
+                .padding(.horizontal, 5.5)
+                .padding(.vertical, 4)
+                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                )
+            }
+            .buttonStyle(.plain)
+            .fixedSize(horizontal: true, vertical: false)
+            .help("打开每日确定性统计报表")
+
+            Button {
                 openRecorderWindow(section: .history)
             } label: {
                 HStack(spacing: 3) {
@@ -610,7 +632,7 @@ struct MenuBarPopoverView: View {
                         .font(.system(size: 10, weight: .medium))
                 }
                 .foregroundStyle(.primary.opacity(0.85))
-                .padding(.horizontal, 6.5)
+                .padding(.horizontal, 5.5)
                 .padding(.vertical, 4)
                 .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 .overlay(
@@ -644,7 +666,7 @@ struct MenuBarPopoverView: View {
                 Text("退出")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.primary.opacity(0.78))
-                    .padding(.horizontal, 6.5)
+                    .padding(.horizontal, 5.5)
                     .padding(.vertical, 4)
                     .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                     .overlay(
