@@ -113,8 +113,8 @@ public enum DayHelmCLI {
                                                        Search window titles, URLs, sessions & OCR text
           dayhelm sessions [--date YYYY-MM-DD] [--id <session_id>] [--limit 50] [--format json|md] [--store-dir <path>]
                                                        List sessions or inspect full session details
-          dayhelm stats [--date YYYY-MM-DD] [--format json|md] [--json] [--store-dir <path>]
-                                                       Deterministic daily telemetry, allocation & switch stats
+          dayhelm stats [--date YYYY-MM-DD] [--rebuild] [--format json|md] [--json] [--store-dir <path>]
+                                                       Read persisted historical daily stats (defaults to latest historical day)
           dayhelm status [--format json|md] [--store-dir <path>]
                                                        Print today's budget & telemetry summary (--json alias for --format json)
           dayhelm purge [--before YYYY-MM-DD] [--store-dir <path>]
@@ -492,6 +492,7 @@ public enum DayHelmCLI {
 
     private static func runStats(args: [String], clock: any DayHelmClock) -> DayHelmCLIResult {
         var dateString: String?
+        var rebuild = false
         var format: DayHelmCLIFormat = .md
         var storeDirPath: String?
 
@@ -505,6 +506,9 @@ public enum DayHelmCLI {
                 }
                 dateString = args[i + 1]
                 i += 2
+            case "--rebuild":
+                rebuild = true
+                i += 1
             case "--json":
                 format = .json
                 i += 1
@@ -527,34 +531,82 @@ public enum DayHelmCLI {
             }
         }
 
-        let targetDate = dateString ?? DayHelmDateFormatting.dayString(from: clock.now())
+        let directory = resolveDirectory(storeDirPath)
+        let store = DayHelmStore(directory: directory)
+        let todayString = DayHelmDateFormatting.dayString(from: clock.now())
+
+        let database: ActivityDatabase? = FileManager.default.fileExists(atPath: store.databaseURL.path)
+            ? (try? ActivityDatabase(databaseURL: store.databaseURL))
+            : nil
+
+        let targetDate: String
+        if let dateString {
+            targetDate = dateString
+        } else {
+            let historicalDates = DailyStatsMaterializer.discoverHistoricalCandidateDates(
+                store: store,
+                database: database,
+                todayDateString: todayString
+            )
+            if let latest = historicalDates.first {
+                targetDate = latest
+            } else {
+                let yesterdayDate = startOfDay(for: clock.now()).addingTimeInterval(-86_400)
+                let yesterdayStr = DayHelmDateFormatting.dayString(from: yesterdayDate)
+                if format == .json {
+                    let emptyReport = DailyStatsAggregator.aggregate(
+                        dateString: yesterdayStr,
+                        liveSnapshot: nil,
+                        budgets: nil,
+                        store: nil,
+                        database: nil,
+                        clock: clock,
+                        includeBaseline: false
+                    )
+                    return encodeJSONResult(emptyReport)
+                }
+                return DayHelmCLIResult(
+                    exitCode: 0,
+                    stdout: "# DayHelm 每日统计\n\n暂无已归档的历史统计日期（系统会在次日自动生成前一天报表；如需查看指定日期含今天，请传入 `--date YYYY-MM-DD`）。\n"
+                )
+            }
+        }
+
         guard targetDate.count == 10,
               let parsedDate = DayHelmDateFormatting.parseDayString(targetDate),
               DayHelmDateFormatting.dayString(from: parsedDate) == targetDate else {
             return DayHelmCLIResult(exitCode: 1, stderr: "Error: Invalid date '\(targetDate)'. Expected YYYY-MM-DD.\n")
         }
 
-        let directory = resolveDirectory(storeDirPath)
-        let store = DayHelmStore(directory: directory)
         let budgets = storeDirPath == nil
             ? TimeAuditConfigLoader.loadBudgets()
             : TimeAuditConfigLoader.loadBudgets(
                 timeAuditDirectory: store.directory.appendingPathComponent("__none__", isDirectory: true),
                 dayhelmConfigURL: store.configURL
             )
-        let database: ActivityDatabase? = FileManager.default.fileExists(atPath: store.databaseURL.path)
-            ? (try? ActivityDatabase(databaseURL: store.databaseURL))
-            : nil
 
-        let report = DailyStatsAggregator.aggregate(
-            dateString: targetDate,
-            liveSnapshot: nil,
-            budgets: budgets,
-            store: store,
-            database: database,
-            clock: clock,
-            includeBaseline: true
-        )
+        let report: DailyStatsReport
+        if targetDate < todayString,
+           let materialized = DailyStatsMaterializer.loadOrMaterializeHistoricalStats(
+               dateString: targetDate,
+               store: store,
+               database: database,
+               budgets: budgets,
+               clock: clock,
+               forceRebuild: rebuild
+           ) {
+            report = materialized.report
+        } else {
+            report = DailyStatsAggregator.aggregate(
+                dateString: targetDate,
+                liveSnapshot: nil,
+                budgets: budgets,
+                store: store,
+                database: database,
+                clock: clock,
+                includeBaseline: true
+            )
+        }
 
         if format == .json {
             return encodeJSONResult(report)

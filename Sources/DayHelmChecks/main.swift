@@ -5266,6 +5266,7 @@ struct DayHelmChecksMain {
                 try check(prompt.contains(dayStr), "Prompt must include target date")
                 try check(prompt.contains(tmpDir.path), "Prompt must include local store directory path")
                 try check(prompt.contains("days/\(dayStr).json"), "Prompt must reference archived day JSON for historical date")
+                try check(prompt.contains("stats/\(dayStr).json"), "Prompt must reference precomputed stats JSON for historical date")
                 try check(prompt.contains("dayhelm stats --date \(dayStr)"), "Prompt must include dayhelm stats CLI command")
                 try check(prompt.contains("dayhelm sessions --date \(dayStr)"), "Prompt must include dayhelm sessions CLI command")
                 try check(prompt.contains("dayhelm search"), "Prompt must include dayhelm search CLI command")
@@ -5276,7 +5277,7 @@ struct DayHelmChecksMain {
             try check(draftPrompt.contains("日报") || draftPrompt.contains("产出"), "Work output draft preset includes daily report focus")
         }
 
-        try await runCheck("76. dayhelm stats CLI (md/json) & HybridActivityCoordinator stats integration") {
+        try await runCheck("76. dayhelm stats CLI (persisted cache, --rebuild, default latest historical day) & coordinator async stats") {
             let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-cli-stats-\(UUID().uuidString)")
             let store = DayHelmStore(directory: tmpDir)
             defer { try? FileManager.default.removeItem(at: tmpDir) }
@@ -5302,18 +5303,51 @@ struct DayHelmChecksMain {
 
             let helpRes = DayHelmCLI.run(arguments: ["dayhelm", "--help"], clock: clock)
             try check(helpRes?.stdout.contains("dayhelm stats") == true, "--help must document dayhelm stats")
+            try check(helpRes?.stdout.contains("--rebuild") == true, "--help must document --rebuild")
 
+            // Default (no --date) picks latest historical day (2026-11-16) and materializes stats/2026-11-16.json
+            let defaultRes = DayHelmCLI.run(arguments: ["dayhelm", "stats", "--json", "--store-dir", tmpDir.path], clock: clock)
+            try checkEqual(defaultRes?.exitCode, 0, "dayhelm stats without --date exits 0")
+            let defaultDecoded = try DayHelmDateFormatting.makeDecoder().decode(DailyStatsReport.self, from: Data((defaultRes?.stdout ?? "").utf8))
+            try checkEqual(defaultDecoded.date, archDate, "Default stats selects latest historical date (not today)")
+            try check(!defaultDecoded.isToday, "Default historical report has isToday == false")
+            try check(store.hasDailyStats(dateString: archDate), "Historical stats query persists stats/YYYY-MM-DD.json")
+
+            // Explicit --date for today still works on demand without writing stats/today.json
             let mdRes = DayHelmCLI.run(arguments: ["dayhelm", "stats", "--date", "2026-11-17", "--store-dir", tmpDir.path], clock: clock)
-            try checkEqual(mdRes?.exitCode, 0, "dayhelm stats md exits 0")
-            try check(mdRes?.stdout.contains("2026-11-17") == true, "md output contains date")
+            try checkEqual(mdRes?.exitCode, 0, "dayhelm stats --date today exits 0")
+            try check(mdRes?.stdout.contains("2026-11-17") == true, "md output contains explicit date")
             try check(mdRes?.stdout.contains("example.com") == true, "md output contains normalized top site")
+            try check(!store.hasDailyStats(dateString: "2026-11-17"), "Today must never be persisted into stats/")
 
-            let jsonRes = DayHelmCLI.run(arguments: ["dayhelm", "stats", "--date", archDate, "--json", "--store-dir", tmpDir.path], clock: clock)
-            try checkEqual(jsonRes?.exitCode, 0, "dayhelm stats --json exits 0")
-            let decoded = try DayHelmDateFormatting.makeDecoder().decode(DailyStatsReport.self, from: Data((jsonRes?.stdout ?? "").utf8))
-            try checkEqual(decoded.date, archDate, "JSON report date matches archived day")
-            try check(!decoded.isToday, "Archived day has isToday == false")
-            try checkApprox(decoded.core.activeMinutes, 20.0, tolerance: 0.1, "Archived day activeMinutes matches")
+            // Verify CLI reads persisted stats/2026-11-16.json directly without re-aggregating
+            let sentinelReport = DailyStatsReport(
+                date: archDate,
+                isToday: false,
+                hasData: true,
+                firstActiveAt: archStart,
+                lastActiveAt: archStart.addingTimeInterval(1200),
+                spanMinutes: 20,
+                core: DailyStatsCoreMetrics(activeMinutes: 77.0, medianBlockMinutes: 20, longestBlockMinutes: 20, solidBlocksCount: 1, crossTaskSwitchCount: 0, switchesPerHour: 0, thrashingMinutes: 0, thrashingSegmentCount: 0, clickCount: 5, keypressCount: 9, inputEventsPerMinute: 0.7, sessionCount: 1, meetingCount: 0, snapshotCount: 0, ocrFrameCount: 0),
+                baseline7d: nil,
+                spectrumSegments: [],
+                budgets: [],
+                activityModes: [],
+                topApps: [],
+                topSites: [],
+                hourlyRhythm: [],
+                dwellBuckets: [],
+                topTransitions: []
+            )
+            try store.saveDailyStats(sentinelReport)
+            let cachedCliRes = DayHelmCLI.run(arguments: ["dayhelm", "stats", "--date", archDate, "--json", "--store-dir", tmpDir.path], clock: clock)
+            let cachedDecoded = try DayHelmDateFormatting.makeDecoder().decode(DailyStatsReport.self, from: Data((cachedCliRes?.stdout ?? "").utf8))
+            try checkApprox(cachedDecoded.core.activeMinutes, 77.0, tolerance: 0.01, "CLI must read persisted stats/YYYY-MM-DD.json without re-aggregating")
+
+            // --rebuild recomputes from archive and overwrites persisted stats
+            let rebuildRes = DayHelmCLI.run(arguments: ["dayhelm", "stats", "--date", archDate, "--rebuild", "--json", "--store-dir", tmpDir.path], clock: clock)
+            let rebuiltDecoded = try DayHelmDateFormatting.makeDecoder().decode(DailyStatsReport.self, from: Data((rebuildRes?.stdout ?? "").utf8))
+            try checkApprox(rebuiltDecoded.core.activeMinutes, 20.0, tolerance: 0.1, "--rebuild must recompute and overwrite persisted stats")
 
             let badRes = DayHelmCLI.run(arguments: ["dayhelm", "stats", "--date", "not-a-date", "--store-dir", tmpDir.path], clock: clock)
             try checkEqual(badRes?.exitCode, 1, "Invalid --date must exit 1")
@@ -5329,11 +5363,155 @@ struct DayHelmChecksMain {
                 )
             }
             let availDates = await MainActor.run { coordinator.availableStatsDates() }
-            try checkEqual(availDates, ["2026-11-17", "2026-11-16"], "Coordinator availableStatsDates includes today + archives descending")
-            let coordReport = await MainActor.run { coordinator.loadDailyStats(for: "2026-11-17") }
-            try checkEqual(coordReport.baseline7d?.sampleDays, 1, "Coordinator report includes 7d baseline")
-            let coordPrompt = await MainActor.run { coordinator.buildAgentAnalysisPrompt(for: coordReport, preset: .dailyReview) }
-            try check(coordPrompt.contains(tmpDir.path), "Coordinator prompt builder embeds store directory")
+            try checkEqual(availDates, ["2026-11-16"], "Coordinator availableStatsDates excludes today and lists historical dates descending")
+            let todayRefused = await coordinator.loadHistoricalDailyStats(for: "2026-11-17")
+            try check(todayRefused == nil, "Coordinator loadHistoricalDailyStats must refuse today")
+            let coordReport = await coordinator.loadHistoricalDailyStats(for: "2026-11-16")
+            try checkEqual(coordReport?.date, "2026-11-16", "Coordinator loads historical report asynchronously")
+            if let coordReport {
+                let coordPrompt = await MainActor.run { coordinator.buildAgentAnalysisPrompt(for: coordReport, preset: .dailyReview) }
+                try check(coordPrompt.contains(tmpDir.path), "Coordinator prompt builder embeds store directory")
+                try check(coordPrompt.contains("stats/2026-11-16.json"), "Coordinator prompt references persisted stats JSON")
+            }
+        }
+
+        try await runCheck("77. DayHelmStore stats persistence, purge scope & DailyStatsMaterializer idempotency") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-mat-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let today = "2026-11-17"
+            let t0 = DayHelmDateFormatting.parseISO8601("2026-11-17T10:00:00+08:00")!
+            let clock = ManualClock(now: t0)
+
+            // Seed 2 historical archived days (11-15, 11-16) and today (11-17 in today.json AND wrongly in days/ to prove strict < today filtering)
+            for (dStr, mins) in [("2026-11-15", 45.0), ("2026-11-16", 90.0), (today, 15.0)] {
+                let dStart = DayHelmDateFormatting.parseDayString(dStr)!.addingTimeInterval(9 * 3600)
+                let snap = DayHelmDaySnapshot(
+                    date: dStr,
+                    budgets: [],
+                    focusSessions: [],
+                    enrichedSpans: [EnrichedSpan(
+                        startedAt: dStart,
+                        endedAt: dStart.addingTimeInterval(mins * 60),
+                        appName: "Google Chrome",
+                        bundleId: "com.google.Chrome",
+                        windowTitle: "Secret Bank",
+                        url: "https://secret.bank.local/account",
+                        declaredTaskId: nil,
+                        redacted: true
+                    )],
+                    metrics: DayMetrics(activeMinutes: mins, longestBlockMinutes: mins, solidBlocksCount: 1, recentSwitchesPerHour: 0)
+                )
+                if dStr == today {
+                    try store.saveToday(snap)
+                }
+                try store.archiveDay(snap)
+            }
+
+            // Also seed SQLite-only historical date (2026-11-14)
+            let db = try ActivityDatabase(databaseURL: store.databaseURL)
+            let d14Ms = Int64(DayHelmDateFormatting.parseISO8601("2026-11-14T11:00:00+08:00")!.timeIntervalSince1970 * 1000)
+            try db.startSession(id: "sess_14", startedAtMs: d14Ms, triggerKind: "app_focus", appNames: ["Xcode"])
+            try db.closeSession(sessionId: "sess_14", endedAtMs: d14Ms + 1_800_000)
+
+            let firstPass = DailyStatsMaterializer.materializeMissingHistoricalStats(
+                store: store,
+                database: db,
+                budgets: sampleBudgets(),
+                clock: clock
+            )
+            try checkEqual(firstPass.generatedDates.sorted(), ["2026-11-14", "2026-11-15", "2026-11-16"], "Materializer generates stats for < today from days/ and SQLite")
+            try check(firstPass.skippedTodayOrFutureDates.contains(today), "Materializer strictly skips today")
+            try check(!store.hasDailyStats(dateString: today), "Today stats file must not exist")
+            try checkEqual(store.listMaterializedStatsDayStrings(), ["2026-11-16", "2026-11-15", "2026-11-14"], "Materialized dates sorted descending")
+
+            // Privacy isolation check on persisted stats JSON
+            let persisted16 = try store.loadDailyStats(dateString: "2026-11-16")!
+            try check(persisted16.topSites.isEmpty, "Redacted span must not leak site host into persisted stats JSON")
+
+            // Idempotency: overwrite 2026-11-15 with marker activeMinutes=123 and run materializer again; must skip existing!
+            let marker = DailyStatsReport(
+                date: "2026-11-15",
+                isToday: false,
+                hasData: true,
+                firstActiveAt: nil,
+                lastActiveAt: nil,
+                spanMinutes: 0,
+                core: DailyStatsCoreMetrics(activeMinutes: 123, medianBlockMinutes: 0, longestBlockMinutes: 0, solidBlocksCount: 0, crossTaskSwitchCount: 0, switchesPerHour: 0, thrashingMinutes: 0, thrashingSegmentCount: 0, clickCount: 0, keypressCount: 0, inputEventsPerMinute: 0, sessionCount: 0, meetingCount: 0, snapshotCount: 0, ocrFrameCount: 0),
+                baseline7d: nil,
+                spectrumSegments: [],
+                budgets: [],
+                activityModes: [],
+                topApps: [],
+                topSites: [],
+                hourlyRhythm: [],
+                dwellBuckets: [],
+                topTransitions: []
+            )
+            try store.saveDailyStats(marker)
+            let secondPass = DailyStatsMaterializer.materializeMissingHistoricalStats(
+                store: store,
+                database: db,
+                budgets: sampleBudgets(),
+                clock: clock
+            )
+            try check(secondPass.generatedDates.isEmpty, "Second materializer pass must be idempotent")
+            try checkEqual(secondPass.skippedExistingDates.sorted(), ["2026-11-14", "2026-11-15", "2026-11-16"], "Existing stats files skipped without re-aggregation")
+            try checkApprox((try store.loadDailyStats(dateString: "2026-11-15"))?.core.activeMinutes ?? 0, 123.0, tolerance: 0.01, "Existing stats file not overwritten")
+
+            // Partial purge removes stats < cutoff, full purge removes stats/ completely
+            let partial = try store.purge(before: DayHelmDateFormatting.parseDayString("2026-11-15")!)
+            try check(partial.deletedFiles >= 1, "Partial purge removes 2026-11-14 stats & sessions")
+            try check(!store.hasDailyStats(dateString: "2026-11-14"), "2026-11-14 stats removed by partial purge")
+            try check(store.hasDailyStats(dateString: "2026-11-15"), "2026-11-15 stats preserved by partial purge")
+
+            _ = try store.purge(before: nil)
+            try check(!FileManager.default.fileExists(atPath: store.statsDirectory.path), "Full purge removes stats directory")
+        }
+
+        try await runCheck("78. Coordinator startup & rollover background materialization + synthetic demo historical stats") {
+            let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("dayhelm-chk-coord-mat-\(UUID().uuidString)")
+            let store = DayHelmStore(directory: tmpDir)
+            defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+            let t0 = DayHelmDateFormatting.parseISO8601("2026-11-17T23:59:50+08:00")!
+            let clock = ManualClock(now: t0)
+            let budgets = sampleBudgets()
+            let engine = DayHelmEngine(budgets: budgets, clock: clock)
+            engine.startFocus(taskId: "ecommerce", at: t0.addingTimeInterval(-1200))
+            engine.ingest(ActivitySample(timestamp: t0.addingTimeInterval(-30), appName: "Xcode", bundleId: "com.apple.dt.Xcode", windowTitle: "App.swift", idleSeconds: 0))
+
+            let coordinator = await MainActor.run {
+                HybridActivityCoordinator(
+                    engine: engine,
+                    store: store,
+                    almaClient: nil,
+                    inspector: MockInspector(currentSample: ActivitySample(timestamp: t0, appName: "Xcode", bundleId: "com.apple.dt.Xcode", windowTitle: "App.swift", idleSeconds: 0)),
+                    clock: clock,
+                    syntheticDemo: false
+                )
+            }
+
+            // Simulate midnight rollover to 2026-11-18
+            clock.advance(by: 20)
+            await MainActor.run {
+                coordinator.pollOnce()
+            }
+            try await waitUntil("Rollover materializes 2026-11-17 stats in background") {
+                store.hasDailyStats(dateString: "2026-11-17")
+            }
+            let availAfterRollover = await coordinator.refreshAvailableHistoricalDatesAsync()
+            try check(availAfterRollover.contains("2026-11-17"), "Available historical dates updated after rollover")
+            try check(!availAfterRollover.contains("2026-11-18"), "New today must not be in available historical dates")
+
+            // Synthetic demo provides precomputed historical reports (no today)
+            let demo = await MainActor.run { HybridActivityCoordinator.makeSyntheticDemo(clock: ManualClock(now: t0)) }
+            let demoDates = await MainActor.run { demo.availableStatsDates() }
+            try check(!demoDates.isEmpty, "Synthetic demo has precomputed historical dates")
+            try check(!demoDates.contains("2026-11-17"), "Synthetic demo historical dates exclude today")
+            let demoReport = await demo.loadHistoricalDailyStats(for: demoDates[0])
+            try check(demoReport != nil && demoReport?.hasData == true, "Synthetic demo historical report loads immediately with data")
         }
     }
 

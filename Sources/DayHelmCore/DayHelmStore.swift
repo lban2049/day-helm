@@ -317,6 +317,10 @@ public final class DayHelmStore: @unchecked Sendable {
         directory.appendingPathComponent("days", isDirectory: true)
     }
 
+    public var statsDirectory: URL {
+        directory.appendingPathComponent("stats", isDirectory: true)
+    }
+
     public var snapshotsDirectory: URL {
         directory.appendingPathComponent("snapshots", isDirectory: true)
     }
@@ -373,9 +377,49 @@ public final class DayHelmStore: @unchecked Sendable {
 
     /// Lists valid `YYYY-MM-DD` archived day strings under `days/`, sorted descending.
     public func listArchivedDayStrings() -> [String] {
-        guard fileManager.fileExists(atPath: daysDirectory.path),
+        listDayStrings(in: daysDirectory)
+    }
+
+    public func statsFileURL(for dateString: String) -> URL {
+        statsDirectory.appendingPathComponent("\(dateString).json")
+    }
+
+    public func hasDailyStats(dateString: String) -> Bool {
+        guard isValidDayString(dateString) else { return false }
+        return fileManager.fileExists(atPath: statsFileURL(for: dateString).path)
+    }
+
+    public func saveDailyStats(_ report: DailyStatsReport) throws {
+        try ensureDirectory(statsDirectory)
+        let targetURL = statsFileURL(for: report.date)
+        let tmpURL = statsDirectory.appendingPathComponent("\(report.date).json.\(UUID().uuidString).tmp")
+        let data = try encoder.encode(report)
+        try writeAtomically(data: data, to: targetURL, tempURL: tmpURL)
+    }
+
+    public func loadDailyStats(dateString: String) throws -> DailyStatsReport? {
+        let url = statsFileURL(for: dateString)
+        guard fileManager.fileExists(atPath: url.path) else {
+            return nil
+        }
+        let data = try Data(contentsOf: url)
+        return try decoder.decode(DailyStatsReport.self, from: data)
+    }
+
+    /// Lists valid `YYYY-MM-DD` precomputed daily stats strings under `stats/`, sorted descending.
+    public func listMaterializedStatsDayStrings() -> [String] {
+        listDayStrings(in: statsDirectory)
+    }
+
+    private func isValidDayString(_ stem: String) -> Bool {
+        stem.count == 10
+            && DayHelmDateFormatting.parseDayString(stem).map { DayHelmDateFormatting.dayString(from: $0) == stem } == true
+    }
+
+    private func listDayStrings(in dir: URL) -> [String] {
+        guard fileManager.fileExists(atPath: dir.path),
               let items = try? fileManager.contentsOfDirectory(
-                  at: daysDirectory,
+                  at: dir,
                   includingPropertiesForKeys: [.isRegularFileKey],
                   options: [.skipsHiddenFiles]
               ) else {
@@ -384,11 +428,7 @@ public final class DayHelmStore: @unchecked Sendable {
         var dates: [String] = []
         for item in items where item.pathExtension.lowercased() == "json" {
             let stem = item.deletingPathExtension().lastPathComponent
-            guard stem.count == 10,
-                  let parsed = DayHelmDateFormatting.parseDayString(stem),
-                  DayHelmDateFormatting.dayString(from: parsed) == stem else {
-                continue
-            }
+            guard isValidDayString(stem) else { continue }
             dates.append(stem)
         }
         return dates.sorted(by: >)
@@ -553,8 +593,8 @@ public final class DayHelmStore: @unchecked Sendable {
         if let cutoffDate {
             let cutoffDay = DayHelmDateFormatting.dayString(from: cutoffDate)
 
-            if fileManager.fileExists(atPath: daysDirectory.path) {
-                let items = try fileManager.contentsOfDirectory(at: daysDirectory, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey])
+            for dir in [daysDirectory, statsDirectory] where fileManager.fileExists(atPath: dir.path) {
+                let items = try fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey])
                 for item in items where item.pathExtension == "json" {
                     let stem = item.deletingPathExtension().lastPathComponent
                     if stem < cutoffDay {
@@ -614,7 +654,7 @@ public final class DayHelmStore: @unchecked Sendable {
             }
         }
 
-        for subDir in [daysDirectory, snapshotsDirectory] where fileManager.fileExists(atPath: subDir.path) {
+        for subDir in [daysDirectory, statsDirectory, snapshotsDirectory] where fileManager.fileExists(atPath: subDir.path) {
             try? fileManager.removeItem(at: subDir)
         }
 

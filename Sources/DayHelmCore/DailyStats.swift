@@ -983,17 +983,22 @@ public enum DailyStatsAggregator {
         archivedSnapshots: [String: DayHelmDaySnapshot]?
     ) -> DailyStatsBaseline7d? {
         let snapshotMap: [String: DayHelmDaySnapshot] = archivedSnapshots ?? [:]
-        var candidateDates: [String] = []
+        var candidateSet = Set<String>()
 
         if let store {
-            candidateDates.append(contentsOf: store.listArchivedDayStrings().filter { $0 < dateString })
-        }
-        if let archivedSnapshots {
-            for key in archivedSnapshots.keys where key < dateString && !candidateDates.contains(key) {
-                candidateDates.append(key)
+            for day in store.listMaterializedStatsDayStrings() where day < dateString {
+                candidateSet.insert(day)
+            }
+            for day in store.listArchivedDayStrings() where day < dateString {
+                candidateSet.insert(day)
             }
         }
-        candidateDates = Array(candidateDates.sorted(by: >).prefix(7))
+        if let archivedSnapshots {
+            for key in archivedSnapshots.keys where key < dateString {
+                candidateSet.insert(key)
+            }
+        }
+        let candidateDates = Array(candidateSet.sorted(by: >).prefix(7))
         guard !candidateDates.isEmpty else { return nil }
 
         var sumActive = 0.0
@@ -1006,17 +1011,33 @@ public enum DailyStatsAggregator {
         var count = 0
 
         for day in candidateDates {
-            let archSnap = snapshotMap[day] ?? (try? store?.loadDay(dateString: day))
-            guard let archSnap else { continue }
-            let report = aggregate(
-                dateString: day,
-                liveSnapshot: archSnap,
-                budgets: budgets,
-                store: nil,
-                database: nil,
-                clock: clock,
-                includeBaseline: false
-            )
+            let report: DailyStatsReport?
+            if let archSnap = snapshotMap[day] {
+                report = aggregate(
+                    dateString: day,
+                    liveSnapshot: archSnap,
+                    budgets: budgets,
+                    store: nil,
+                    database: nil,
+                    clock: clock,
+                    includeBaseline: false
+                )
+            } else if let persisted = try? store?.loadDailyStats(dateString: day) {
+                report = persisted
+            } else if let archSnap = try? store?.loadDay(dateString: day) {
+                report = aggregate(
+                    dateString: day,
+                    liveSnapshot: archSnap,
+                    budgets: budgets,
+                    store: nil,
+                    database: nil,
+                    clock: clock,
+                    includeBaseline: false
+                )
+            } else {
+                report = nil
+            }
+            guard let report else { continue }
             sumActive += report.core.activeMinutes
             sumMedian += report.core.medianBlockMinutes
             sumLongest += report.core.longestBlockMinutes
@@ -1336,6 +1357,150 @@ public enum DailyStatsMarkdownRenderer {
     }
 }
 
+// MARK: - Historical Materializer
+
+public struct DailyStatsMaterializationResult: Sendable, Equatable {
+    public let todayDateString: String
+    public let candidateDates: [String]
+    public let generatedDates: [String]
+    public let skippedExistingDates: [String]
+    public let skippedTodayOrFutureDates: [String]
+
+    public init(
+        todayDateString: String,
+        candidateDates: [String],
+        generatedDates: [String],
+        skippedExistingDates: [String],
+        skippedTodayOrFutureDates: [String]
+    ) {
+        self.todayDateString = todayDateString
+        self.candidateDates = candidateDates
+        self.generatedDates = generatedDates
+        self.skippedExistingDates = skippedExistingDates
+        self.skippedTodayOrFutureDates = skippedTodayOrFutureDates
+    }
+}
+
+public enum DailyStatsMaterializer {
+    /// Discovers all distinct historical dates (`< todayDateString`) from persisted `stats/`,
+    /// archived `days/`, and SQLite `activity_sessions`, sorted descending (newest first).
+    public static func discoverHistoricalCandidateDates(
+        store: DayHelmStore,
+        database: ActivityDatabase?,
+        todayDateString: String
+    ) -> [String] {
+        var dates = Set<String>()
+        for d in store.listMaterializedStatsDayStrings() where d < todayDateString {
+            dates.insert(d)
+        }
+        for d in store.listArchivedDayStrings() where d < todayDateString {
+            dates.insert(d)
+        }
+        if let dbDates = try? database?.listSessionDayStrings() {
+            for d in dbDates where d < todayDateString {
+                dates.insert(d)
+            }
+        }
+        return dates.sorted(by: >)
+    }
+
+    /// Materializes `stats/YYYY-MM-DD.json` for all missing historical dates (`< todayDateString`).
+    /// Strictly skips `todayDateString` and future dates, and is idempotent for existing stats files unless `forceRebuild` is true.
+    @discardableResult
+    public static func materializeMissingHistoricalStats(
+        store: DayHelmStore,
+        database: ActivityDatabase?,
+        budgets: [TaskBudget]? = nil,
+        clock: any DayHelmClock = SystemClock(),
+        forceRebuild: Bool = false
+    ) -> DailyStatsMaterializationResult {
+        let todayStr = DayHelmDateFormatting.dayString(from: clock.now())
+        var rawDates = Set<String>(store.listArchivedDayStrings())
+        if let dbDates = try? database?.listSessionDayStrings() {
+            for d in dbDates {
+                rawDates.insert(d)
+            }
+        }
+
+        let skippedTodayOrFuture = rawDates.filter { $0 >= todayStr }.sorted()
+        // Process ascending so earlier days populate `stats/` before later days compute `baseline7d`.
+        let candidateDates = rawDates.filter { $0 < todayStr }.sorted()
+
+        var generated: [String] = []
+        var skippedExisting: [String] = []
+
+        for date in candidateDates {
+            if !forceRebuild, (try? store.loadDailyStats(dateString: date)) != nil {
+                skippedExisting.append(date)
+                continue
+            }
+
+            let report = DailyStatsAggregator.aggregate(
+                dateString: date,
+                liveSnapshot: nil,
+                budgets: budgets,
+                store: store,
+                database: database,
+                clock: clock,
+                includeBaseline: true
+            )
+            do {
+                try store.saveDailyStats(report)
+                generated.append(date)
+            } catch {
+                // Keep batch resilient on single-day write error.
+            }
+        }
+
+        return DailyStatsMaterializationResult(
+            todayDateString: todayStr,
+            candidateDates: candidateDates,
+            generatedDates: generated,
+            skippedExistingDates: skippedExisting,
+            skippedTodayOrFutureDates: skippedTodayOrFuture
+        )
+    }
+
+    /// Loads a historical (`< todayDateString`) precomputed report from `stats/YYYY-MM-DD.json` without re-aggregating.
+    /// If missing (or `forceRebuild == true`), aggregates and persists it when data or an archived snapshot exists.
+    /// Returns `nil` for today or future dates.
+    public static func loadOrMaterializeHistoricalStats(
+        dateString: String,
+        store: DayHelmStore,
+        database: ActivityDatabase?,
+        budgets: [TaskBudget]? = nil,
+        clock: any DayHelmClock = SystemClock(),
+        forceRebuild: Bool = false
+    ) -> (report: DailyStatsReport, loadedFromCache: Bool)? {
+        let todayStr = DayHelmDateFormatting.dayString(from: clock.now())
+        guard dateString.count == 10,
+              let parsed = DayHelmDateFormatting.parseDayString(dateString),
+              DayHelmDateFormatting.dayString(from: parsed) == dateString,
+              dateString < todayStr else {
+            return nil
+        }
+
+        if !forceRebuild, let cached = try? store.loadDailyStats(dateString: dateString) {
+            return (cached, true)
+        }
+
+        let report = DailyStatsAggregator.aggregate(
+            dateString: dateString,
+            liveSnapshot: nil,
+            budgets: budgets,
+            store: store,
+            database: database,
+            clock: clock,
+            includeBaseline: true
+        )
+        let hasArchive = (try? store.loadDay(dateString: dateString)) != nil
+        if report.hasData || hasArchive || forceRebuild {
+            try? store.saveDailyStats(report)
+        }
+        return (report, false)
+    }
+}
+
 // MARK: - Local Agent Analysis Prompt Builder
 
 public enum AgentAnalysisPromptBuilder {
@@ -1345,6 +1510,7 @@ public enum AgentAnalysisPromptBuilder {
         storeDirectory: URL = DayHelmStore.defaultDirectory
     ) -> String {
         let storePath = storeDirectory.path
+        let statsFullPath = storeDirectory.appendingPathComponent("stats/\(report.date).json").path
         let snapshotRelative = report.isToday ? "today.json" : "days/\(report.date).json"
         let snapshotFullPath = storeDirectory.appendingPathComponent(snapshotRelative).path
         let sqlitePath = storeDirectory.appendingPathComponent("activity.sqlite").path
@@ -1376,6 +1542,8 @@ public enum AgentAnalysisPromptBuilder {
             """
         }
 
+        let statsFileLine = report.isToday ? "" : "- **预计算日统计报表**（只读）：`\(statsFullPath)`\n"
+
         return """
         你现在作为我的本地个人工作分析助手，基于本机 DayHelm（日舵）采集的客观活动数据进行\(preset.title)。
 
@@ -1383,7 +1551,7 @@ public enum AgentAnalysisPromptBuilder {
 
         ## 本地数据源与只读下钻方式
         - **数据目录**：`\(storePath)`
-        - **当日快照文件**（只读）：`\(snapshotFullPath)`（包含 `budgets`、`focusSessions`、`enrichedSpans`、`metrics`）
+        \(statsFileLine)- **当日快照文件**（只读）：`\(snapshotFullPath)`（包含 `budgets`、`focusSessions`、`enrichedSpans`、`metrics`）
         - **本地 SQLite 数据库**（只读）：`\(sqlitePath)`
 
         推荐先运行以下 CLI 命令获取结构化上下文：
@@ -1399,7 +1567,7 @@ public enum AgentAnalysisPromptBuilder {
         ```
 
         ## 只读与隐私脱敏护栏（必须遵守）
-        1. **严格只读**：严禁修改、覆盖或删除 `\(storePath)` 下的任何文件（包括 `activity.sqlite`、`today.json`、`days/*.json`、`config.json`、`jev.key`）；查询 SQLite 必须使用 `-readonly` 且只执行 `SELECT`。
+        1. **严格只读**：严禁修改、覆盖或删除 `\(storePath)` 下的任何文件（包括 `activity.sqlite`、`today.json`、`days/*.json`、`stats/*.json`、`config.json`、`jev.key`）；查询 SQLite 必须使用 `-readonly` 且只执行 `SELECT`。
         2. **隐私边界**：命中脱敏规则（`redacted = true`）的记录仅保留应用名，绝不尝试猜测、反推或索要被脱敏的标题、URL 或密码/私密对话内容；若在数据中遇到掩码凭据（`***`），直接忽略并保持脱敏。
         3. **客观陈述**：所有时长、切换与产出结论必须严格引用观测到的会话/事件事实，不得虚构工作成果或给出主观“生产力打分”。
 

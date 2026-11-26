@@ -15,6 +15,8 @@ struct DailyStatsView: View {
     @State private var selectedDate: String = ""
     @State private var availableDates: [String] = []
     @State private var report: DailyStatsReport?
+    @State private var isLoadingReport: Bool = false
+    @State private var loadTask: Task<Void, Never>?
     @State private var rankingTab: TopRankingTab = .apps
     @State private var promptPreset: AgentAnalysisPromptPreset = .dailyReview
     @State private var isPromptExpanded: Bool = false
@@ -40,9 +42,12 @@ struct DailyStatsView: View {
                             habitsDualCards(report: report)
                         }
                         agentPromptCard(report: report)
+                    } else if isLoadingReport || coordinator.isMaterializingHistoricalStats {
+                        generatingPlaceholderCard
+                    } else if availableDates.isEmpty {
+                        noHistoryYetCard
                     } else {
-                        ProgressView("正在聚合日统计...")
-                            .frame(maxWidth: .infinity, minHeight: 200)
+                        generatingPlaceholderCard
                     }
                 }
                 .frame(maxWidth: 900, alignment: .leading)
@@ -52,23 +57,36 @@ struct DailyStatsView: View {
             }
         }
         .onAppear {
-            reloadDatesAndReport(resetToTodayIfEmpty: true)
+            loadDatesAndReport(resetToLatestIfNeeded: true)
+        }
+        .onDisappear {
+            loadTask?.cancel()
+            loadTask = nil
         }
         .onChange(of: refreshNonce) { _, _ in
-            reloadDatesAndReport(resetToTodayIfEmpty: false)
+            loadDatesAndReport(resetToLatestIfNeeded: false)
+        }
+        .onChange(of: coordinator.historicalStatsRevision) { _, _ in
+            loadDatesAndReport(resetToLatestIfNeeded: selectedDate.isEmpty)
         }
         .onChange(of: selectedDate) { _, newDate in
-            guard !newDate.isEmpty else { return }
+            guard !newDate.isEmpty else {
+                report = nil
+                return
+            }
             hoveredHour = nil
             hoveredSegmentId = nil
-            report = coordinator.loadDailyStats(for: newDate)
+            loadReport(for: newDate, forceRebuild: false)
         }
     }
 
     // MARK: - 1. Date Navigation Bar
 
     private var dateNavigationBar: some View {
-        HStack(spacing: 10) {
+        let latestHistorical = availableDates.first
+        let yesterdayString = yesterdayDateString
+
+        return HStack(spacing: 10) {
             HStack(spacing: 4) {
                 Button {
                     stepDate(older: true)
@@ -93,7 +111,7 @@ struct DailyStatsView: View {
                             selectedDate = date
                         } label: {
                             HStack {
-                                Text(date == coordinator.todayDateString ? "\(date)（今天）" : date)
+                                Text(date == yesterdayString ? "\(date)（昨天）" : date)
                                 if date == selectedDate {
                                     Image(systemName: "checkmark")
                                 }
@@ -105,11 +123,11 @@ struct DailyStatsView: View {
                         Image(systemName: "calendar")
                             .font(.system(size: 11))
                             .foregroundStyle(DayHelmColors.primaryBlue)
-                        Text(selectedDate.isEmpty ? coordinator.todayDateString : selectedDate)
+                        Text(selectedDate.isEmpty ? "暂无历史报表" : selectedDate)
                             .font(.system(size: 12, weight: .semibold, design: .monospaced))
                             .monospacedDigit()
-                        if selectedDate == coordinator.todayDateString {
-                            Text("今天")
+                        if !selectedDate.isEmpty && selectedDate == yesterdayString {
+                            Text("昨天")
                                 .font(.system(size: 9.5, weight: .semibold))
                                 .foregroundStyle(DayHelmColors.primaryBlue)
                                 .padding(.horizontal, 5)
@@ -130,6 +148,7 @@ struct DailyStatsView: View {
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
+                .disabled(availableDates.isEmpty)
 
                 Button {
                     stepDate(older: false)
@@ -148,11 +167,11 @@ struct DailyStatsView: View {
                 .disabled(!canStepNewer)
                 .opacity(canStepNewer ? 1.0 : 0.4)
 
-                if selectedDate != coordinator.todayDateString {
+                if let latestHistorical, !selectedDate.isEmpty, selectedDate != latestHistorical {
                     Button {
-                        selectedDate = coordinator.todayDateString
+                        selectedDate = latestHistorical
                     } label: {
-                        Text("回到今天")
+                        Text("最新一天")
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(DayHelmColors.primaryBlue)
                             .padding(.horizontal, 8)
@@ -161,9 +180,37 @@ struct DailyStatsView: View {
                     }
                     .buttonStyle(.plain)
                 }
+
+                if !selectedDate.isEmpty && !coordinator.isSyntheticDemo {
+                    Button {
+                        loadReport(for: selectedDate, forceRebuild: true)
+                    } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(6)
+                            .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isLoadingReport)
+                    .opacity(isLoadingReport ? 0.45 : 1.0)
+                    .help("在后台重新计算并更新 \(selectedDate) 的持久化统计报表")
+                }
             }
 
-            if let report, let first = report.firstActiveAt, let last = report.lastActiveAt {
+            if coordinator.isMaterializingHistoricalStats || isLoadingReport {
+                HStack(spacing: 5) {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.7)
+                    Text(coordinator.isMaterializingHistoricalStats ? "后台预计算中…" : "读取中…")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.primary.opacity(0.045), in: Capsule())
+            } else if let report, let first = report.firstActiveAt, let last = report.lastActiveAt {
                 HStack(spacing: 4) {
                     Image(systemName: "clock")
                         .font(.system(size: 10))
@@ -1025,6 +1072,41 @@ struct DailyStatsView: View {
         }
     }
 
+    private var generatingPlaceholderCard: some View {
+        StatsSectionCard {
+            VStack(spacing: 10) {
+                ProgressView()
+                    .controlSize(.regular)
+                Text(selectedDate.isEmpty ? "正在后台准备历史统计报表…" : "正在后台加载 / 生成 \(selectedDate) 统计报表…")
+                    .font(.system(size: 13, weight: .semibold))
+                Text("每日统计均在后台低优先级队列预计算并缓存到 stats/ 目录，不会阻塞界面操作。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 36)
+        }
+    }
+
+    private var noHistoryYetCard: some View {
+        StatsSectionCard {
+            VStack(spacing: 8) {
+                Image(systemName: "calendar.badge.clock")
+                    .font(.system(size: 26))
+                    .foregroundStyle(.secondary)
+                Text("暂无已生成的历史统计报表")
+                    .font(.system(size: 13.5, weight: .semibold))
+                Text("「每日统计」仅查看昨天及更早的预计算历史报表（不在切换页面时实时计算当天）。系统会在次日跨天及启动时自动在后台生成前一天报表。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 480)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 36)
+        }
+    }
+
     private func emptyStateCard(date: String) -> some View {
         StatsSectionCard {
             VStack(spacing: 8) {
@@ -1033,7 +1115,7 @@ struct DailyStatsView: View {
                     .foregroundStyle(.secondary)
                 Text("\(date) 暂无可统计的活动数据")
                     .font(.system(size: 13, weight: .semibold))
-                Text("切换到其他已归档日期，或使用下方提示词让本地 Agent 检索历史 SQLite 记录。")
+                Text("切换到其他历史日期，或使用下方提示词让本地 Agent 检索历史 SQLite 记录。")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
@@ -1043,6 +1125,13 @@ struct DailyStatsView: View {
     }
 
     // MARK: - Helpers
+
+    private var yesterdayDateString: String? {
+        guard let todayStart = DayHelmDateFormatting.parseDayString(coordinator.todayDateString) else {
+            return nil
+        }
+        return DayHelmDateFormatting.dayString(from: todayStart.addingTimeInterval(-86_400))
+    }
 
     private var canStepOlder: Bool {
         guard let idx = availableDates.firstIndex(of: selectedDate) else { return false }
@@ -1061,13 +1150,59 @@ struct DailyStatsView: View {
         selectedDate = availableDates[nextIdx]
     }
 
-    private func reloadDatesAndReport(resetToTodayIfEmpty: Bool) {
-        let dates = coordinator.availableStatsDates()
-        availableDates = dates
-        if resetToTodayIfEmpty || selectedDate.isEmpty || !dates.contains(selectedDate) {
-            selectedDate = coordinator.todayDateString
+    private func loadDatesAndReport(resetToLatestIfNeeded: Bool) {
+        loadTask?.cancel()
+        loadTask = Task {
+            let dates = await coordinator.refreshAvailableHistoricalDatesAsync()
+            guard !Task.isCancelled else { return }
+            availableDates = dates
+
+            if dates.isEmpty {
+                selectedDate = ""
+                report = nil
+                isLoadingReport = false
+                return
+            }
+
+            let targetDate: String
+            if resetToLatestIfNeeded || selectedDate.isEmpty || !dates.contains(selectedDate) {
+                targetDate = dates[0]
+            } else {
+                targetDate = selectedDate
+            }
+
+            if selectedDate != targetDate {
+                // Setting selectedDate triggers `.onChange(of: selectedDate)` which runs `loadReport`.
+                selectedDate = targetDate
+                return
+            }
+
+            await performLoadReport(for: targetDate, forceRebuild: false)
         }
-        report = coordinator.loadDailyStats(for: selectedDate)
+    }
+
+    private func loadReport(for dateString: String, forceRebuild: Bool) {
+        loadTask?.cancel()
+        loadTask = Task {
+            await performLoadReport(for: dateString, forceRebuild: forceRebuild)
+        }
+    }
+
+    @MainActor
+    private func performLoadReport(for dateString: String, forceRebuild: Bool) async {
+        guard !dateString.isEmpty else {
+            report = nil
+            isLoadingReport = false
+            return
+        }
+        isLoadingReport = true
+        if report?.date != dateString {
+            report = nil
+        }
+        let loaded = await coordinator.loadHistoricalDailyStats(for: dateString, forceRebuild: forceRebuild)
+        guard !Task.isCancelled, selectedDate == dateString else { return }
+        report = loaded
+        isLoadingReport = false
     }
 
     private func copyPromptToClipboard(report: DailyStatsReport) {
@@ -1094,7 +1229,7 @@ struct DailyStatsView: View {
         if let first = report.firstActiveAt, let last = report.lastActiveAt {
             return "起止 \(formatHHMM(first))–\(formatHHMM(last)) · 跨度 \(formatDuration(minutes: report.spanMinutes))"
         }
-        return report.isToday ? "今日实时统计" : "历史归档日期"
+        return "历史归档日期（预计算）"
     }
 
     private func formatDelta(

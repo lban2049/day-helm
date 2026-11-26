@@ -64,6 +64,9 @@ public final class HybridActivityCoordinator: ObservableObject {
     @Published public private(set) var otherWorkMinutes: Double = 0.0
     @Published public private(set) var nonWorkMinutes: Double = 0.0
     @Published public private(set) var activityModeMinutes: [String: Double] = [:]
+    @Published public private(set) var availableHistoricalStatsDates: [String] = []
+    @Published public private(set) var isMaterializingHistoricalStats: Bool = false
+    @Published public private(set) var historicalStatsRevision: Int = 0
 
     public let isSyntheticDemo: Bool
     public let storeDirectoryURL: URL
@@ -85,6 +88,7 @@ public final class HybridActivityCoordinator: ObservableObject {
     private var settings: DayHelmSettings
     private var syntheticSessionDetails: [RecordedSessionDetail] = []
     private var syntheticHistorySnapshots: [String: DayHelmDaySnapshot] = [:]
+    private var syntheticHistoryReports: [String: DailyStatsReport] = [:]
 
     public var enableLiveTimersForTesting: Bool = false
 
@@ -92,6 +96,7 @@ public final class HybridActivityCoordinator: ObservableObject {
 
     private var timerTask: Task<Void, Never>?
     private var almaSyncTask: Task<Void, Never>?
+    private var statsMaterializationQueueTask: Task<Void, Never>?
     private var typingPauseTask: Task<Void, Never>?
     private var jevClassifyTask: Task<Void, Never>?
     private var jevDwellTask: Task<Void, Never>?
@@ -174,6 +179,12 @@ public final class HybridActivityCoordinator: ObservableObject {
 
         if !syntheticDemo, let store {
             self.jevDecisionLogs = store.loadJevDecisionLogs(forDate: engine.currentDateString)
+            let todayStr = engine.currentDateString
+            var initialDates = Set<String>(store.listMaterializedStatsDayStrings().filter { $0 < todayStr })
+            for archived in store.listArchivedDayStrings() where archived < todayStr {
+                initialDates.insert(archived)
+            }
+            self.availableHistoricalStatsDates = initialDates.sorted(by: >)
         }
 
         refreshJevAPIKeyStatus()
@@ -336,7 +347,14 @@ public final class HybridActivityCoordinator: ObservableObject {
 
         let demoDetails = Self.makeSyntheticSessionDetails(now: now)
         coordinator.syntheticSessionDetails = demoDetails
-        coordinator.syntheticHistorySnapshots = Self.makeSyntheticHistorySnapshots(now: now, budgets: budgets)
+        let historySnapshots = Self.makeSyntheticHistorySnapshots(now: now, budgets: budgets)
+        coordinator.syntheticHistorySnapshots = historySnapshots
+        coordinator.syntheticHistoryReports = Self.makeSyntheticHistoryReports(
+            snapshots: historySnapshots,
+            budgets: budgets,
+            clock: clock
+        )
+        coordinator.availableHistoricalStatsDates = coordinator.availableStatsDates()
         coordinator.recentSessions = demoDetails.map(\.session)
         coordinator.recorderStats = RecorderStorageStats(
             totalSessions: demoDetails.count,
@@ -524,67 +542,130 @@ public final class HybridActivityCoordinator: ObservableObject {
     }
 
     public func availableStatsDates() -> [String] {
-        var dates = Set<String>([todayDateString])
+        let todayStr = todayDateString
         if isSyntheticDemo {
-            for key in syntheticHistorySnapshots.keys {
+            return syntheticHistoryReports.keys
+                .filter { $0 < todayStr }
+                .sorted(by: >)
+        }
+        var dates = Set<String>(availableHistoricalStatsDates.filter { $0 < todayStr })
+        if let store {
+            for key in store.listMaterializedStatsDayStrings() where key < todayStr {
                 dates.insert(key)
             }
-        } else if let store {
-            for key in store.listArchivedDayStrings() {
+            for key in store.listArchivedDayStrings() where key < todayStr {
                 dates.insert(key)
             }
         }
         return dates.sorted(by: >)
     }
 
-    public func loadDailyStats(for dateString: String) -> DailyStatsReport {
-        let isToday = (dateString == todayDateString)
-        let liveSnap = isToday ? engine.snapshot(at: clock.now()) : nil
+    public func refreshAvailableHistoricalDatesAsync() async -> [String] {
+        let todayStr = todayDateString
+        if isSyntheticDemo {
+            let demoDates = syntheticHistoryReports.keys.filter { $0 < todayStr }.sorted(by: >)
+            if availableHistoricalStatsDates != demoDates {
+                availableHistoricalStatsDates = demoDates
+            }
+            return demoDates
+        }
+        guard let store else { return [] }
+        let db = database
+        let discovered = await Task.detached(priority: .utility) {
+            DailyStatsMaterializer.discoverHistoricalCandidateDates(
+                store: store,
+                database: db,
+                todayDateString: todayStr
+            )
+        }.value
+        if availableHistoricalStatsDates != discovered {
+            availableHistoricalStatsDates = discovered
+        }
+        return discovered
+    }
+
+    /// Asynchronously loads a precomputed historical report (`< todayDateString`) off the main thread.
+    /// Never computes or returns today's live report so tab/date switching stays instantaneous.
+    public func loadHistoricalDailyStats(
+        for dateString: String,
+        forceRebuild: Bool = false
+    ) async -> DailyStatsReport? {
+        let todayStr = todayDateString
+        guard dateString < todayStr else { return nil }
 
         if isSyntheticDemo {
-            let syntheticTotals: DailyStatsAggregator.SyntheticRecorderTotals?
-            if isToday {
-                let clicks = syntheticSessionDetails.reduce(0) { $0 + $1.session.clickCount }
-                let keypresses = syntheticSessionDetails.reduce(0) { $0 + $1.session.keypressCount }
-                let meetings = syntheticSessionDetails.filter { $0.session.isMeeting }.count
-                let totalMs = syntheticSessionDetails.reduce(Int64(0)) { acc, detail in
-                    let dur = detail.session.durationMs ?? max(0, Int64(clock.now().timeIntervalSince1970 * 1000) - detail.session.startedAt)
-                    return acc + dur
-                }
-                syntheticTotals = DailyStatsAggregator.SyntheticRecorderTotals(
-                    sessions: syntheticSessionDetails.count,
-                    meetings: meetings,
-                    clicks: clicks,
-                    keypresses: keypresses,
-                    snapshots: todaySnapshotCount,
-                    ocrFrames: todayOCRCount,
-                    activeSessionMs: totalMs
-                )
-            } else {
-                syntheticTotals = nil
-            }
-            return DailyStatsAggregator.aggregate(
-                dateString: dateString,
-                liveSnapshot: liveSnap,
-                budgets: engine.budgets,
-                store: nil,
-                database: nil,
-                clock: clock,
-                includeBaseline: true,
-                syntheticTotals: syntheticTotals,
-                archivedSnapshots: syntheticHistorySnapshots
-            )
+            return syntheticHistoryReports[dateString]
         }
 
-        return DailyStatsAggregator.aggregate(
-            dateString: dateString,
-            liveSnapshot: liveSnap,
-            budgets: engine.budgets,
-            store: store,
-            database: database,
-            clock: clock,
-            includeBaseline: true
-        )
+        guard let store else { return nil }
+        let db = database
+        let budgets = engine.budgets
+        let clock = self.clock
+
+        let result = await Task.detached(priority: .utility) {
+            DailyStatsMaterializer.loadOrMaterializeHistoricalStats(
+                dateString: dateString,
+                store: store,
+                database: db,
+                budgets: budgets,
+                clock: clock,
+                forceRebuild: forceRebuild
+            )
+        }.value
+
+        if let result, !result.loadedFromCache {
+            _ = await refreshAvailableHistoricalDatesAsync()
+        }
+        return result?.report
+    }
+
+    public func scheduleHistoricalStatsMaterialization(forceRebuildDate: String? = nil) {
+        guard !isSyntheticDemo, let store else { return }
+        let db = database
+        let budgets = engine.budgets
+        let clock = self.clock
+        let previousTask = statsMaterializationQueueTask
+        isMaterializingHistoricalStats = true
+
+        let task = Task.detached(priority: .utility) { [weak self] in
+            _ = await previousTask?.value
+            guard !Task.isCancelled else { return }
+
+            if let forceRebuildDate {
+                _ = DailyStatsMaterializer.loadOrMaterializeHistoricalStats(
+                    dateString: forceRebuildDate,
+                    store: store,
+                    database: db,
+                    budgets: budgets,
+                    clock: clock,
+                    forceRebuild: true
+                )
+            } else {
+                _ = DailyStatsMaterializer.materializeMissingHistoricalStats(
+                    store: store,
+                    database: db,
+                    budgets: budgets,
+                    clock: clock,
+                    forceRebuild: false
+                )
+            }
+
+            guard !Task.isCancelled else { return }
+            let todayStr = DayHelmDateFormatting.dayString(from: clock.now())
+            let updatedDates = DailyStatsMaterializer.discoverHistoricalCandidateDates(
+                store: store,
+                database: db,
+                todayDateString: todayStr
+            )
+
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.availableHistoricalStatsDates = updatedDates
+                self.historicalStatsRevision &+= 1
+                self.isMaterializingHistoricalStats = false
+            }
+        }
+        statsMaterializationQueueTask = task
     }
 
     public func buildAgentAnalysisPrompt(
@@ -596,6 +677,38 @@ public final class HybridActivityCoordinator: ObservableObject {
             preset: preset,
             storeDirectory: storeDirectoryURL
         )
+    }
+
+    private static func makeSyntheticHistoryReports(
+        snapshots: [String: DayHelmDaySnapshot],
+        budgets: [TaskBudget],
+        clock: any DayHelmClock
+    ) -> [String: DailyStatsReport] {
+        var reports: [String: DailyStatsReport] = [:]
+        let sortedDays = snapshots.keys.sorted()
+        for (idx, dayStr) in sortedDays.enumerated() {
+            let syntheticTotals = DailyStatsAggregator.SyntheticRecorderTotals(
+                sessions: 3 + idx,
+                meetings: idx % 2,
+                clicks: 120 + idx * 35,
+                keypresses: 860 + idx * 190,
+                snapshots: 14 + idx * 4,
+                ocrFrames: 11 + idx * 3,
+                activeSessionMs: Int64((115 + idx * 20) * 60_000)
+            )
+            reports[dayStr] = DailyStatsAggregator.aggregate(
+                dateString: dayStr,
+                liveSnapshot: nil,
+                budgets: budgets,
+                store: nil,
+                database: nil,
+                clock: clock,
+                includeBaseline: true,
+                syntheticTotals: syntheticTotals,
+                archivedSnapshots: snapshots
+            )
+        }
+        return reports
     }
 
     private static func makeSyntheticHistorySnapshots(
@@ -750,6 +863,7 @@ public final class HybridActivityCoordinator: ObservableObject {
         }
 
         if !isSyntheticDemo {
+            scheduleHistoricalStatsMaterialization()
             almaSyncTask = Task { [weak self] in
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 10_000_000_000)
@@ -766,6 +880,9 @@ public final class HybridActivityCoordinator: ObservableObject {
         timerTask = nil
         almaSyncTask?.cancel()
         almaSyncTask = nil
+        statsMaterializationQueueTask?.cancel()
+        statsMaterializationQueueTask = nil
+        isMaterializingHistoricalStats = false
         typingPauseTask?.cancel()
         typingPauseTask = nil
         jevClassifyTask?.cancel()
@@ -2392,6 +2509,7 @@ public final class HybridActivityCoordinator: ObservableObject {
         }
         refreshPublishedState(now: now)
         refreshRecorderCounts()
+        scheduleHistoricalStatsMaterialization()
     }
 
     @discardableResult

@@ -1542,6 +1542,21 @@ public final class ActivityDatabase: @unchecked Sendable {
         )
     }
 
+    /// Returns distinct `YYYY-MM-DD` (UTC+8) date strings with sessions in `activity_sessions`, sorted descending.
+    public func listSessionDayStrings() throws -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        var seen = Set<String>()
+        let sql = "SELECT DISTINCT CAST((started_at + 28800000) / 86400000 AS INTEGER) AS day_idx FROM activity_sessions WHERE started_at >= 0 ORDER BY day_idx DESC;"
+        try queryStatementLocked(sql, bind: { _ in }, onRow: { stmt in
+            let dayIndex = sqlite3_column_int64(stmt, 0)
+            let noonEpoch = TimeInterval(dayIndex) * 86_400.0 - 28_800.0 + 43_200.0
+            let date = Date(timeIntervalSince1970: noonEpoch)
+            seen.insert(DayHelmDateFormatting.dayString(from: date))
+        })
+        return seen.sorted(by: >)
+    }
+
     public func currentOpenSessionId() throws -> String? {
         lock.lock()
         defer { lock.unlock() }

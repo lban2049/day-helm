@@ -37,6 +37,7 @@
   snapshots/YYYY-MM-DD/  # 去重后的 JPEG 快照（>1天 warm 1280px/0.4；>7天 cold 640px/0.3；默认 7 天过期清理 + 10GB 容量封顶）
   today.json             # 今日实时配额与上下文热数据（原子写）
   days/YYYY-MM-DD.json   # 日终定稿归档
+  stats/YYYY-MM-DD.json  # 历史单日预计算统计报表（仅保存前一天及更早日期，已脱敏，原子写）
   config.json            # 事项配额、关键词与采集器设置（含采集启停、防抖/心跳/空闲/停顿/轮询/JPEG 质量、Vision OCR 与语言/采样间隔、全局键鼠监听开关、sensitiveBundleIds、留存天数与存储上限）
 ```
 
@@ -100,13 +101,13 @@
 2. **手动彻底删除**：提供 CLI 命令，删除后不可恢复：
 
 ```bash
-dayhelm purge                       # 删除 ~/.config/alma/dayhelm/ 全部内容（JSON、activity.sqlite、snapshots/、config.json）
-dayhelm purge --before 2026-11-01   # 按日期删除：清理该日期前的 days/*.json、SQLite 记录与 snapshots/YYYY-MM-DD/
+dayhelm purge                       # 删除 ~/.config/alma/dayhelm/ 全部内容（JSON、stats/、activity.sqlite、snapshots/、config.json）
+dayhelm purge --before 2026-11-01   # 按日期删除：清理该日期前的 days/*.json、stats/*.json、SQLite 记录与 snapshots/YYYY-MM-DD/
 ```
 
 删除时必须：
 
-- 同时清理 `today.json`、`days/`、`config.json`、`activity.sqlite`（含 `-wal` / `-shm`）及 `snapshots/`
+- 同时清理 `today.json`、`days/`、`stats/`、`config.json`、`activity.sqlite`（含 `-wal` / `-shm`）及 `snapshots/`
 - 明确打印删除了什么、多少文件、多少字节
 - 不做"软删除"、不留备份
 
@@ -125,6 +126,7 @@ dayhelm purge --before 2026-11-01   # 按日期删除：清理该日期前的 da
 data/
 today.json
 days/
+stats/
 blocks/
 captures/
 snapshots/
